@@ -52,11 +52,20 @@ void construct_lookup_read_counts(typename Flavor::Polynomial& read_counts,
 {
     // loop over all tables used in the circuit; each table records the row read by every lookup gate made on it
     size_t table_offset = circuit.blocks.lookup.trace_offset();
+    std::vector<uint32_t> counts;
     for (auto& table : circuit.get_lookup_tables()) {
+        // count the reads of each row as integers, then add each non-zero count to the polynomial once
+        counts.assign(table.size(), 0);
         for (const uint32_t index_in_table : table.lookup_gate_rows) {
-            // increment the read count at the corresponding index in the full polynomial
+            counts.at(index_in_table)++;
+        }
+        for (size_t index_in_table = 0; index_in_table < counts.size(); ++index_in_table) {
+            if (counts[index_in_table] == 0) {
+                continue;
+            }
+            // add the read count at the corresponding index in the full polynomial
             size_t index_in_poly = table_offset + index_in_table;
-            read_counts.at(index_in_poly)++;
+            read_counts.at(index_in_poly) += counts[index_in_table];
             read_tags.at(index_in_poly) = 1; // tag is 1 if entry has been read 1 or more times
         }
         table_offset += table.size(); // set the offset of the next table within the polynomials
