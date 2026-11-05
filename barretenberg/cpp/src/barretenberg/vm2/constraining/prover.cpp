@@ -101,7 +101,7 @@ void AvmProver::execute_wire_commitments_round()
     // logderivative phase)
     auto batch = commitment_key.start_batch();
     for (const auto& [poly, label] : zip_view(prover_polynomials.get_wires(), prover_polynomials.get_wires_labels())) {
-        batch.add_to_batch(poly, label);
+        batch.add_to_batch(poly, label, /*has_duplicates_hint=*/true);
     }
     batch.commit_and_send_to_verifier(transcript);
 }
