@@ -253,6 +253,27 @@ template <class base_uint> std::pair<uintx<base_uint>, uintx<base_uint>> uintx<b
         uint256_t(0xFFFFFFFFFFFFFFFFULL, 0x00000000FFFFFFFFULL, 0x0000000000000000ULL, 0xFFFFFFFF00000001ULL);
 
     if (b == uintx(BN254FQMODULUS256)) {
+        if constexpr (base_uint::length() == 512) {
+            // For x < S = 2^576, mu = floor(S / p) gives an underestimate
+            // q = floor(x * mu / S) of x / p by at most one. Keep the full-width
+            // Barrett path below for larger operands; no caller bounds are assumed.
+            if ((hi >> 64) == base_uint(0)) {
+                static const base_uint reciprocal = (uintx(1) << 576).divmod_base(uintx(BN254FQMODULUS256)).first.lo;
+                const auto low_product = lo.mul_extended(reciprocal);
+                // x = lo + 2^512 * hi. Since hi < 2^64 and mu < 2^323,
+                // this sum fits in 388 bits, and the discarded low half cannot
+                // affect the result after shifting by 576 bits.
+                const base_uint middle = low_product.second + hi * reciprocal;
+                base_uint quotient = middle >> 64;
+                const auto product = quotient.mul_extended(base_uint(BN254FQMODULUS256));
+                uintx remainder = *this - uintx(product.first, product.second);
+                if (remainder >= uintx(BN254FQMODULUS256)) {
+                    quotient += 1;
+                    remainder -= uintx(BN254FQMODULUS256);
+                }
+                return { uintx(quotient), remainder };
+            }
+        }
         return (*this).template barrett_reduction<BN254FQMODULUS256>();
     }
     if (b == uintx(SECP256K1FQMODULUS256)) {
