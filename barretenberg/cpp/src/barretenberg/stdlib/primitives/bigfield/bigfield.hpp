@@ -570,11 +570,24 @@ template <typename Builder, typename T> class bigfield {
                              bool enable_divisor_nz_check = true);
 
     static bigfield sum(const std::vector<bigfield>& terms);
+    // Caller-owned native witness-evaluation cache. It stores no circuit values
+    // and accepts a hit only for the same reduced denominator.
+    class NativeDivisionCache {
+        friend class bigfield;
+        uint256_t denominator_{ 0 };
+        native inverse_;
+        bool valid_ = false;
+    };
+
     static bigfield internal_div(const std::vector<bigfield>& numerators,
                                  const bigfield& denominator,
-                                 bool check_for_zero);
+                                 bool check_for_zero,
+                                 NativeDivisionCache* cache = nullptr);
 
     static bigfield div_without_denominator_check(const std::vector<bigfield>& numerators, const bigfield& denominator);
+    static bigfield div_without_denominator_check(const std::vector<bigfield>& numerators,
+                                                  const bigfield& denominator,
+                                                  NativeDivisionCache& cache);
     bigfield div_without_denominator_check(const bigfield& denominator);
     static bigfield div_check_denominator_nonzero(const std::vector<bigfield>& numerators, const bigfield& denominator);
 

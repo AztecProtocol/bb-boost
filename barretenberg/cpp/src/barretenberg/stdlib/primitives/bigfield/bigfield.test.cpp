@@ -17,6 +17,7 @@
 #include "barretenberg/transcript/origin_tag.hpp"
 #include <gtest/gtest.h>
 #include <memory>
+#include <array>
 #include <utility>
 
 using namespace bb;
@@ -1582,6 +1583,45 @@ template <typename BigField> class stdlib_bigfield : public testing::Test {
         EXPECT_EQ(fq_native((selected.get_value() % uint512_t(fq_native::modulus)).lo), b);
     }
 
+    static void test_native_division_cache()
+    {
+        Builder cached_builder;
+        Builder plain_builder;
+        typename fq_ct::NativeDivisionCache cache;
+        for (const uint64_t divisor : std::array<uint64_t, 4>{ 7, 7, 11, 7 }) {
+            auto run = [&](Builder& builder, bool use_cache) {
+                auto a = fq_ct::create_from_u512_as_witness(&builder, uint512_t(17));
+                auto b = fq_ct::create_from_u512_as_witness(&builder, uint512_t(3));
+                auto denominator = fq_ct::create_from_u512_as_witness(&builder, uint512_t(divisor));
+                return use_cache ? fq_ct::div_without_denominator_check({ a, b }, denominator, cache)
+                                 : fq_ct::div_without_denominator_check({ a, b }, denominator);
+            };
+            const auto cached = run(cached_builder, true);
+            const auto plain = run(plain_builder, false);
+            EXPECT_EQ(cached.get_value(), plain.get_value());
+            ASSERT_EQ(cached_builder.get_variables().size(), plain_builder.get_variables().size());
+            for (size_t i = 0; i < cached_builder.get_variables().size(); ++i) {
+                for (size_t limb = 0; limb < 4; ++limb) {
+                    EXPECT_EQ(cached_builder.get_variables()[i].data[limb], plain_builder.get_variables()[i].data[limb]);
+                }
+            }
+            EXPECT_EQ(cached_builder.blocks, plain_builder.blocks);
+            EXPECT_EQ(cached_builder.real_variable_index, plain_builder.real_variable_index);
+            // The public base equality includes private next/previous copy-cycle indices.
+            EXPECT_EQ(static_cast<const CircuitBuilderBase<fr>&>(cached_builder),
+                      static_cast<const CircuitBuilderBase<fr>&>(plain_builder));
+        }
+        EXPECT_TRUE(CircuitChecker::check(cached_builder));
+        EXPECT_TRUE(CircuitChecker::check(plain_builder));
+
+        // A zero denominator follows the existing unchecked constant path and
+        // does not consume a previously cached nonzero inverse.
+        const fq_ct one(1);
+        const fq_ct zero(0);
+        EXPECT_EQ(fq_ct::div_without_denominator_check({ one }, zero, cache).get_value(),
+                  fq_ct::div_without_denominator_check({ one }, zero).get_value());
+    }
+
     static void test_division_context()
     {
         auto builder = Builder();
@@ -2698,4 +2738,10 @@ TYPED_TEST(stdlib_bigfield, less_than_works)
 
     EXPECT_TRUE(CircuitChecker::check(builder));
     EXPECT_FALSE(builder.failed());
+}
+
+
+TYPED_TEST(stdlib_bigfield, native_division_cache_preserves_witnesses_and_gates)
+{
+    TestFixture::test_native_division_cache();
 }

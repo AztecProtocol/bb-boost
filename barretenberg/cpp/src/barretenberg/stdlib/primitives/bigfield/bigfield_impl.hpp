@@ -775,7 +775,8 @@ bigfield<Builder, T> bigfield<Builder, T>::sum(const std::vector<bigfield>& term
 template <typename Builder, typename T>
 bigfield<Builder, T> bigfield<Builder, T>::internal_div(const std::vector<bigfield>& numerators,
                                                         const bigfield& denominator,
-                                                        bool check_for_zero)
+                                                        bool check_for_zero,
+                                                        NativeDivisionCache* cache)
 {
     BB_ASSERT_LT(numerators.size(), MAXIMUM_SUMMAND_COUNT);
     if (numerators.empty()) {
@@ -813,7 +814,18 @@ bigfield<Builder, T> bigfield<Builder, T>::internal_div(const std::vector<bigfie
     if (denominator_reduced != 0) {
         using NativeField = bb::field<T>;
         const NativeField numerator_native(uint256_t((left % modulus).lo.lo));
-        inverse_value = uint512_t(uint256_t(numerator_native * NativeField(denominator_reduced).invert()));
+        NativeField denominator_inverse;
+        if (cache != nullptr && cache->valid_ && cache->denominator_ == denominator_reduced) {
+            denominator_inverse = cache->inverse_;
+        } else {
+            denominator_inverse = NativeField(denominator_reduced).invert();
+            if (cache != nullptr) {
+                cache->denominator_ = denominator_reduced;
+                cache->inverse_ = denominator_inverse;
+                cache->valid_ = true;
+            }
+        }
+        inverse_value = uint512_t(uint256_t(numerator_native * denominator_inverse));
     }
 
     const uint1024_t quotient_1024 =
@@ -847,7 +859,7 @@ bigfield<Builder, T> bigfield<Builder, T>::internal_div(const std::vector<bigfie
         if (reduction_required) {
 
             denominator.self_reduce();
-            return internal_div(numerators, denominator, check_for_zero);
+            return internal_div(numerators, denominator, check_for_zero, cache);
         }
         // We do this after the quotient check, since this creates gates and we don't want to do this twice
         if (check_for_zero) {
@@ -874,6 +886,14 @@ bigfield<Builder, T> bigfield<Builder, T>::div_without_denominator_check(const s
                                                                          const bigfield& denominator)
 {
     return internal_div(numerators, denominator, false);
+}
+
+template <typename Builder, typename T>
+bigfield<Builder, T> bigfield<Builder, T>::div_without_denominator_check(const std::vector<bigfield>& numerators,
+                                                                        const bigfield& denominator,
+                                                                        NativeDivisionCache& cache)
+{
+    return internal_div(numerators, denominator, false, &cache);
 }
 
 template <typename Builder, typename T>
