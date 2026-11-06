@@ -205,11 +205,6 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
                     clear_events(events.tx);
                 },
                 [&]() {
-                    ExecutionTraceBuilder exec_builder;
-                    AVM_TRACK_TIME("tracegen/execution", exec_builder.process(events.execution, trace));
-                    clear_events(events.execution);
-                },
-                [&]() {
                     AddressDerivationTraceBuilder address_derivation_builder;
                     AVM_TRACK_TIME("tracegen/address_derivation",
                                    address_derivation_builder.process(events.address_derivation, trace));
@@ -418,7 +413,14 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
                     clear_events(events.emit_public_log_events);
                 } });
 
-        AVM_TRACK_TIME("tracegen/traces", execute_jobs(jobs));
+        AVM_TRACK_TIME("tracegen/traces", {
+            // Execution fills independent row chunks in parallel. Run it outside the
+            // other job group so it can use the existing top-level thread pool.
+            ExecutionTraceBuilder exec_builder;
+            AVM_TRACK_TIME("tracegen/execution", exec_builder.process(events.execution, trace));
+            clear_events(events.execution);
+            execute_jobs(jobs);
+        });
     }
 }
 
