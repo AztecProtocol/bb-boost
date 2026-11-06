@@ -6,6 +6,9 @@
 #pragma once
 
 #include <array>
+#include <bitset>
+#include <memory>
+#include <vector>
 #include <span>
 
 #include "barretenberg/commitment_schemes/kzg/kzg.hpp"
@@ -259,8 +262,7 @@ class AvmFlavor {
      * @brief A container for univariates used during sumcheck.
      * @details During sumcheck, the prover evaluates the relations on these univariates.
      */
-    class LazilyExtendedProverUnivariates
-        : private AllEntities<std::unique_ptr<bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>>> {
+    class LazilyExtendedProverUnivariates {
       public:
         LazilyExtendedProverUnivariates(const ProverPolynomials& multivariates)
             : multivariates(multivariates)
@@ -271,7 +273,14 @@ class AvmFlavor {
 
       private:
         size_t current_edge = 0;
-        mutable bool dirty = false;
+        using ExtendedUnivariate = bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>;
+        // References returned by get remain valid until set_current_edge. Reuse storage by
+        // access order, so the pool retains only the largest number of nonzero edges needed
+        // at one row pair, rather than the union of all columns visited by this worker.
+        mutable std::array<const ExtendedUnivariate*, NUM_ALL_ENTITIES> cached{};
+        mutable std::bitset<NUM_ALL_ENTITIES> valid{};
+        mutable std::vector<std::unique_ptr<ExtendedUnivariate>> pool;
+        mutable size_t used = 0;
         const ProverPolynomials& multivariates;
     };
 

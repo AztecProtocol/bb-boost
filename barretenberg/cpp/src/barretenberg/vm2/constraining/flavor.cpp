@@ -100,43 +100,40 @@ AvmFlavor::ProvingKey::ProvingKey()
 void AvmFlavor::LazilyExtendedProverUnivariates::set_current_edge(size_t edge_idx)
 {
     current_edge = edge_idx;
-    // If the current edge changed, we need to clear all the cached univariates.
-    dirty = true;
+    valid.reset();
+    used = 0;
 }
 
 const bb::Univariate<AvmFlavor::FF, AvmFlavor::MAX_PARTIAL_RELATION_LENGTH>& AvmFlavor::
     LazilyExtendedProverUnivariates::get(ColumnAndShifts c) const
 {
+    const auto column = static_cast<size_t>(c);
+    if (valid[column]) {
+        return *cached[column];
+    }
     const auto& multivariate = multivariates.get(c);
     if (multivariate.is_empty() || multivariate.end_index() < current_edge) {
         static const auto zero_univariate = bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>::zero();
-        return zero_univariate;
+        cached[column] = &zero_univariate;
     } else {
-        auto& mutable_entities = const_cast<decltype(entities)&>(entities);
-        if (dirty) {
-            // If the current edge changed, we need to clear all the cached univariates.
-            for (auto& extended_ptr : mutable_entities) {
-                extended_ptr.reset();
+        const auto& val0 = multivariate[current_edge];
+        const auto& val1 = multivariate[current_edge + 1];
+        if (val0.is_zero() && val1.is_zero()) {
+            static const auto zero_univariate = bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>::zero();
+            cached[column] = &zero_univariate;
+        } else {
+            const auto extended =
+                bb::Univariate<FF, 2>({ val0, val1 }).template extend_to<MAX_PARTIAL_RELATION_LENGTH>();
+            if (used == pool.size()) {
+                pool.push_back(std::make_unique<ExtendedUnivariate>(extended));
+            } else {
+                *pool[used] = extended;
             }
-            dirty = false;
+            cached[column] = pool[used++].get();
         }
-        auto& extended_ptr = mutable_entities[static_cast<size_t>(c)];
-        if (extended_ptr.get() == nullptr) {
-            const auto& val0 = multivariate[current_edge];
-            const auto& val1 = multivariate[current_edge + 1];
-            // Fast path: if both edge values are zero, return a static zero univariate
-            // without allocating or computing extend_to. This avoids heap allocation and
-            // the extend_to computation for zero selectors on sparse AVM traces.
-            if (val0.is_zero() && val1.is_zero()) {
-                static const auto zero_univariate = bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>::zero();
-                return zero_univariate; // Weirdly, defining a single static zero_univariate above the "if" block
-                                        // leads to a performance regression and obliterates the performance gain.
-            }
-            extended_ptr = std::make_unique<bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>>(
-                bb::Univariate<FF, 2>({ val0, val1 }).template extend_to<MAX_PARTIAL_RELATION_LENGTH>());
-        }
-        return *extended_ptr;
     }
+    valid[column] = true;
+    return *cached[column];
 }
 
 } // namespace bb::avm2
