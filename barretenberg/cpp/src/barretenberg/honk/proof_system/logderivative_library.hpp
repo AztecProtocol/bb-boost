@@ -199,6 +199,18 @@ void _accumulate_logderivative_subrelation_contributions(ContainerOverSubrelatio
     std::get<0>(accumulator) +=
         (denominator_accumulator[NUM_TOTAL_TERMS - 1] * lookup_inverses - inverse_exists) * scaling_factor;
 
+#ifndef __wasm__
+    // The inverse check above remains mandatory, even when both accumulation
+    // contributions vanish. Only the exact AVM linear-edge adapter provides this proof.
+    if constexpr (!IsPermutation && NUM_LOOKUP_TERMS == 1 && NUM_TABLE_TERMS == 1 && requires {
+                      in.lookup_accumulation_is_zero(std::type_identity<typename Relation::LinearLookupSettings>{});
+                  }) {
+        if (in.lookup_accumulation_is_zero(std::type_identity<typename Relation::LinearLookupSettings>{})) {
+            return;
+        }
+    }
+#endif
+
     // 3) Iteratively compute the single inverses
     for (size_t i = NUM_TOTAL_TERMS - 1; i > 0; --i) {
         // Take the cumulative product up to the previous index and multiply by the current inverse accumulator

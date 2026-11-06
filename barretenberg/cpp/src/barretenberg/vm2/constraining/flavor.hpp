@@ -11,6 +11,7 @@
 #include <memory>
 #include <vector>
 #include <span>
+#include <type_traits>
 
 #include "barretenberg/commitment_schemes/kzg/kzg.hpp"
 #include "barretenberg/common/tuple.hpp"
@@ -282,6 +283,20 @@ class AvmFlavor {
         }
 
         const bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>& get(ColumnAndShifts c) const;
+#ifndef __wasm__
+        // Only the exact AVM lookup adapter promises these selector/count mappings.
+        // Linear edges are zero everywhere exactly when both endpoints are zero.
+        template <typename Settings>
+        bool lookup_accumulation_is_zero(std::type_identity<lookup_settings<Settings>>) const
+        {
+            if (!edge_is_zero(static_cast<ColumnAndShifts>(Settings::SRC_SELECTOR))) {
+                return false;
+            }
+            return edge_is_zero(static_cast<ColumnAndShifts>(Settings::DST_SELECTOR)) ||
+                   edge_is_zero(static_cast<ColumnAndShifts>(Settings::COUNTS));
+        }
+#endif
+
 
         // Both compressed lookup tuples remain linear in the edge variable. Pack
         // their endpoints together to keep the native four-lane multiplication
