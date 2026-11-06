@@ -74,7 +74,12 @@ template <typename FF_, typename Settings_> struct lookup_relation_base : public
 
     template <typename AllEntities> inline static bool skip(const AllEntities& in)
     {
-        return (in.get(static_cast<ColumnAndShifts>(Settings::INVERSES))).is_zero();
+        constexpr auto inverse_column = static_cast<ColumnAndShifts>(Settings::INVERSES);
+        if constexpr (requires { in.edge_is_zero(inverse_column); }) {
+            return in.edge_is_zero(inverse_column);
+        } else {
+            return (in.get(inverse_column)).is_zero();
+        }
     }
 
     // This obscures the definition from GenericLookupRelation, so that we can instantiate it somewhere else.
@@ -146,7 +151,12 @@ struct permutation_relation_base : public GenericPermutationRelation<Settings_, 
 
     template <typename AllEntities> inline static bool skip(const AllEntities& in)
     {
-        return (in.get(static_cast<ColumnAndShifts>(Settings::INVERSES))).is_zero();
+        constexpr auto inverse_column = static_cast<ColumnAndShifts>(Settings::INVERSES);
+        if constexpr (requires { in.edge_is_zero(inverse_column); }) {
+            return in.edge_is_zero(inverse_column);
+        } else {
+            return (in.get(inverse_column)).is_zero();
+        }
     }
 
     static std::string get_subrelation_label(size_t index)

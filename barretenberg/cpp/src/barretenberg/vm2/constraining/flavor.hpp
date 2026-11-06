@@ -269,6 +269,17 @@ class AvmFlavor {
         {}
 
         void set_current_edge(size_t edge_idx);
+
+        // This container only exposes linear extensions of source row pairs. Such an
+        // edge is identically zero exactly when both source evaluations are zero.
+        // Checking endpoints avoids materializing an inverse edge solely to skip it.
+        bool edge_is_zero(ColumnAndShifts c) const
+        {
+            const auto& polynomial = multivariates.get(c);
+            return polynomial.is_empty() || polynomial.end_index() < current_edge ||
+                   (polynomial[current_edge].is_zero() && polynomial[current_edge + 1].is_zero());
+        }
+
         const bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>& get(ColumnAndShifts c) const;
 
       private:
