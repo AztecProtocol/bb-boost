@@ -15,7 +15,9 @@
 #include "barretenberg/common/tuple.hpp"
 
 #include <limits>
+#include <optional>
 #include <span>
+#include <type_traits>
 #include <typeinfo>
 
 namespace bb {
@@ -31,11 +33,17 @@ namespace bb {
  * If a given row does not contain a lookup gate, the inverse polynomial is set to zero.
  *
  */
-template <typename FF, typename Relation, typename Polynomials, bool UseMultithreading = false>
+template <typename FF,
+          typename Relation,
+          typename Polynomials,
+          bool UseMultithreading = false,
+          bool UseVirtualZeroTails = false>
 void compute_logderivative_inverse(Polynomials& polynomials,
                                    auto& relation_parameters,
                                    const size_t start_index = 0,
-                                   const size_t end_index = std::numeric_limits<size_t>::max())
+                                   const size_t end_index = std::numeric_limits<size_t>::max(),
+                                   const size_t lookup_zero_from = std::numeric_limits<size_t>::max(),
+                                   const size_t table_zero_from = std::numeric_limits<size_t>::max())
 {
     BB_BENCH_NAME("compute_logderivative_inverse");
     using Accumulator = typename Relation::ValueAccumulator0;
@@ -47,7 +55,17 @@ void compute_logderivative_inverse(Polynomials& polynomials,
     // Clamp to the polynomial's actual (non-virtual) data extent; beyond end_index() everything is virtual zero.
     const size_t actual_end = std::min(inverse_polynomial.end_index(), end_index);
     const size_t actual_size = actual_end > offset ? actual_end - offset : 0;
+    static_assert(!UseVirtualZeroTails ||
+                  (NUM_LOOKUP_TERMS == 1 && NUM_TABLE_TERMS == 1 && std::is_same_v<Accumulator, FF>));
+    struct EmptyTailCache {};
+    struct ZeroTailCache {
+        std::optional<FF> lookup;
+        std::optional<FF> table;
+    };
     const auto compute_inverses = [&](size_t start, size_t end) {
+        // Opt-in callers prove that all inputs to a basic term are virtual raw zero beyond its bound.
+        // Evaluate the original term once there, preserving even its raw representative.
+        [[maybe_unused]] std::conditional_t<UseVirtualZeroTails, ZeroTailCache, EmptyTailCache> zero_terms;
         for (size_t i = start; i < end; ++i) {
             const size_t row_idx = i + offset;
             // TODO(https://github.com/AztecProtocol/barretenberg/issues/940): avoid get_row if possible.
@@ -58,13 +76,33 @@ void compute_logderivative_inverse(Polynomials& polynomials,
             }
             FF denominator = 1;
             bb::constexpr_for<0, NUM_LOOKUP_TERMS, 1>([&]<size_t lookup_index> {
-                auto denominator_term =
-                    Relation::template compute_lookup_term<Accumulator, lookup_index>(row, relation_parameters);
+                const auto denominator_term = [&]() {
+                    if constexpr (UseVirtualZeroTails) {
+                        if (row_idx >= lookup_zero_from) {
+                            if (!zero_terms.lookup.has_value()) {
+                                zero_terms.lookup = Relation::template compute_lookup_term<Accumulator, lookup_index>(
+                                    row, relation_parameters);
+                            }
+                            return *zero_terms.lookup;
+                        }
+                    }
+                    return Relation::template compute_lookup_term<Accumulator, lookup_index>(row, relation_parameters);
+                }();
                 denominator *= denominator_term;
             });
             bb::constexpr_for<0, NUM_TABLE_TERMS, 1>([&]<size_t table_index> {
-                auto denominator_term =
-                    Relation::template compute_table_term<Accumulator, table_index>(row, relation_parameters);
+                const auto denominator_term = [&]() {
+                    if constexpr (UseVirtualZeroTails) {
+                        if (row_idx >= table_zero_from) {
+                            if (!zero_terms.table.has_value()) {
+                                zero_terms.table = Relation::template compute_table_term<Accumulator, table_index>(
+                                    row, relation_parameters);
+                            }
+                            return *zero_terms.table;
+                        }
+                    }
+                    return Relation::template compute_table_term<Accumulator, table_index>(row, relation_parameters);
+                }();
                 denominator *= denominator_term;
             });
             inverse_polynomial.at(row_idx) = denominator;

@@ -26,6 +26,23 @@
 namespace bb::avm2 {
 
 using Flavor = AvmFlavor;
+
+namespace {
+template <typename Relation> inline constexpr bool CAN_CACHE_VIRTUAL_ZERO_TERMS = false;
+#ifndef __wasm__
+template <typename FF, typename Settings>
+inline constexpr bool CAN_CACHE_VIRTUAL_ZERO_TERMS<lookup_relation_base<FF, lookup_settings<Settings>>> = true;
+template <typename FF, typename Settings>
+inline constexpr bool CAN_CACHE_VIRTUAL_ZERO_TERMS<permutation_relation_base<FF, permutation_settings<Settings>>> =
+    true;
+// The generated list begins with a lookup and ends with a permutation. Untagged/custom families stay disabled.
+static_assert(CAN_CACHE_VIRTUAL_ZERO_TERMS<std::tuple_element_t<0, Flavor::LookupRelations>>);
+static_assert(CAN_CACHE_VIRTUAL_ZERO_TERMS<
+              std::tuple_element_t<std::tuple_size_v<Flavor::LookupRelations> - 1, Flavor::LookupRelations>>);
+#endif
+struct CustomOrAggregateInverseRelation {};
+static_assert(!CAN_CACHE_VIRTUAL_ZERO_TERMS<CustomOrAggregateInverseRelation>);
+} // namespace
 using FF = Flavor::FF;
 
 /**
@@ -116,8 +133,10 @@ void AvmProver::execute_log_derivative_inverse_round()
     relation_parameters.gamma = gamma;
     struct InverseJob {
         size_t end_index;
+        size_t lookup_zero_from;
+        size_t table_zero_from;
         std::function<void()> initialize;
-        std::function<void(size_t, size_t)> compute;
+        std::function<void(size_t, size_t, size_t, size_t)> compute;
     };
     std::vector<InverseJob> jobs;
     jobs.reserve(std::tuple_size_v<Flavor::LookupRelations>);
@@ -128,18 +147,34 @@ void AvmProver::execute_log_derivative_inverse_round()
             prover_polynomials.get(static_cast<ColumnAndShifts>(Relation::Settings::SRC_SELECTOR));
         const auto& dst_selector =
             prover_polynomials.get(static_cast<ColumnAndShifts>(Relation::Settings::DST_SELECTOR));
+        size_t lookup_zero_from = 0;
+        size_t table_zero_from = 0;
+        if constexpr (CAN_CACHE_VIRTUAL_ZERO_TERMS<Relation>) {
+            for (const auto column : Relation::Settings::SRC_COLUMNS) {
+                lookup_zero_from = std::max(lookup_zero_from, prover_polynomials.get(column).end_index());
+            }
+            for (const auto column : Relation::Settings::DST_COLUMNS) {
+                table_zero_from = std::max(table_zero_from, prover_polynomials.get(column).end_index());
+            }
+        }
         jobs.push_back({
             std::max(src_selector.end_index(), dst_selector.end_index()),
+            lookup_zero_from,
+            table_zero_from,
             [&]() {
                 constraining::resize_inverses(prover_polynomials,
                                               Relation::Settings::INVERSES,
                                               Relation::Settings::SRC_SELECTOR,
                                               Relation::Settings::DST_SELECTOR);
             },
-            [&](size_t start, size_t end) {
+            [&](size_t start, size_t end, size_t source_end, size_t destination_end) {
                 AVM_TRACK_TIME(std::string("prove/log_derivative_inverse_round/") + std::string(Relation::NAME),
-                               (compute_logderivative_inverse<FF, Relation, Flavor::ProverPolynomials, false>(
-                                   prover_polynomials, relation_parameters, start, end)));
+                               (compute_logderivative_inverse<FF,
+                                                              Relation,
+                                                              Flavor::ProverPolynomials,
+                                                              false,
+                                                              CAN_CACHE_VIRTUAL_ZERO_TERMS<Relation>>(
+                                   prover_polynomials, relation_parameters, start, end, source_end, destination_end)));
             },
         });
     });
@@ -168,7 +203,8 @@ void AvmProver::execute_log_derivative_inverse_round()
     // Each task computes and inverts only its own rows. No task starts a nested pool.
     bb::parallel_for(chunks.size(), [&](size_t i) {
         const auto& chunk = chunks[i];
-        jobs[chunk.job_index].compute(chunk.start, chunk.end);
+        const auto& job = jobs[chunk.job_index];
+        job.compute(chunk.start, chunk.end, job.lookup_zero_from, job.table_zero_from);
     });
 }
 
