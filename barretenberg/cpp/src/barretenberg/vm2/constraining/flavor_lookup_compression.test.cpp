@@ -150,3 +150,50 @@ TEST(AvmZeroAccumulation, EndpointProofAndBothCanonicalSubrelations)
 }
 } // namespace bb::avm2
 #endif
+
+namespace bb::avm2 {
+namespace {
+AvmFlavor::FF constant_edge_coarse_representative(AvmFlavor::FF value)
+{
+    value = value.reduce_once();
+    uint64_t carry = 0;
+    for (size_t limb = 0; limb < 4; ++limb) {
+        const uint64_t first = value.data[limb] + AvmFlavor::FF::modulus.data[limb];
+        const uint64_t first_carry = first < value.data[limb];
+        const uint64_t second = first + carry;
+        carry = first_carry | (second < first);
+        value.data[limb] = second;
+    }
+    return value;
+}
+} // namespace
+
+TEST(AvmConstantEdge, CanonicalExtensionAndCacheWithCoarseInputs)
+{
+    using FF = AvmFlavor::FF;
+    constexpr auto column = static_cast<ColumnAndShifts>(0);
+    const FF normalized = FF(7).reduce_once();
+    const FF coarse = constant_edge_coarse_representative(normalized);
+    const FF coarse_zero = constant_edge_coarse_representative(FF(0));
+    const std::array<FF, 12> values{ FF(7), FF(7), -FF(7), -FF(7), normalized, coarse,
+                                   coarse, coarse, coarse_zero, coarse_zero, FF(0), FF(13) };
+    for (size_t start = 0; start < 3; ++start) {
+        AvmFlavor::ProverPolynomials polynomials;
+        auto& polynomial = polynomials.get(column);
+        polynomial = AvmFlavor::Polynomial(12 - start, 16, start);
+        for (size_t row = start; row < 12; ++row) {
+            polynomial.at(row) = values[row - start];
+        }
+        AvmFlavor::LazilyExtendedProverUnivariates edges(polynomials);
+        for (size_t edge = 0; edge < 16; edge += 2) {
+            edges.set_current_edge(edge);
+            const auto expected = bb::Univariate<FF, 2>({ polynomial[edge], polynomial[edge + 1] })
+                                      .extend_to<AvmFlavor::MAX_PARTIAL_RELATION_LENGTH>();
+            const auto* actual = &edges.get(column);
+            EXPECT_EQ(::to_buffer(actual->evaluations), ::to_buffer(expected.evaluations)) << start << " " << edge;
+            EXPECT_EQ(&edges.get(column), actual);
+            EXPECT_EQ(::to_buffer(edges.get(column).evaluations), ::to_buffer(expected.evaluations));
+        }
+    }
+}
+} // namespace bb::avm2

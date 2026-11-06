@@ -129,8 +129,15 @@ const bb::Univariate<AvmFlavor::FF, AvmFlavor::MAX_PARTIAL_RELATION_LENGTH>& Avm
             static const auto zero_univariate = bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>::zero();
             cached[column] = &zero_univariate;
         } else {
-            const auto extended =
-                bb::Univariate<FF, 2>({ val0, val1 }).template extend_to<MAX_PARTIAL_RELATION_LENGTH>();
+            // Constant nonzero edges need only copies, not a subtraction and
+            // MAX_PARTIAL_RELATION_LENGTH - 2 field additions. Raw equality is cheap;
+            // different coarse representatives keep the original extension path.
+            const bool constant = val0.data[0] == val1.data[0] && val0.data[1] == val1.data[1] &&
+                                  val0.data[2] == val1.data[2] && val0.data[3] == val1.data[3];
+            const auto extended = constant
+                                      ? ExtendedUnivariate(val0)
+                                      : bb::Univariate<FF, 2>({ val0, val1 })
+                                            .template extend_to<MAX_PARTIAL_RELATION_LENGTH>();
             if (used == pool.size()) {
                 pool.push_back(std::make_unique<ExtendedUnivariate>(extended));
             } else {
