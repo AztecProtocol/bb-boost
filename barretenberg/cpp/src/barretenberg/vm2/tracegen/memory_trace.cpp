@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <type_traits>
 
 #include "barretenberg/common/assert.hpp"
 #include "barretenberg/vm2/common/field.hpp"
@@ -24,6 +25,19 @@
 
 namespace bb::avm2::tracegen {
 
+std::array<uint64_t, 2> MemoryTraceBuilder::get_event_sort_key(const simulation::MemoryEvent& event)
+{
+    static_assert(std::is_same_v<decltype(event.space_id), uint16_t>);
+    static_assert(std::is_same_v<decltype(event.addr), uint32_t>);
+    static_assert(std::is_same_v<decltype(event.execution_clk), uint32_t>);
+    static_assert(std::is_same_v<std::underlying_type_t<simulation::MemoryMode>, int32_t>);
+    // Bias signed mode into unsigned order. Do not assume only READ/WRITE values:
+    // this preserves the full existing comparator domain, including negative modes.
+    const uint32_t mode = static_cast<uint32_t>(static_cast<int32_t>(event.mode)) ^ (uint32_t{ 1 } << 31);
+    return { (static_cast<uint64_t>(event.space_id) << 32) | event.addr,
+             (static_cast<uint64_t>(event.execution_clk) << 32) | mode };
+}
+
 /**
  * @brief Processes memory events into the memory subtrace.
  *
@@ -38,16 +52,21 @@ void MemoryTraceBuilder::process(const simulation::EventEmitterInterface<simulat
     using simulation::MemoryEvent;
     using simulation::MemoryMode;
 
-    // Create a vector of pointers to avoid copying the events.
-    std::vector<const simulation::MemoryEvent*> event_ptrs;
+    // Cache immutable comparison keys beside pointers, avoiding scattered event
+    // reads on every comparison. No event payloads are copied or moved.
+    struct SortEntry {
+        std::array<uint64_t, 2> key;
+        const MemoryEvent* event;
+    };
+    std::vector<SortEntry> sorted_events;
     const size_t trace_size = events.size();
-    event_ptrs.reserve(trace_size);
+    sorted_events.reserve(trace_size);
 
     for (const auto& event : events) {
-        event_ptrs.push_back(&event);
+        sorted_events.push_back({ get_event_sort_key(event), &event });
     }
 
-    std::ranges::sort(event_ptrs, [](const auto* lhs, const auto* rhs) { return lhs->operator<(*rhs); });
+    std::ranges::sort(sorted_events, [](const auto& lhs, const auto& rhs) { return lhs.key < rhs.key; });
 
     using C = Column;
 
@@ -69,7 +88,7 @@ void MemoryTraceBuilder::process(const simulation::EventEmitterInterface<simulat
     uint32_t row = 1;
 
     for (uint32_t i = 0; i < trace_size; i++) {
-        const auto& event = *event_ptrs[i];
+        const auto& event = *sorted_events[i].event;
         const bool is_last = i + 1 == trace_size;
         const bool sel_tag_is_ff = event.value.get_tag() == MemoryTag::FF;
         const uint64_t global_addr = (static_cast<uint64_t>(event.space_id) << 32) + event.addr;
@@ -81,7 +100,7 @@ void MemoryTraceBuilder::process(const simulation::EventEmitterInterface<simulat
         uint64_t global_addr_diff = 0;
 
         if (!is_last) {
-            const auto& next_event = *event_ptrs[i + 1];
+            const auto& next_event = *sorted_events[i + 1].event;
             const uint64_t next_global_addr = (static_cast<uint64_t>(next_event.space_id) << 32) + next_event.addr;
             const uint64_t next_timestamp =
                 (static_cast<uint64_t>(next_event.execution_clk) << 1) + static_cast<uint64_t>(next_event.mode);
