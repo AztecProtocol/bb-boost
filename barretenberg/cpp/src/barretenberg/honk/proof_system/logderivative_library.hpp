@@ -14,6 +14,7 @@
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/common/tuple.hpp"
 
+#include <limits>
 #include <span>
 #include <typeinfo>
 
@@ -31,7 +32,10 @@ namespace bb {
  *
  */
 template <typename FF, typename Relation, typename Polynomials, bool UseMultithreading = false>
-void compute_logderivative_inverse(Polynomials& polynomials, auto& relation_parameters, const size_t start_index = 0)
+void compute_logderivative_inverse(Polynomials& polynomials,
+                                   auto& relation_parameters,
+                                   const size_t start_index = 0,
+                                   const size_t end_index = std::numeric_limits<size_t>::max())
 {
     BB_BENCH_NAME("compute_logderivative_inverse");
     using Accumulator = typename Relation::ValueAccumulator0;
@@ -41,7 +45,8 @@ void compute_logderivative_inverse(Polynomials& polynomials, auto& relation_para
     auto& inverse_polynomial = Relation::get_inverse_polynomial(polynomials);
     const size_t offset = std::max(inverse_polynomial.start_index(), start_index);
     // Clamp to the polynomial's actual (non-virtual) data extent; beyond end_index() everything is virtual zero.
-    const size_t actual_size = inverse_polynomial.end_index() > offset ? inverse_polynomial.end_index() - offset : 0;
+    const size_t actual_end = std::min(inverse_polynomial.end_index(), end_index);
+    const size_t actual_size = actual_end > offset ? actual_end - offset : 0;
     const auto compute_inverses = [&](size_t start, size_t end) {
         for (size_t i = start; i < end; ++i) {
             const size_t row_idx = i + offset;

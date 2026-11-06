@@ -114,28 +114,62 @@ void AvmProver::execute_log_derivative_inverse_round()
     auto [beta, gamma] = transcript->template get_challenges<FF>(std::array<std::string, 2>{ "beta", "gamma" });
     relation_parameters.beta = beta;
     relation_parameters.gamma = gamma;
-    std::vector<std::function<void()>> tasks;
+    struct InverseJob {
+        size_t end_index;
+        std::function<void()> initialize;
+        std::function<void(size_t, size_t)> compute;
+    };
+    std::vector<InverseJob> jobs;
+    jobs.reserve(std::tuple_size_v<Flavor::LookupRelations>);
 
-    // Iterate over all LookupRelations and for each relation create a task that:
-    // 1. Resizes the inverse polynomial based on the max end_index() of the source and destination selector
-    // 2. Computes the logderivative inverse
     bb::constexpr_for<0, std::tuple_size_v<Flavor::LookupRelations>, 1>([&]<size_t relation_idx>() {
         using Relation = std::tuple_element_t<relation_idx, Flavor::LookupRelations>;
-        tasks.push_back([&]() {
-            // We need to resize the inverse polynomials for the relation, now that the selectors have been computed.
-            constraining::resize_inverses(prover_polynomials,
-                                          Relation::Settings::INVERSES,
-                                          Relation::Settings::SRC_SELECTOR,
-                                          Relation::Settings::DST_SELECTOR);
-
-            AVM_TRACK_TIME(std::string("prove/log_derivative_inverse_round/") + std::string(Relation::NAME),
-                           (compute_logderivative_inverse<FF, Relation, Flavor::ProverPolynomials, false>(
-                               prover_polynomials, relation_parameters)));
+        const auto& src_selector =
+            prover_polynomials.get(static_cast<ColumnAndShifts>(Relation::Settings::SRC_SELECTOR));
+        const auto& dst_selector =
+            prover_polynomials.get(static_cast<ColumnAndShifts>(Relation::Settings::DST_SELECTOR));
+        jobs.push_back({
+            std::max(src_selector.end_index(), dst_selector.end_index()),
+            [&]() {
+                constraining::resize_inverses(prover_polynomials,
+                                              Relation::Settings::INVERSES,
+                                              Relation::Settings::SRC_SELECTOR,
+                                              Relation::Settings::DST_SELECTOR);
+            },
+            [&](size_t start, size_t end) {
+                AVM_TRACK_TIME(std::string("prove/log_derivative_inverse_round/") + std::string(Relation::NAME),
+                               (compute_logderivative_inverse<FF, Relation, Flavor::ProverPolynomials, false>(
+                                   prover_polynomials, relation_parameters, start, end)));
+            },
         });
     });
 
-    // Execute all the tasks in parallel
-    bb::parallel_for(tasks.size(), [&](size_t i) { tasks[i](); });
+    // Allocate each relation's destination once before publishing disjoint row ranges.
+    bb::parallel_for(jobs.size(), [&](size_t i) { jobs[i].initialize(); });
+
+    struct InverseChunk {
+        size_t job_index;
+        size_t start;
+        size_t end;
+    };
+    std::vector<InverseChunk> chunks;
+    constexpr size_t MAX_ROWS_PER_CHUNK = 1 << 16;
+    const bool split_rows = bb::get_num_cpus() > 1;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const size_t end = jobs[i].end_index;
+        const size_t chunk_size = split_rows ? MAX_ROWS_PER_CHUNK : std::max(size_t{ 1 }, end);
+        for (size_t start = 0; start < end;) {
+            const size_t chunk_end = start + std::min(chunk_size, end - start);
+            chunks.push_back({ i, start, chunk_end });
+            start = chunk_end;
+        }
+    }
+
+    // Each task computes and inverts only its own rows. No task starts a nested pool.
+    bb::parallel_for(chunks.size(), [&](size_t i) {
+        const auto& chunk = chunks[i];
+        jobs[chunk.job_index].compute(chunk.start, chunk.end);
+    });
 }
 
 void AvmProver::execute_log_derivative_inverse_commitments_round()
