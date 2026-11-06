@@ -138,11 +138,16 @@ void _accumulate_logderivative_subrelation_contributions(ContainerOverSubrelatio
     //      (lookup_term_1 * .. * lookup_term_(i-1)) * lookup_inverse * (lookup_term_(i+1) * .. * table_term_m)
 
     // Collect all the terms in a single vector, first the lookup terms, then the table terms
-    bb::constexpr_for<0, NUM_LOOKUP_TERMS, 1>(
-        [&]<size_t i>() { lookup_terms[i] = Relation::template compute_lookup_term<Accumulator, i>(in, params); });
-    bb::constexpr_for<0, NUM_TABLE_TERMS, 1>([&]<size_t i>() {
-        lookup_terms[i + NUM_LOOKUP_TERMS] = Relation::template compute_table_term<Accumulator, i>(in, params);
-    });
+    if constexpr (NUM_LOOKUP_TERMS == 1 && NUM_TABLE_TERMS == 1 &&
+                  requires { in.template compress_lookup_pair<Accumulator, typename Relation::LinearLookupSettings>(params); }) {
+        lookup_terms = in.template compress_lookup_pair<Accumulator, typename Relation::LinearLookupSettings>(params);
+    } else {
+        bb::constexpr_for<0, NUM_LOOKUP_TERMS, 1>(
+            [&]<size_t i>() { lookup_terms[i] = Relation::template compute_lookup_term<Accumulator, i>(in, params); });
+        bb::constexpr_for<0, NUM_TABLE_TERMS, 1>([&]<size_t i>() {
+            lookup_terms[i + NUM_LOOKUP_TERMS] = Relation::template compute_table_term<Accumulator, i>(in, params);
+        });
+    }
 
     // 1) Construct the successive products
     bb::constexpr_for<0, NUM_TOTAL_TERMS, 1>([&]<size_t i>() { denominator_accumulator[i] = lookup_terms[i]; });

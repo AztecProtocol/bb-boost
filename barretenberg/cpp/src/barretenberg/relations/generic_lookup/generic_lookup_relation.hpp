@@ -7,6 +7,7 @@
 #pragma once
 #include <array>
 #include <tuple>
+#include <type_traits>
 
 #include "barretenberg/common/constexpr_utils.hpp"
 #include "barretenberg/honk/proof_system/logderivative_library.hpp"
@@ -246,6 +247,13 @@ template <typename Settings, typename FF_> class GenericLookupRelationImpl {
 
     static constexpr size_t NUM_LOOKUP_TERMS = Settings::NUM_LOOKUP_TERMS;
     static constexpr size_t NUM_TABLE_TERMS = Settings::NUM_TABLE_TERMS;
+    // Only ordinary single read/write terms are linear tuple compressions.
+    using LinearLookupSettings = std::conditional_t<NUM_LOOKUP_TERMS == 1 && NUM_TABLE_TERMS == 1 &&
+                                                       Settings::LOOKUP_TYPES[0] == BASIC_LOOKUP &&
+                                                       Settings::TABLE_TYPES[0] == BASIC_TABLE,
+                                                   Settings,
+                                                   void>;
+
 
     /**
      * When performing a basic lookup, we batch columns for efficiency. This constant represents the number of columns

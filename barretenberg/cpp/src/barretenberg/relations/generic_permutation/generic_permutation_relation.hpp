@@ -69,6 +69,7 @@ template <typename Settings, typename FF_> class GenericPermutationRelationImpl 
   public:
     using FF = FF_;
     using PolynomialStructure = PermutationPolynomialStructure<Settings>;
+    using LinearLookupSettings = Settings;
 
     // The term counts should stay set to 1 unless we want to permute several columns at once as accumulated
     // sets (not as tuples).

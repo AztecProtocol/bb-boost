@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <concepts>
 #include <bitset>
 #include <memory>
 #include <vector>
@@ -281,6 +282,36 @@ class AvmFlavor {
         }
 
         const bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>& get(ColumnAndShifts c) const;
+
+        // Both compressed lookup tuples remain linear in the edge variable. Pack
+        // their endpoints together to keep the native four-lane multiplication
+        // path, then extend only the two compressed results.
+        template <typename Accumulator, typename Settings, typename Parameters>
+        std::array<Accumulator, 2> compress_lookup_pair(const Parameters& params) const
+            requires requires {
+                requires (Accumulator::LENGTH >= 4);
+                requires std::same_as<Accumulator, bb::Univariate<FF, Accumulator::LENGTH>>;
+                requires (Settings::SRC_COLUMNS.size() >= 2);
+                requires (Settings::SRC_COLUMNS.size() == Settings::DST_COLUMNS.size());
+            }
+        {
+            bb::Univariate<FF, 4> packed(FF(0));
+            bb::constexpr_for<0, Settings::SRC_COLUMNS.size(), 1>([&]<size_t i>() {
+                const auto& source = get(Settings::SRC_COLUMNS[i]);
+                const auto& destination = get(Settings::DST_COLUMNS[i]);
+                packed *= params.beta;
+                packed.value_at(0) += source.value_at(0);
+                packed.value_at(1) += source.value_at(1);
+                packed.value_at(2) += destination.value_at(0);
+                packed.value_at(3) += destination.value_at(1);
+            });
+            packed += params.gamma;
+            return { bb::Univariate<FF, 2>({ packed.value_at(0), packed.value_at(1) })
+                         .template extend_to<Accumulator::LENGTH>(),
+                     bb::Univariate<FF, 2>({ packed.value_at(2), packed.value_at(3) })
+                         .template extend_to<Accumulator::LENGTH>() };
+        }
+
 
       private:
         size_t current_edge = 0;
