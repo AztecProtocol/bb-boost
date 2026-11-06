@@ -262,7 +262,7 @@ void AvmProver::execute_pcs_rounds()
     // Assign the batched unshifted polynomial according to whether the largest poly was among the to be shifted polys
     // or not
     Polynomial batched_unshifted;
-    if (unshifted_polys[max_idx_unshifted].end_index() > batched_shifted.end_index()) {
+    if (unshifted_polys[max_idx_unshifted].end_index() >= batched_shifted.end_index()) {
         batched_unshifted = std::move(unshifted_polys[max_idx_unshifted]);
         batched_unshifted *= unshifted_challenges[max_idx_unshifted];
         batched_unshifted += batched_shifted;
