@@ -293,10 +293,18 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
             small_arena_bytes = std::max(small_arena_bytes, bytes);
         }
         // The per-worker arenas are one contiguous block of `num_workers * small_arena_bytes`.
-        // Cap it at one MSM's budget so a wide batch doesn't hold many full arenas at once,
-        // matching the large-member path's single reused arena of the same budget.
+        // Native servers may keep more independent small MSMs busy at once. This aggregate
+        // allowance does not change any individual MSM's 32 MiB window/layout budget.
+        // 2 GiB bounds this experiment to 64 such budgets; it is not a tuned optimum.
+        // Compared with the old aggregate cap, the arena block can grow by at most 2016 MiB.
+        // Other worker/TLS allocations and RSS must still be measured separately.
+#ifdef __wasm__
+        constexpr size_t aggregate_arena_budget = round_parallel_detail::BATCH_MEM_BUDGET;
+#else
+        constexpr size_t aggregate_arena_budget = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+#endif
         const size_t workers_by_budget =
-            small_arena_bytes > 0 ? std::max<size_t>(1, round_parallel_detail::BATCH_MEM_BUDGET / small_arena_bytes)
+            small_arena_bytes > 0 ? std::max<size_t>(1, aggregate_arena_budget / small_arena_bytes)
                                   : std::numeric_limits<size_t>::max();
         const size_t num_workers = std::min({ pool_width, small_members.size(), workers_by_budget });
         std::unique_ptr<std::byte[]> small_arena_owner; // NOLINT(cppcoreguidelines-avoid-c-arrays)
