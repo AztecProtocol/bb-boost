@@ -15,6 +15,55 @@ using plookup::ColumnIdx;
 using plookup::MultiTableId;
 using namespace bb;
 
+#ifndef __wasm__
+namespace {
+// The builders still generate every lookup witness and gate. Only the returned field_t wrappers
+// are selected: constructing or tagging a wrapper does not modify its builder or witness value.
+template <typename Builder, size_t N>
+std::array<field_t<Builder>, N> read_selected_lookup_rows(const MultiTableId id,
+                                                        const field_t<Builder>& key_a,
+                                                        const field_t<Builder>& key_b,
+                                                        const bool is_2_to_1_lookup,
+                                                        const std::array<ColumnIdx, N>& columns,
+                                                        const std::array<bool, N>& last_rows)
+{
+    Builder* ctx = key_a.get_context() ? key_a.get_context() : key_b.get_context();
+    const auto lookup_data =
+        plookup::get_lookup_accumulators(id, key_a.get_value(), key_b.get_value(), is_2_to_1_lookup);
+    const auto row = [&](size_t i) { return last_rows[i] ? lookup_data[columns[i]].size() - 1 : 0; };
+    std::array<field_t<Builder>, N> result;
+    if (key_a.is_constant() && (key_b.is_constant() || !is_2_to_1_lookup)) {
+        for (size_t i = 0; i < N; ++i) {
+            result[i] = field_t<Builder>(ctx, lookup_data[columns[i]][row(i)]);
+        }
+        return result;
+    }
+
+    // Keep the normalization and constant-witness operations in the same order as the full API.
+    uint32_t lhs_index = key_a.get_witness_index();
+    uint32_t rhs_index = key_b.get_witness_index();
+    if (key_a.is_constant()) {
+        lhs_index = ctx->put_constant_variable(key_a.get_value());
+    }
+    if (key_b.is_constant() && is_2_to_1_lookup) {
+        rhs_index = ctx->put_constant_variable(key_b.get_value());
+    }
+    auto key_b_witness = std::make_optional(rhs_index);
+    if (rhs_index == stdlib::IS_CONSTANT) {
+        key_b_witness = std::nullopt;
+    }
+    const auto accumulator_witnesses =
+        ctx->create_gates_from_plookup_accumulators(id, lookup_data, lhs_index, key_b_witness);
+    const auto merged_tag = OriginTag(key_a.get_origin_tag(), key_b.get_origin_tag());
+    for (size_t i = 0; i < N; ++i) {
+        result[i] = field_t<Builder>::from_witness_index(ctx, accumulator_witnesses[columns[i]][row(i)]);
+        result[i].set_origin_tag(merged_tag);
+    }
+    return result;
+}
+} // namespace
+#endif
+
 template <typename Builder>
 plookup::ReadData<field_t<Builder>> plookup_read<Builder>::get_lookup_accumulators(const MultiTableId id,
                                                                                    const field_t<Builder>& key_a,
@@ -74,9 +123,14 @@ template <typename Builder>
 std::pair<field_t<Builder>, field_t<Builder>> plookup_read<Builder>::read_pair_from_table(const MultiTableId id,
                                                                                           const field_t<Builder>& key)
 {
+#ifndef __wasm__
+    auto result = read_selected_lookup_rows<Builder, 2>(id, key, 0, false, { ColumnIdx::C2, ColumnIdx::C3 }, { false, false });
+    return { std::move(result[0]), std::move(result[1]) };
+#else
     const auto lookup = get_lookup_accumulators(id, key);
 
     return { lookup[ColumnIdx::C2][0], lookup[ColumnIdx::C3][0] };
+#endif
 }
 
 template <typename Builder>
@@ -84,18 +138,40 @@ field_t<Builder> plookup_read<Builder>::read_from_2_to_1_table(const MultiTableI
                                                                const field_t<Builder>& key_a,
                                                                const field_t<Builder>& key_b)
 {
+#ifndef __wasm__
+    auto result = read_selected_lookup_rows<Builder, 1>(id, key_a, key_b, true, { ColumnIdx::C3 }, { false });
+    return std::move(result[0]);
+#else
     const auto lookup = get_lookup_accumulators(id, key_a, key_b, /*is_2_to_1_lookup=*/true);
 
     return lookup[ColumnIdx::C3][0];
+#endif
 }
 
 template <typename Builder>
 field_t<Builder> plookup_read<Builder>::read_from_1_to_2_table(const MultiTableId id, const field_t<Builder>& key_a)
 {
+#ifndef __wasm__
+    auto result = read_selected_lookup_rows<Builder, 1>(id, key_a, 0, false, { ColumnIdx::C2 }, { false });
+    return std::move(result[0]);
+#else
     const auto lookup = get_lookup_accumulators(id, key_a);
 
     return lookup[ColumnIdx::C2][0];
+#endif
 }
+
+#ifndef __wasm__
+// Return the reconstructed second column and the final third-column slice, without materializing
+// the other circuit-field wrappers. The underlying lookup queries, witnesses and gates are unchanged.
+template <typename Builder>
+std::pair<field_t<Builder>, field_t<Builder>> plookup_read<Builder>::read_first_and_last_from_table(
+    const MultiTableId id, const field_t<Builder>& key)
+{
+    auto result = read_selected_lookup_rows<Builder, 2>(id, key, 0, false, { ColumnIdx::C2, ColumnIdx::C3 }, { false, true });
+    return { std::move(result[0]), std::move(result[1]) };
+}
+#endif
 
 template class plookup_read<bb::UltraCircuitBuilder>;
 // Plookup-backed: only the arithmetizations that keep the lookup gate.

@@ -33,6 +33,10 @@ template <typename Builder> class plookup_read {
 
   public:
     static std::pair<field_pt, field_pt> read_pair_from_table(const plookup::MultiTableId id, const field_pt& key);
+#ifndef __wasm__
+    // Select C2[0] and C3[last]; all lookup witnesses and constraints are still generated.
+    static std::pair<field_pt, field_pt> read_first_and_last_from_table(const plookup::MultiTableId id, const field_pt& key);
+#endif
 
     static field_pt read_from_2_to_1_table(const plookup::MultiTableId id,
                                            const field_pt& key_a,
