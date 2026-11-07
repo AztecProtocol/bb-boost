@@ -741,6 +741,12 @@ template <typename BigField> class stdlib_bigfield : public testing::Test {
             fq_native expected = (a_native * b_native) + c_native;
             expected = expected.from_montgomery_form_reduced();
             uint512_t result = d_ct.get_value();
+            if (a_type == InputType::CONSTANT && b_type == InputType::CONSTANT &&
+                c_type == InputType::WITNESS) {
+                // This branch delegates to sum(), whose value may be unreduced.
+                // Only this newly covered branch needs the canonical field oracle.
+                result = result % uint512_t(fq_native::modulus);
+            }
 
             EXPECT_EQ(result.lo.data[0], expected.data[0]);
             EXPECT_EQ(result.lo.data[1], expected.data[1]);
@@ -2362,6 +2368,8 @@ TYPED_TEST(stdlib_bigfield, madd)
 }
 TYPED_TEST(stdlib_bigfield, madd_with_constants)
 {
+    TestFixture::test_madd(InputType::CONSTANT, InputType::CONSTANT, InputType::WITNESS);  // c * c + w
+    TestFixture::test_madd(InputType::CONSTANT, InputType::CONSTANT, InputType::CONSTANT); // c * c + c
     TestFixture::test_madd(InputType::WITNESS, InputType::WITNESS, InputType::CONSTANT);  // w * w + c
     TestFixture::test_madd(InputType::WITNESS, InputType::CONSTANT, InputType::WITNESS);  // w * c + w
     TestFixture::test_madd(InputType::WITNESS, InputType::CONSTANT, InputType::CONSTANT); // w * c + c

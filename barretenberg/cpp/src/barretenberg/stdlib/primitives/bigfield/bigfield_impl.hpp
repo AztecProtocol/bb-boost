@@ -1070,14 +1070,11 @@ bigfield<Builder, T> bigfield<Builder, T>::madd(const bigfield& to_mul, const st
     const uint1024_t add_right(add_values);
     const uint1024_t modulus(target_basis.modulus);
 
-    const auto [quotient_1024, remainder_1024] = (left * mul_right + add_right).divmod(modulus);
-
-    const uint512_t quotient_value = quotient_1024.lo;
-    const uint512_t remainder_value = remainder_1024.lo;
-
     bigfield remainder;
     bigfield quotient;
     if (is_constant() && to_mul.is_constant() && add_constant) {
+        const auto [_, remainder_1024] = (left * mul_right + add_right).divmod(modulus);
+        const uint512_t remainder_value = remainder_1024.lo;
         remainder = bigfield(ctx, uint256_t(remainder_value.lo));
         return remainder;
     } else if (is_constant() && to_mul.is_constant()) {
@@ -1096,6 +1093,10 @@ bigfield<Builder, T> bigfield<Builder, T>::madd(const bigfield& to_mul, const st
             }
             return (*this).madd(to_mul, to_add);
         }
+        // Only compute the quotient and remainder after ruling out paths that do not consume them.
+        const auto [quotient_1024, remainder_1024] = (left * mul_right + add_right).divmod(modulus);
+        const uint512_t quotient_value = quotient_1024.lo;
+        const uint512_t remainder_value = remainder_1024.lo;
         quotient = create_from_u512_as_witness(ctx, quotient_value, false, num_quotient_bits);
         remainder = create_from_u512_as_witness(ctx, remainder_value);
     };
