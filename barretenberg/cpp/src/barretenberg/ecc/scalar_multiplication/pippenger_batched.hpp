@@ -256,6 +256,66 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
                                           max_large_n <= total_large_n / pool_width;
 #endif
 
+    // A few independent large native MSMs can instead share the CPU budget,
+    // each using a private multi-threaded arena. Keep the established wide-AVM
+    // single-thread-per-member policy above unchanged.
+    size_t large_job_count = 0;
+    [[maybe_unused]] size_t threads_per_large_job = 0;
+    [[maybe_unused]] size_t large_job_arena_bytes = 0;
+#if !defined(__wasm__) && !defined(NO_MULTITHREADING) && SIZE_MAX > UINT32_MAX
+    constexpr size_t MIN_LARGE_JOB_THREADS = 4;
+    constexpr size_t MAX_LARGE_JOBS = 4;
+    // Admission cap on canonical arena payload only, not expected allocation or
+    // a process RSS bound (GLV storage, sort scratch and thread stacks are extra).
+    constexpr size_t LARGE_JOB_ARENA_PAYLOAD_CAP = size_t{ 16 } << 30;
+    if (!large_members_concurrent && large_members.size() >= 2 &&
+        pool_width >= 2 * MIN_LARGE_JOB_THREADS && total_large_n >= (size_t{ 1 } << 18)) {
+        // The kernel temporarily converts scalar backing in place and restores
+        // it. Sequential large members allowed repeated/overlapping spans, so
+        // preserve that path unless every concurrent mutable span is disjoint.
+        bool disjoint_scalars = true;
+        for (size_t i = 0; i < large_members.size() && disjoint_scalars; ++i) {
+            const size_t a = large_members[i];
+            if (n_input[a] > std::numeric_limits<size_t>::max() / sizeof(ScalarField)) {
+                disjoint_scalars = false;
+                break;
+            }
+            const uintptr_t first = reinterpret_cast<uintptr_t>(scalar_arrays[a].data());
+            const size_t first_bytes = n_input[a] * sizeof(ScalarField);
+            for (size_t j = 0; j < i; ++j) {
+                const size_t b = large_members[j];
+                const uintptr_t second = reinterpret_cast<uintptr_t>(scalar_arrays[b].data());
+                const size_t second_bytes = n_input[b] * sizeof(ScalarField);
+                if (first <= second ? second - first < first_bytes : first - second < second_bytes) {
+                    disjoint_scalars = false;
+                    break;
+                }
+            }
+        }
+        const size_t max_jobs = std::min({ MAX_LARGE_JOBS, large_members.size(), pool_width / MIN_LARGE_JOB_THREADS });
+        for (size_t jobs = disjoint_scalars ? max_jobs : 0; jobs >= 2; --jobs) {
+            const size_t average = total_large_n / jobs;
+            // Avoid assigning most of the work to one independently capped job.
+            if (max_large_n > average + average / 2) {
+                continue;
+            }
+            const size_t threads = pool_width / jobs;
+            size_t arena_bytes = 0;
+            for (size_t m : large_members) {
+                const bool ext_glv = !external_glv_for(m, n_input[m]).empty();
+                arena_bytes = std::max(arena_bytes,
+                                       compute_arena_bytes_for_msm<Curve>(n_input[m], ext_glv, info_for(m), threads));
+            }
+            if (arena_bytes <= LARGE_JOB_ARENA_PAYLOAD_CAP / jobs) {
+                large_job_count = jobs;
+                threads_per_large_job = threads;
+                large_job_arena_bytes = arena_bytes;
+                break;
+            }
+        }
+    }
+#endif
+
     // Shared dynamically-sized arena for the sequential (large-member) calls. Sized to
     // the max requirement across those members so each MSM_fast finds enough space; a
     // single allocation across the batch (vs one per MSM_fast if we passed {} down).
@@ -264,7 +324,7 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
     size_t shared_arena_bytes = 0;
     std::unique_ptr<std::byte[]> shared_arena_owner; // NOLINT(cppcoreguidelines-avoid-c-arrays)
     std::span<std::byte> shared_arena;
-    if (!large_members_concurrent) {
+    if (!large_members_concurrent && large_job_count == 0) {
         for (size_t m : large_members) {
             const bool ext_glv = !external_glv_for(m, n_input[m]).empty();
             // The internal short-circuits to trivial_msm_threaded for tiny MSMs, so the hint
@@ -358,6 +418,58 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
                     sp, point_arrays[m], info_for(m), external_glv_for(m, n), {}, /*max_threads=*/1);
             }
         });
+#if !defined(__wasm__) && !defined(NO_MULTITHREADING) && SIZE_MAX > UINT32_MAX
+    } else if (large_job_count != 0) {
+        BB_BENCH_NAME("MSM_fast::pippenger_round_parallel_batched/large_member_jobs");
+        std::sort(
+            large_members.begin(), large_members.end(), [&](size_t a, size_t b) { return n_input[a] > n_input[b]; });
+        std::atomic<size_t> next_large{ 0 };
+        auto* const bench_parent = bb::detail::GlobalBenchStatsContainer::parent;
+        std::vector<std::thread> jobs;
+        jobs.reserve(large_job_count);
+        for (size_t job = 0; job < large_job_count; ++job) {
+            try {
+                jobs.emplace_back([&] {
+                    // A new caller thread owns a new TLS pool. Set its width
+                    // BEFORE the first MSM dispatch; active job widths together
+                    // never exceed the original caller's pool_width.
+                    bb::set_parallel_for_concurrency(threads_per_large_job);
+                    bb::detail::GlobalBenchStatsContainer::parent = bench_parent;
+                    std::unique_ptr<std::byte[]> owner; // NOLINT(cppcoreguidelines-avoid-c-arrays)
+                    std::span<std::byte> arena;
+                    if (large_job_arena_bytes != 0) {
+                        owner = std::make_unique_for_overwrite<std::byte[]>(large_job_arena_bytes);
+                        arena = { owner.get(), large_job_arena_bytes };
+                    }
+                    while (true) {
+                        const size_t index = next_large.fetch_add(1, std::memory_order_relaxed);
+                        if (index >= large_members.size()) {
+                            break;
+                        }
+                        const size_t m = large_members[index];
+                        const size_t n = n_input[m];
+                        PolynomialSpan<const ScalarField> sp(0, std::span<const ScalarField>(scalar_arrays[m].data(), n));
+                        out_results[m] = pippenger_round_parallel<Curve>(
+                            sp, point_arrays[m], info_for(m), external_glv_for(m, n), arena, threads_per_large_job);
+                    }
+                });
+            } catch (const std::system_error&) {
+                // Any successfully created jobs still drain the complete queue.
+                // If none could start, use the original per-member fallback below.
+                break;
+            }
+        }
+        for (auto& job : jobs) {
+            job.join();
+        }
+        if (jobs.empty()) {
+            for (size_t m : large_members) {
+                const size_t n = n_input[m];
+                PolynomialSpan<const ScalarField> sp(0, std::span<const ScalarField>(scalar_arrays[m].data(), n));
+                out_results[m] = pippenger_round_parallel<Curve>(sp, point_arrays[m], info_for(m), external_glv_for(m, n));
+            }
+        }
+#endif
     } else {
         // Sequential large-member dispatch: one member at a time, each running the full single-
         // MSM_fast pipeline (its own from-Mont and to-Mont, schedule, Stage 1-6b) across the whole
