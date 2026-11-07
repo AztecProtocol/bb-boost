@@ -293,6 +293,30 @@ template <class T> constexpr field<T> field<T>::to_montgomery_form() const noexc
 
 template <class T> constexpr field<T> field<T>::from_montgomery_form() const noexcept
 {
+#if defined(__SIZEOF_INT128__) && !defined(__wasm__)
+    if constexpr (T::modulus_3 != 0 && T::modulus_3 < MODULUS_TOP_LIMB_LARGE_THRESHOLD) {
+        if (!std::is_constant_evaluated()) {
+            // REDC(y) with no product to form: y already occupies only four words. Use four fixed
+            // reduction rounds, avoiding the structural zero products of multiplication by raw one.
+            uint64_t t0 = data[0], t1 = data[1], t2 = data[2], t3 = data[3];
+            auto reduce_word = [&] {
+                const uint64_t q = t0 * T::r_inv;
+                uint64_t carry = mac_discard_lo(t0, q, T::modulus_0);
+                t0 = mac(t1, q, T::modulus_1, carry, carry);
+                t1 = mac(t2, q, T::modulus_2, carry, carry);
+                t2 = mac(t3, q, T::modulus_3, carry, carry);
+                t3 = carry;
+            };
+            reduce_word();
+            reduce_word();
+            reduce_word();
+            reduce_word();
+            field result{ t0, t1, t2, t3 };
+            result.assert_coarse_form();
+            return result;
+        }
+    }
+#endif
     constexpr field one_raw{ 1, 0, 0, 0 };
     return operator*(one_raw);
 }
@@ -306,6 +330,14 @@ template <class T> constexpr void field<T>::self_to_montgomery_form() & noexcept
 
 template <class T> constexpr void field<T>::self_from_montgomery_form() & noexcept
 {
+#if defined(__SIZEOF_INT128__) && !defined(__wasm__)
+    if constexpr (T::modulus_3 != 0 && T::modulus_3 < MODULUS_TOP_LIMB_LARGE_THRESHOLD) {
+        if (!std::is_constant_evaluated()) {
+            *this = from_montgomery_form();
+            return;
+        }
+    }
+#endif
     constexpr field one_raw{ 1, 0, 0, 0 };
     *this *= one_raw;
 }

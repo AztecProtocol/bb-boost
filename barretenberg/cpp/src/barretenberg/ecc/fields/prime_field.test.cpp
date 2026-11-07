@@ -21,6 +21,7 @@
 #include "barretenberg/numeric/random/engine.hpp"
 #include "barretenberg/numeric/uint256/uint256.hpp"
 #include "barretenberg/serialize/test_helper.hpp"
+#include <array>
 #include <gtest/gtest.h>
 
 using namespace bb;
@@ -798,5 +799,86 @@ TYPED_TEST(PrimeFieldTwoFiftyFourTest, ToMontgomeryFormNoReductionNeeded)
         uint256_t result_internal(result.data[0], result.data[1], result.data[2], result.data[3]);
         EXPECT_LT(result_internal, two_p)
             << "Edge case: Result of to_montgomery_form exceeds [0, 2p) for offset " << offset;
+    }
+}
+
+namespace {
+template <typename F> void check_conversion_against_raw_one(const F& input)
+{
+    const F original_product = input * F{ 1, 0, 0, 0 };
+    const F original_reduced = original_product.reduce_once();
+    const F product = input.from_montgomery_form();
+    const F reduced = input.from_montgomery_form_reduced();
+    F self_product = input;
+    self_product.self_from_montgomery_form();
+    F self_reduced = input;
+    self_reduced.self_from_montgomery_form_reduced();
+    for (size_t limb = 0; limb < 4; ++limb) {
+        EXPECT_EQ(product.data[limb], original_product.data[limb]);
+        EXPECT_EQ(reduced.data[limb], original_reduced.data[limb]);
+        EXPECT_EQ(self_product.data[limb], original_product.data[limb]);
+        EXPECT_EQ(self_reduced.data[limb], original_reduced.data[limb]);
+    }
+}
+} // namespace
+
+TYPED_TEST(PrimeFieldTest, FromMontgomerySmallValuesAndCoarseRepresentatives)
+{
+    using F = TypeParam;
+    constexpr F constant_input(17);
+    constexpr F constant_result = constant_input.from_montgomery_form_reduced();
+    static_assert(constant_result.data[0] == 17 && constant_result.data[1] == 0 && constant_result.data[2] == 0 &&
+                  constant_result.data[3] == 0);
+    const uint64_t top = F::modulus.data[3];
+    const uint256_t maximum{ UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX };
+    for (const uint64_t value : std::array<uint64_t, 13>{ 0,
+                                                          1,
+                                                          2,
+                                                          65535,
+                                                          65536,
+                                                          uint64_t(1) << 32,
+                                                          (uint64_t(1) << 63) - 1,
+                                                          uint64_t(1) << 63,
+                                                          UINT64_MAX,
+                                                          top - 1,
+                                                          top,
+                                                          top + 1,
+                                                          top + 2 }) {
+        const F input = F(value).reduce_once();
+        check_conversion_against_raw_one(input);
+        const F reduced = input.from_montgomery_form_reduced();
+        EXPECT_EQ(reduced.data[0], value);
+        EXPECT_EQ(reduced.data[1] | reduced.data[2] | reduced.data[3], 0U);
+        const uint256_t raw{ input.data[0], input.data[1], input.data[2], input.data[3] };
+        if (raw <= maximum - F::modulus) {
+            const uint256_t coarse = raw + F::modulus;
+            check_conversion_against_raw_one(F{ coarse.data[0], coarse.data[1], coarse.data[2], coarse.data[3] });
+        }
+    }
+}
+
+TYPED_TEST(PrimeFieldTest, FromMontgomeryArbitraryRawWords)
+{
+    using F = TypeParam;
+    const uint256_t maximum{ UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX };
+    const uint256_t twice_p = F::modulus + F::modulus;
+    for (const uint256_t& raw : std::array<uint256_t, 8>{
+             uint256_t(0), F::modulus - 1, F::modulus, F::modulus + 1, twice_p - 1, twice_p, twice_p + 1, maximum }) {
+        check_conversion_against_raw_one(F{ raw.data[0], raw.data[1], raw.data[2], raw.data[3] });
+    }
+    for (size_t bit = 0; bit < 256; ++bit) {
+        const uint256_t raw = uint256_t(1) << bit;
+        check_conversion_against_raw_one(F{ raw.data[0], raw.data[1], raw.data[2], raw.data[3] });
+    }
+    uint64_t state = 0x9e3779b97f4a7c15ULL;
+    auto next = [&]() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+    for (size_t i = 0; i < 4096; ++i) {
+        const std::array<uint64_t, 4> words{ next(), next(), next(), next() };
+        check_conversion_against_raw_one(F{ words[0], words[1], words[2], words[3] });
     }
 }
