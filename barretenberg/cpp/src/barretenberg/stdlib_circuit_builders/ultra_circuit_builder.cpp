@@ -21,6 +21,7 @@
 #include "barretenberg/honk/execution_trace/generated/mega_zk_execution_trace_generated.hpp"
 #include "bounded_range_sort.hpp"
 #include "rom_ram_logic.hpp"
+#include <type_traits>
 
 #include "barretenberg/crypto/sha256/sha256.hpp"
 #include "barretenberg/serialize/msgpack_impl.hpp"
@@ -600,12 +601,12 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
     for (size_t i = 0; i < num_full_limbs; ++i) {
         const auto limb_idx = this->add_variable(bb::fr(sublimbs[i]));
         sublimb_indices.emplace_back(limb_idx);
-        create_small_range_constraint(limb_idx, sublimb_mask);
+        register_small_range_constraint(limb_idx, sublimb_mask, sublimbs[i], "create_small_range_constraint");
     }
     if (has_remainder_bits) {
         const auto limb_idx = this->add_variable(bb::fr(sublimbs.back()));
         sublimb_indices.emplace_back(limb_idx);
-        create_small_range_constraint(limb_idx, last_limb_range);
+        register_small_range_constraint(limb_idx, last_limb_range, sublimbs.back(), "create_small_range_constraint");
     }
 
     // Prove that the limbs reconstruct the original value by processing limbs in groups of 3.
@@ -690,9 +691,26 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_small_range_constraint(const u
                                                                          const uint64_t target_range,
                                                                          std::string_view msg)
 {
-    // make sure `target_range` is not too big.
+    register_small_range_constraint(variable_index, target_range, RangeWitnessValue{}, msg);
+}
+
+template <typename ExecutionTrace>
+template <typename ValueSource>
+void UltraCircuitBuilder_<ExecutionTrace>::register_small_range_constraint(const uint32_t variable_index,
+                                                                           const uint64_t target_range,
+                                                                           ValueSource value_source,
+                                                                           std::string_view msg)
+{
+    // Keep the original public check in this body so its field temporaries do not span another helper call.
     BB_ASSERT_GTE(MAX_SMALL_RANGE_CONSTRAINT_VAL, target_range);
-    const bool is_out_of_range = (uint256_t(this->get_variable(variable_index)).data[0] > target_range);
+    const bool is_out_of_range = [&] {
+        if constexpr (std::is_same_v<ValueSource, RangeWitnessValue>) {
+            return uint256_t(this->get_variable(variable_index)).data[0] > target_range;
+        } else {
+            static_assert(std::is_same_v<ValueSource, uint64_t>);
+            return value_source > target_range;
+        }
+    }();
     if (is_out_of_range && !this->failed()) {
         this->failure(std::string(msg));
     }

@@ -201,6 +201,15 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         UltraCircuitBuilderData::cached_partial_non_native_field_multiplication;
 
   private:
+    // One registration body for arbitrary witnesses and exact native sub-limbs. The empty source tag
+    // lets the public entry point delegate without preparing field temporaries or native-value arguments.
+    struct RangeWitnessValue {};
+    template <typename ValueSource>
+    void register_small_range_constraint(uint32_t variable_index,
+                                         uint64_t target_range,
+                                         ValueSource value_source,
+                                         std::string_view msg);
+
     // The set of lookup tables used by the circuit, plus the gate data for the lookups from each table
     std::deque<plookup::BasicTable> lookup_tables;
 

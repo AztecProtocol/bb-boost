@@ -222,3 +222,27 @@ TEST(UltraCircuitBuilder, BoundedRangeSortValidAndInvalidWitnesses)
 }
 
 } // namespace bb
+
+namespace bb {
+TEST(UltraCircuitBuilder, NativeSubLimbAdmissionPreservesRangeChecks)
+{
+    for (const uint64_t bits : std::array<uint64_t, 5>{ 14, 15, 28, 68, 253 }) {
+        for (const size_t shape : std::array<size_t, 3>{ 0, 1, 2 }) {
+            UltraCircuitBuilder builder;
+            const uint256_t value =
+                shape == 0 ? uint256_t(0) : (shape == 1 ? (uint256_t(1) << bits) - 1 : uint256_t(1) << bits);
+            const uint32_t index = builder.add_variable(fr(value));
+            const auto limbs = builder.create_limbed_range_constraint(index, bits, 14, "native-limb-test");
+            EXPECT_EQ(limbs.size(), (bits + 13) / 14);
+            for (size_t i = 0; i < limbs.size(); ++i) {
+                EXPECT_EQ(builder.get_variable(limbs[i]), fr((value >> (i * 14)).data[0] & uint64_t(16383)));
+            }
+            EXPECT_EQ(builder.failed(), shape == 2);
+            if (shape == 2) {
+                EXPECT_EQ(builder.err(), "native-limb-test");
+            }
+            EXPECT_EQ(CircuitChecker::check(builder), shape != 2);
+        }
+    }
+}
+} // namespace bb
