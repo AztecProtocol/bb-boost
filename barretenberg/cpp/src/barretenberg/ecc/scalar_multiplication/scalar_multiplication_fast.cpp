@@ -22,6 +22,10 @@
 #include <memory>
 #include <span>
 #include <vector>
+#if !defined(__wasm__) && !defined(NO_MULTITHREADING) && SIZE_MAX > UINT32_MAX
+#include <system_error>
+#include <thread>
+#endif
 
 #ifdef __wasm_simd128__
 #include <wasm_simd128.h>
