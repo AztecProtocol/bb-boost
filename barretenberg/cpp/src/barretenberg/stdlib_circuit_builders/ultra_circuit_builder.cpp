@@ -19,6 +19,7 @@
 #include "barretenberg/honk/execution_trace/generated/mega_execution_trace_generated.hpp"
 #include "barretenberg/honk/execution_trace/generated/mega_kernel_execution_trace_generated.hpp"
 #include "barretenberg/honk/execution_trace/generated/mega_zk_execution_trace_generated.hpp"
+#include "bounded_range_sort.hpp"
 #include "rom_ram_logic.hpp"
 
 #include "barretenberg/crypto/sha256/sha256.hpp"
@@ -770,18 +771,24 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::pr
     // argument).
     std::vector<uint32_t> sorted_list;
     sorted_list.reserve(list.variable_indices.size());
+    bool values_in_range = true;
     for (const auto variable_index : list.variable_indices) {
         // note that `field_element` is < 32 bits as the corresponding witness has a non-trivial range-constraint.
         const auto& field_element = this->get_variable(variable_index);
-        const uint32_t shrinked_value = static_cast<uint32_t>(field_element);
+        // Convert once, as the original uint32_t field conversion did, then validate the full value.
+        const uint256_t native_value = static_cast<uint256_t>(field_element);
+        values_in_range = values_in_range && native_value <= uint256_t(list.target_range);
+        const uint32_t shrinked_value = static_cast<uint32_t>(native_value.data[0]);
         sorted_list.emplace_back(shrinked_value);
     }
 
+    if (!values_in_range || !range_sort::try_counting_sort(sorted_list, list.target_range)) {
 #ifdef NO_PAR_ALGOS
-    std::sort(sorted_list.begin(), sorted_list.end());
+        std::sort(sorted_list.begin(), sorted_list.end());
 #else
-    std::sort(std::execution::par_unseq, sorted_list.begin(), sorted_list.end());
+        std::sort(std::execution::par_unseq, sorted_list.begin(), sorted_list.end());
 #endif
+    }
     // list must be padded to a multipe of 4 and larger than 4 (gate_width)
     constexpr size_t gate_width = NUM_WIRES;
     size_t padding = (gate_width - (list.variable_indices.size() % gate_width)) % gate_width;
