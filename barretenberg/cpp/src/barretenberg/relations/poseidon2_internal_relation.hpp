@@ -164,6 +164,50 @@ template <typename FF_> class Poseidon2InternalRelationImpl {
         barycentric_term += scaled_u1;
         std::get<3>(evals) += barycentric_term;
     };
+#ifndef __wasm__
+    // Native prover batching: combine the four linear terms before their common selector product.
+    struct SubrelationBatchingConstants {
+        FF sbox;
+        std::array<FF, 3> wires;
+        std::array<FF, 4> shifts;
+    };
+
+    static SubrelationBatchingConstants compute_subrelation_batching_constants(const std::array<FF, 4>& w)
+    {
+        const auto sum = w[0] + w[1] + w[2] + w[3];
+        return { w[0] * D1 + w[1] + w[2] + w[3],
+                 { sum + w[1] * D2_minus_1, sum + w[2] * D3_minus_1, sum + w[3] * D4_minus_1 },
+                 w };
+    }
+
+    template <typename ContainerOverSubrelations, typename AllEntities, typename Parameters>
+    static void accumulate_with_subrelation_batching(ContainerOverSubrelations& evals,
+                                                     const AllEntities& in,
+                                                     const Parameters&,
+                                                     const FF& scaling_factor,
+                                                     const SubrelationBatchingConstants& constants)
+    {
+        using Accumulator = std::tuple_element_t<0, ContainerOverSubrelations>;
+        using Coeff = typename Accumulator::CoefficientAccumulator;
+        using Id = typename AllEntities::EntityId;
+        const auto s1 = Accumulator(Coeff(in[Id::w_l]) + Coeff(in[Id::q_l]));
+        auto u1 = s1.sqr();
+        u1 = u1.sqr();
+        u1 *= s1;
+        const auto q_scaled = Coeff(in[Id::q_poseidon2_internal]) * scaling_factor;
+        auto linear = Coeff(in[Id::w_r]) * constants.wires[0];
+        linear += Coeff(in[Id::w_o]) * constants.wires[1];
+        linear += Coeff(in[Id::w_4]) * constants.wires[2];
+        linear -= Coeff(in[Id::w_l_shift]) * constants.shifts[0];
+        linear -= Coeff(in[Id::w_r_shift]) * constants.shifts[1];
+        linear -= Coeff(in[Id::w_o_shift]) * constants.shifts[2];
+        linear -= Coeff(in[Id::w_4_shift]) * constants.shifts[3];
+        auto body = u1 * Accumulator(q_scaled * constants.sbox);
+        body += Accumulator(linear * q_scaled);
+        std::get<0>(evals) += body;
+    }
+#endif
+
 }; // namespace bb
 
 template <typename FF> using Poseidon2InternalRelation = Relation<Poseidon2InternalRelationImpl<FF>>;

@@ -160,6 +160,50 @@ template <typename FF_> class Poseidon2ExternalRelationImpl {
 
         std::get<3>(evals) += q_pos_by_scaling * (v4 - Accumulator(w_4_shift));
     };
+#ifndef __wasm__
+    // Native prover batching: transpose the external matrix onto the round's subrelation weights.
+    struct SubrelationBatchingConstants {
+        std::array<FF, 4> sbox;
+        std::array<FF, 4> shifts;
+    };
+
+    static SubrelationBatchingConstants compute_subrelation_batching_constants(const std::array<FF, 4>& w)
+    {
+        return { { w[0] * FF(5) + w[1] * FF(4) + w[2] + w[3],
+                   w[0] * FF(7) + w[1] * FF(6) + w[2] * FF(3) + w[3],
+                   w[0] + w[1] + w[2] * FF(5) + w[3] * FF(4),
+                   w[0] * FF(3) + w[1] + w[2] * FF(7) + w[3] * FF(6) },
+                 w };
+    }
+
+    template <typename ContainerOverSubrelations, typename AllEntities, typename Parameters>
+    static void accumulate_with_subrelation_batching(ContainerOverSubrelations& evals,
+                                                     const AllEntities& in,
+                                                     const Parameters&,
+                                                     const FF& scaling_factor,
+                                                     const SubrelationBatchingConstants& constants)
+    {
+        using Accumulator = std::tuple_element_t<0, ContainerOverSubrelations>;
+        using Coeff = typename Accumulator::CoefficientAccumulator;
+        using Id = typename AllEntities::EntityId;
+        // m*x^5 = (x^2)^2*(m*x): apply the weight to two coefficients, not seven evaluations.
+        auto weighted_sbox = [](const auto& x, const FF& weight) -> Accumulator {
+            const Accumulator square(x.sqr());
+            return square.sqr() * Accumulator(x * weight);
+        };
+        auto body = weighted_sbox(Coeff(in[Id::w_l]) + Coeff(in[Id::q_l]), constants.sbox[0]);
+        body += weighted_sbox(Coeff(in[Id::w_r]) + Coeff(in[Id::q_r]), constants.sbox[1]);
+        body += weighted_sbox(Coeff(in[Id::w_o]) + Coeff(in[Id::q_o]), constants.sbox[2]);
+        body += weighted_sbox(Coeff(in[Id::w_4]) + Coeff(in[Id::q_4]), constants.sbox[3]);
+        auto shifts = Coeff(in[Id::w_l_shift]) * constants.shifts[0];
+        shifts += Coeff(in[Id::w_r_shift]) * constants.shifts[1];
+        shifts += Coeff(in[Id::w_o_shift]) * constants.shifts[2];
+        shifts += Coeff(in[Id::w_4_shift]) * constants.shifts[3];
+        body -= Accumulator(shifts);
+        std::get<0>(evals) += Accumulator(Coeff(in[Id::q_poseidon2_external]) * scaling_factor) * body;
+    }
+#endif
+
 };
 
 template <typename FF> using Poseidon2ExternalRelation = Relation<Poseidon2ExternalRelationImpl<FF>>;
