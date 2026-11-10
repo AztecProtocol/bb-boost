@@ -1,5 +1,9 @@
 #include "barretenberg/vm2/avm_api.hpp"
 
+#include <future>
+
+#include "barretenberg/common/thread.hpp"
+#include "barretenberg/vm2/constraining/flavor.hpp"
 #include "barretenberg/vm2/proving_helper.hpp"
 #include "barretenberg/vm2/simulation_helper.hpp"
 #include "barretenberg/vm2/tooling/debugger.hpp"
@@ -10,8 +14,28 @@ namespace bb::avm2 {
 
 using namespace bb::avm2::simulation;
 
+namespace {
+// Without multithreading the CRS factory has no mutex, so the CRS is loaded where it is first needed.
+#ifdef NO_MULTITHREADING
+constexpr auto CRS_LOAD_POLICY = std::launch::deferred;
+#else
+constexpr auto CRS_LOAD_POLICY = std::launch::async;
+#endif
+} // namespace
+
 AvmAPI::AvmProof AvmAPI::prove(const AvmAPI::ProvingInputs& inputs)
 {
+    // The proving key's commitment key needs the CRS for the full (fixed) circuit size, which does not depend on the
+    // inputs. Build the same commitment key on a background thread so that reading and decoding the CRS overlaps
+    // simulation and trace generation; the CRS factory keeps the points, so the proving key later finds them loaded.
+    // The parallel_for thread count is per thread, so the loading thread takes the caller's.
+    auto crs_loaded = std::async(CRS_LOAD_POLICY, [num_cpus = get_num_cpus()] {
+        if (get_num_cpus() != num_cpus) {
+            set_parallel_for_concurrency(num_cpus);
+        }
+        [[maybe_unused]] AvmFlavor::CommitmentKey commitment_key(AvmFlavor::ProvingKey::circuit_size);
+    });
+
     // Simulate.
     vinfo("Simulating...");
     AvmSimulationHelper simulation_helper;
@@ -23,6 +47,9 @@ AvmAPI::AvmProof AvmAPI::prove(const AvmAPI::ProvingInputs& inputs)
     AvmTraceGenHelper tracegen_helper;
     auto trace =
         AVM_TRACK_TIME_V("tracegen/all", tracegen_helper.generate_trace(std::move(events), inputs.public_inputs));
+
+    // Waits for the CRS; a loading error is rethrown here, before any proving work starts.
+    crs_loaded.get();
 
     // Prove.
     vinfo("Proving...");
