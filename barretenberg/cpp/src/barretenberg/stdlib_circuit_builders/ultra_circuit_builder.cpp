@@ -637,15 +637,18 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
     // set the correct range constraint on each limb. note that when there are remainder bits, the last limb must be
     // constrained to a smaller range.
     const size_t num_full_limbs = has_remainder_bits ? sublimbs.size() - 1 : sublimbs.size();
+    RangeList* list = nullptr;
     for (size_t i = 0; i < num_full_limbs; ++i) {
         const auto limb_idx = this->add_variable(bb::fr(sublimbs[i]));
         sublimb_indices.emplace_back(limb_idx);
-        register_small_range_constraint(limb_idx, sublimb_mask, sublimbs[i], "create_small_range_constraint");
+        register_new_variable_range_constraint(
+            limb_idx, sublimb_mask, sublimbs[i], list, "create_small_range_constraint");
     }
     if (has_remainder_bits) {
         const auto limb_idx = this->add_variable(bb::fr(sublimbs.back()));
         sublimb_indices.emplace_back(limb_idx);
-        register_small_range_constraint(limb_idx, last_limb_range, sublimbs.back(), "create_small_range_constraint");
+        register_new_variable_range_constraint(
+            limb_idx, last_limb_range, sublimbs.back(), list, "create_small_range_constraint");
     }
 
     // Prove that the limbs reconstruct the original value by processing limbs in groups of 3.
@@ -753,14 +756,10 @@ void UltraCircuitBuilder_<ExecutionTrace>::register_small_range_constraint(const
     if (is_out_of_range && !this->failed()) {
         this->failure(std::string(msg));
     }
-    auto list_it = range_lists.find(target_range);
-    if (list_it == range_lists.end()) {
-        list_it = range_lists.emplace(target_range, create_range_list(target_range)).first;
-    }
+    auto& list = get_or_create_range_list(target_range);
     // The tag of `variable_index` is `DEFAULT_TAG` if it has never been range-constrained and a non-trivial value
     // otherwise.
     const auto existing_tag = this->real_variable_tags[this->real_variable_index[variable_index]];
-    auto& list = list_it->second;
 
     // If the variable's tag matches the target range list's tag, do nothing; the variable has _already_ been
     // constrained to this exact range (i.e., `create_new_range_constraint(variable_index, target_range)` has already
@@ -806,6 +805,38 @@ void UltraCircuitBuilder_<ExecutionTrace>::register_small_range_constraint(const
     }
     // should never occur
     BB_ASSERT(found_tag);
+}
+
+template <typename ExecutionTrace>
+typename UltraCircuitBuilder_<ExecutionTrace>::RangeList& UltraCircuitBuilder_<
+    ExecutionTrace>::get_or_create_range_list(const uint64_t target_range)
+{
+    auto list_it = range_lists.find(target_range);
+    if (list_it == range_lists.end()) {
+        list_it = range_lists.emplace(target_range, create_range_list(target_range)).first;
+    }
+    return list_it->second;
+}
+
+template <typename ExecutionTrace>
+void UltraCircuitBuilder_<ExecutionTrace>::register_new_variable_range_constraint(const uint32_t variable_index,
+                                                                                  const uint64_t target_range,
+                                                                                  const uint64_t value,
+                                                                                  RangeList*& list,
+                                                                                  std::string_view msg)
+{
+    BB_ASSERT_GTE(MAX_SMALL_RANGE_CONSTRAINT_VAL, target_range);
+    if (value > target_range && !this->failed()) {
+        this->failure(std::string(msg));
+    }
+    // std::map does not relocate its elements, so the cached list stays valid while other lists are inserted.
+    if (list == nullptr || list->target_range != target_range) {
+        list = &get_or_create_range_list(target_range);
+    }
+    BB_ASSERT_DEBUG(this->real_variable_index[variable_index] == variable_index);
+    BB_ASSERT_DEBUG(this->real_variable_tags[variable_index] == DEFAULT_TAG);
+    this->real_variable_tags[variable_index] = list->range_tag;
+    list->variable_indices.emplace_back(variable_index);
 }
 
 template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::process_range_list(RangeList& list)
@@ -1233,14 +1264,15 @@ void UltraCircuitBuilder_<ExecutionTrace>::range_constrain_two_limbs(const uint3
     }
     this->increment_num_gates(3);
 
+    RangeList* list = nullptr;
     for (size_t i = 0; i < 5; i++) {
         if (lo_masks[i] != 0) {
-            register_small_range_constraint(
-                lo_sublimbs[i], lo_masks[i], lo_values[i], "ultra_circuit_builder: sublimb of low too large");
+            register_new_variable_range_constraint(
+                lo_sublimbs[i], lo_masks[i], lo_values[i], list, "ultra_circuit_builder: sublimb of low too large");
         }
         if (hi_masks[i] != 0) {
-            register_small_range_constraint(
-                hi_sublimbs[i], hi_masks[i], hi_values[i], "ultra_circuit_builder: sublimb of hi too large");
+            register_new_variable_range_constraint(
+                hi_sublimbs[i], hi_masks[i], hi_values[i], list, "ultra_circuit_builder: sublimb of hi too large");
         }
     }
 };

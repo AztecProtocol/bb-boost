@@ -210,6 +210,15 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
                                          ValueSource value_source,
                                          std::string_view msg);
 
+    // The range list of `target_range`, created if it does not exist yet.
+    RangeList& get_or_create_range_list(uint64_t target_range);
+
+    // register_small_range_constraint for a variable the caller has just created and not yet tagged or
+    // copy-constrained, with its value: such a variable is its own real variable and carries DEFAULT_TAG, so it joins
+    // the list without the tag checks. `list` caches the list of the caller's previous registration.
+    void register_new_variable_range_constraint(
+        uint32_t variable_index, uint64_t target_range, uint64_t value, RangeList*& list, std::string_view msg);
+
     // create_lookup_gate with its q_3 selector, FF(table.table_index), supplied by the caller.
     void append_lookup_gate(uint32_t key_idx,
                             uint32_t val1_idx,
