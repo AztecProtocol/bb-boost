@@ -828,8 +828,8 @@ bigfield<Builder, T> bigfield<Builder, T>::internal_div(const std::vector<bigfie
         inverse_value = uint512_t(uint256_t(numerator_native * denominator_inverse));
     }
 
-    const uint1024_t quotient_1024 =
-        (uint1024_t(inverse_value) * right + unreduced_zero().get_value() - left) / modulus;
+    static const uint512_t unreduced_zero_value = unreduced_zero().get_value();
+    const uint1024_t quotient_1024 = (uint1024_t(inverse_value) * right + unreduced_zero_value - left) / modulus;
     const uint512_t quotient_value = quotient_1024.lo;
 
     bigfield inverse;

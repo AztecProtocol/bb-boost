@@ -69,7 +69,7 @@ template <typename BigField> class BigfieldCircuitIdentity : public testing::Tes
     {
         EXPECT_EQ(actual.get_context(), ctx);
         for (size_t i = 0; i < fq_ct::NUM_LIMBS; ++i) {
-            const Limb reference(field_ct(ctx, fr(value.slice(i * L, (i + 1) * L))));
+            const Limb reference{ field_ct(ctx, fr(value.slice(i * L, (i + 1) * L))) };
             expect_same_field(actual.get_limb(i).element, reference.element);
             EXPECT_EQ(actual.get_limb(i).maximum_value, reference.maximum_value);
         }
@@ -96,6 +96,29 @@ template <typename BigField> class BigfieldCircuitIdentity : public testing::Tes
         expect_constant_layout(nullptr, fq_ct::zero(), uint256_t(0));
         EXPECT_EQ(builder.get_num_variables(), Builder().get_num_variables());
     }
+
+    static void test_unreduced_zero()
+    {
+        const uint512_t multiple =
+            ((fq_ct::get_maximum_unreduced_value() / fq_ct::modulus_u512) + 1) * fq_ct::modulus_u512;
+        const uint64_t msb = multiple.get_msb();
+        const std::array<uint256_t, fq_ct::NUM_LIMBS> slices{ multiple.slice(0, L).lo,
+                                                              multiple.slice(L, 2 * L).lo,
+                                                              multiple.slice(2 * L, 3 * L).lo,
+                                                              multiple.slice(3 * L, msb + 1).lo };
+        for (size_t call = 0; call < 2; ++call) {
+            const fq_ct actual = fq_ct::unreduced_zero();
+            EXPECT_EQ(actual.get_context(), nullptr);
+            for (size_t i = 0; i < fq_ct::NUM_LIMBS; ++i) {
+                const Limb reference{ field_ct(fr(slices[i])) };
+                expect_same_field(actual.get_limb(i).element, reference.element);
+                EXPECT_EQ(actual.get_limb(i).maximum_value, reference.maximum_value);
+            }
+            expect_same_field(actual.get_prime_basis_limb(),
+                              field_ct(uint256_t((multiple % uint512_t(fr::modulus)).lo)));
+            EXPECT_EQ(actual.get_value(), multiple);
+        }
+    }
 };
 
 using CircuitTypes = testing::Types<typename stdlib::bn254<UltraCircuitBuilder>::BaseField,
@@ -108,4 +131,9 @@ TYPED_TEST_SUITE(BigfieldCircuitIdentity, CircuitTypes);
 TYPED_TEST(BigfieldCircuitIdentity, ConstantConstructors)
 {
     TestFixture::test_constant_constructors();
+}
+
+TYPED_TEST(BigfieldCircuitIdentity, UnreducedZero)
+{
+    TestFixture::test_unreduced_zero();
 }

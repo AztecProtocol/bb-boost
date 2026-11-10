@@ -699,19 +699,22 @@ template <typename Builder, typename T> class bigfield {
      */
     static bigfield unreduced_zero()
     {
-        // The multiple of the modulus is a fixed value, so it is computed once
-        static const uint512_t multiple_of_modulus =
-            ((get_maximum_unreduced_value() / modulus_u512) + 1) * modulus_u512;
-        static const uint256_t prime_basis_value = (multiple_of_modulus % uint512_t(field_t<Builder>::modulus)).lo;
-        const auto msb = multiple_of_modulus.get_msb();
+        // A context-free constant fixed by the moduli, so it is built once and copied
+        static const bigfield unreduced_zero_constant = [] {
+            const uint512_t multiple_of_modulus = ((get_maximum_unreduced_value() / modulus_u512) + 1) * modulus_u512;
+            const uint256_t prime_basis_value = (multiple_of_modulus % uint512_t(field_t<Builder>::modulus)).lo;
+            const auto msb = multiple_of_modulus.get_msb();
 
-        bigfield result(nullptr, uint256_t(0));
-        result.binary_basis_limbs[0] = Limb(bb::fr(multiple_of_modulus.slice(0, NUM_LIMB_BITS).lo));
-        result.binary_basis_limbs[1] = Limb(bb::fr(multiple_of_modulus.slice(NUM_LIMB_BITS, 2 * NUM_LIMB_BITS).lo));
-        result.binary_basis_limbs[2] = Limb(bb::fr(multiple_of_modulus.slice(2 * NUM_LIMB_BITS, 3 * NUM_LIMB_BITS).lo));
-        result.binary_basis_limbs[3] = Limb(bb::fr(multiple_of_modulus.slice(3 * NUM_LIMB_BITS, msb + 1).lo));
-        result.prime_basis_limb = field_t<Builder>(prime_basis_value);
-        return result;
+            bigfield result(nullptr, uint256_t(0));
+            result.binary_basis_limbs[0] = Limb(bb::fr(multiple_of_modulus.slice(0, NUM_LIMB_BITS).lo));
+            result.binary_basis_limbs[1] = Limb(bb::fr(multiple_of_modulus.slice(NUM_LIMB_BITS, 2 * NUM_LIMB_BITS).lo));
+            result.binary_basis_limbs[2] =
+                Limb(bb::fr(multiple_of_modulus.slice(2 * NUM_LIMB_BITS, 3 * NUM_LIMB_BITS).lo));
+            result.binary_basis_limbs[3] = Limb(bb::fr(multiple_of_modulus.slice(3 * NUM_LIMB_BITS, msb + 1).lo));
+            result.prime_basis_limb = field_t<Builder>(prime_basis_value);
+            return result;
+        }();
+        return unreduced_zero_constant;
     }
 
     /**
