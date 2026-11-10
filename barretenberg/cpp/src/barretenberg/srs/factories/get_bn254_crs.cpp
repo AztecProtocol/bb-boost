@@ -10,7 +10,16 @@
 #include "bn254_g1_chunk_hashes.hpp"
 #include "http_download.hpp"
 #include <atomic>
+#include <cerrno>
+#include <cstring>
+#include <exception>
+#include <memory>
+#include <mutex>
 #include <span>
+#if !defined(__wasm__) && !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace {
 // Primary CRS URL (Cloudflare R2)
@@ -35,11 +44,39 @@ void write_uncompressed_g1_points(const std::vector<bb::g1::affine_element>& poi
     bb::write_file(path, buf);
 }
 
+#if !defined(__wasm__) && !defined(_WIN32)
+/**
+ * @brief pread exactly `size` bytes at `offset`, retrying short reads and EINTR. Returns false on error or EOF.
+ */
+bool pread_exact(int fd, uint8_t* dst, size_t size, size_t offset)
+{
+    while (size > 0) {
+        const ssize_t got = ::pread(fd, dst, size, static_cast<off_t>(offset));
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            return false;
+        }
+        dst += got;
+        size -= static_cast<size_t>(got);
+        offset += static_cast<size_t>(got);
+    }
+    return true;
+}
+#endif
+
 /**
  * @brief Read uncompressed G1 points (64 bytes each) from a file.
+ *
+ * @details Each thread preads its own contiguous slice of the file into a small buffer and deserializes straight into
+ * `points`. The file is never staged whole in a separate 64-byte-per-point buffer (which cost a serial zero-fill and a
+ * serial read of the entire file before any conversion started), and the reads proceed in parallel. Every point is
+ * still parsed by the same `from_buffer` from the same bytes.
  */
 std::vector<bb::g1::affine_element> read_uncompressed_g1_points(const std::filesystem::path& path, size_t num_points)
 {
+#if defined(__wasm__) || defined(_WIN32)
     auto data = bb::read_file(path, num_points * UNCOMPRESSED_POINT_SIZE);
     if (num_points > data.size() / UNCOMPRESSED_POINT_SIZE) {
         throw_or_abort("Truncated uncompressed BN254 CRS");
@@ -51,6 +88,61 @@ std::vector<bb::g1::affine_element> read_uncompressed_g1_points(const std::files
         }
     });
     return points;
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        throw_or_abort("Unable to open " + path.string() + ": " + strerror(errno));
+    }
+    // Closed on every exit, including an exception from starting the workers.
+    const auto close_fd = [](const int* owned) { ::close(*owned); };
+    const std::unique_ptr<const int, decltype(close_fd)> fd_owner(&fd, close_fd);
+    std::vector<bb::g1::affine_element> points(num_points);
+    std::atomic<bool> read_failed{ false };
+    std::exception_ptr parse_error;
+    std::mutex parse_error_mutex;
+    bb::parallel_for([&](bb::ThreadChunk chunk) {
+#ifndef BB_NO_EXCEPTIONS
+        try {
+#endif
+            constexpr size_t POINTS_PER_READ = 1024;
+            std::vector<uint8_t> buf(POINTS_PER_READ * UNCOMPRESSED_POINT_SIZE);
+            auto range = chunk.range(num_points);
+            if (range.empty()) {
+                return;
+            }
+            const size_t begin = *range.begin();
+            const size_t end = begin + range.size();
+            for (size_t first = begin; first < end; first += POINTS_PER_READ) {
+                const size_t count = std::min(POINTS_PER_READ, end - first);
+                if (!pread_exact(fd, buf.data(), count * UNCOMPRESSED_POINT_SIZE, first * UNCOMPRESSED_POINT_SIZE)) {
+                    read_failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                for (size_t k = 0; k < count; ++k) {
+                    points[first + k] = from_buffer<bb::g1::affine_element>(buf, k * UNCOMPRESSED_POINT_SIZE);
+                }
+            }
+#ifndef BB_NO_EXCEPTIONS
+        } catch (...) {
+            // from_buffer rejects a point off the curve. Caught here so that every worker is done with the
+            // descriptor before the first error is rethrown.
+            const std::lock_guard<std::mutex> lock(parse_error_mutex);
+            if (!parse_error) {
+                parse_error = std::current_exception();
+            }
+        }
+#endif
+    });
+#ifndef BB_NO_EXCEPTIONS
+    if (parse_error) {
+        std::rethrow_exception(parse_error);
+    }
+#endif
+    if (read_failed.load()) {
+        throw_or_abort("Failed to read " + std::to_string(num_points) + " points from " + path.string());
+    }
+    return points;
+#endif
 }
 
 /**
