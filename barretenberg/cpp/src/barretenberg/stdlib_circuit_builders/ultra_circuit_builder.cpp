@@ -753,13 +753,14 @@ void UltraCircuitBuilder_<ExecutionTrace>::register_small_range_constraint(const
     if (is_out_of_range && !this->failed()) {
         this->failure(std::string(msg));
     }
-    if (range_lists.count(target_range) == 0) {
-        range_lists.insert({ target_range, create_range_list(target_range) });
+    auto list_it = range_lists.find(target_range);
+    if (list_it == range_lists.end()) {
+        list_it = range_lists.emplace(target_range, create_range_list(target_range)).first;
     }
     // The tag of `variable_index` is `DEFAULT_TAG` if it has never been range-constrained and a non-trivial value
     // otherwise.
     const auto existing_tag = this->real_variable_tags[this->real_variable_index[variable_index]];
-    auto& list = range_lists[target_range];
+    auto& list = list_it->second;
 
     // If the variable's tag matches the target range list's tag, do nothing; the variable has _already_ been
     // constrained to this exact range (i.e., `create_new_range_constraint(variable_index, target_range)` has already
