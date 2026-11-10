@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <type_traits>
 #if !defined(__wasm__) && !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
@@ -66,29 +67,16 @@ bool pread_exact(int fd, uint8_t* dst, size_t size, size_t offset)
 }
 #endif
 
+#if !defined(__wasm__) && !defined(_WIN32)
 /**
- * @brief Read uncompressed G1 points (64 bytes each) from a file.
+ * @brief Read `num_points` uncompressed G1 points (64 bytes each) from a file into `dst`, which may be uninitialised.
  *
  * @details Each thread preads its own contiguous slice of the file into a small buffer and deserializes straight into
- * `points`. The file is never staged whole in a separate 64-byte-per-point buffer (which cost a serial zero-fill and a
- * serial read of the entire file before any conversion started), and the reads proceed in parallel. Every point is
- * still parsed by the same `from_buffer` from the same bytes.
+ * `dst`, so the file is never staged whole in a separate buffer, the reads proceed in parallel, and each output page is
+ * first touched by the thread that fills it. Every point is parsed by the same `from_buffer` from the same bytes.
  */
-std::vector<bb::g1::affine_element> read_uncompressed_g1_points(const std::filesystem::path& path, size_t num_points)
+void read_uncompressed_g1_points_into(const std::filesystem::path& path, bb::g1::affine_element* dst, size_t num_points)
 {
-#if defined(__wasm__) || defined(_WIN32)
-    auto data = bb::read_file(path, num_points * UNCOMPRESSED_POINT_SIZE);
-    if (num_points > data.size() / UNCOMPRESSED_POINT_SIZE) {
-        throw_or_abort("Truncated uncompressed BN254 CRS");
-    }
-    std::vector<bb::g1::affine_element> points(num_points);
-    bb::parallel_for([&](bb::ThreadChunk chunk) {
-        for (auto i : chunk.range(num_points)) {
-            points[i] = from_buffer<bb::g1::affine_element>(data, i * UNCOMPRESSED_POINT_SIZE);
-        }
-    });
-    return points;
-#else
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         throw_or_abort("Unable to open " + path.string() + ": " + strerror(errno));
@@ -96,7 +84,6 @@ std::vector<bb::g1::affine_element> read_uncompressed_g1_points(const std::files
     // Closed on every exit, including an exception from starting the workers.
     const auto close_fd = [](const int* owned) { ::close(*owned); };
     const std::unique_ptr<const int, decltype(close_fd)> fd_owner(&fd, close_fd);
-    std::vector<bb::g1::affine_element> points(num_points);
     std::atomic<bool> read_failed{ false };
     std::exception_ptr parse_error;
     std::mutex parse_error_mutex;
@@ -119,7 +106,7 @@ std::vector<bb::g1::affine_element> read_uncompressed_g1_points(const std::files
                     return;
                 }
                 for (size_t k = 0; k < count; ++k) {
-                    points[first + k] = from_buffer<bb::g1::affine_element>(buf, k * UNCOMPRESSED_POINT_SIZE);
+                    dst[first + k] = from_buffer<bb::g1::affine_element>(buf, k * UNCOMPRESSED_POINT_SIZE);
                 }
             }
 #ifndef BB_NO_EXCEPTIONS
@@ -141,8 +128,29 @@ std::vector<bb::g1::affine_element> read_uncompressed_g1_points(const std::files
     if (read_failed.load()) {
         throw_or_abort("Failed to read " + std::to_string(num_points) + " points from " + path.string());
     }
-    return points;
+}
 #endif
+
+/**
+ * @brief Read uncompressed G1 points (64 bytes each) from a file.
+ */
+std::vector<bb::g1::affine_element> read_uncompressed_g1_points(const std::filesystem::path& path, size_t num_points)
+{
+    std::vector<bb::g1::affine_element> points(num_points);
+#if defined(__wasm__) || defined(_WIN32)
+    auto data = bb::read_file(path, num_points * UNCOMPRESSED_POINT_SIZE);
+    if (num_points > data.size() / UNCOMPRESSED_POINT_SIZE) {
+        throw_or_abort("Truncated uncompressed BN254 CRS");
+    }
+    bb::parallel_for([&](bb::ThreadChunk chunk) {
+        for (auto i : chunk.range(num_points)) {
+            points[i] = from_buffer<bb::g1::affine_element>(data, i * UNCOMPRESSED_POINT_SIZE);
+        }
+    });
+#else
+    read_uncompressed_g1_points_into(path, points.data(), num_points);
+#endif
+    return points;
 }
 
 /**
@@ -381,6 +389,37 @@ std::vector<g1::affine_element> get_bn254_g1_data(const std::filesystem::path& p
                                                   bool allow_download)
 {
     return get_bn254_g1_data(path, num_points, allow_download, CRS_PRIMARY_URL, CRS_FALLBACK_URL);
+}
+
+Bn254G1Points load_bn254_g1_points(const std::filesystem::path& path, size_t num_points, bool allow_download)
+{
+#if !defined(__wasm__) && !defined(_WIN32)
+    // Fast path, the cached uncompressed file: read straight into uninitialised storage. new T[n] default-initialises,
+    // which for the trivially constructible affine_element leaves the memory untouched.
+    static_assert(std::is_trivially_default_constructible_v<g1::affine_element>);
+    auto allocate = [](size_t n) { return std::shared_ptr<g1::affine_element[]>(new g1::affine_element[n]); };
+    // As get_bn254_g1_data: whole pinned chunks (a verification key is only computed from those), and BB_VERIFY_CRS=1
+    // skips the uncompressed cache, which has no pinned hashes.
+    num_points = round_up_to_chunk_boundary(num_points);
+    if (std::getenv("BB_VERIFY_CRS") == nullptr) {
+        BB_BENCH_NAME("get_bn254_g1_data");
+        std::filesystem::create_directories(path);
+        const auto uncompressed_path = path / "bn254_g1.dat";
+        FileLockGuard lock((path / "crs.lock").string());
+        if (get_file_size(uncompressed_path) / UNCOMPRESSED_POINT_SIZE >= num_points) {
+            vinfo("using cached uncompressed bn254 crs at ", uncompressed_path);
+            Bn254G1Points result{ allocate(num_points), num_points };
+            read_uncompressed_g1_points_into(uncompressed_path, result.points.get(), num_points);
+            return result;
+        }
+    }
+#endif
+    // Decompression and download paths are rare (they populate the cache); reuse them as they are.
+    // The vector stays the owner (aliasing constructor), so its points are not copied.
+    auto points =
+        std::make_shared<std::vector<g1::affine_element>>(get_bn254_g1_data(path, num_points, allow_download));
+    const size_t size = points->size();
+    return { std::shared_ptr<g1::affine_element[]>(points, points->data()), size };
 }
 
 // Loads the canonical 128-byte serialization of [x]_2 from disk and verifies it against the pinned

@@ -22,11 +22,12 @@ class MemBn254Crs : public Crs<curve::BN254> {
     MemBn254Crs& operator=(const MemBn254Crs&) = delete;
     MemBn254Crs& operator=(MemBn254Crs&&) = delete;
 
-    MemBn254Crs(std::vector<Curve::AffineElement> points, g2::affine_element const& g2_point)
+    MemBn254Crs(std::shared_ptr<Curve::AffineElement[]> points, size_t num_points, g2::affine_element const& g2_point)
         : g2_x(g2_point)
         , precomputed_g2_lines(
               static_cast<pairing::miller_lines*>(aligned_alloc(64, sizeof(bb::pairing::miller_lines) * 2)))
-        , monomials_(std::move(points))
+        , monomials_owner_(std::move(points))
+        , monomials_(monomials_owner_.get(), num_points)
     {
         bb::pairing::precompute_miller_lines(bb::g2::one, precomputed_g2_lines[0]);
         bb::pairing::precompute_miller_lines(g2_x, precomputed_g2_lines[1]);
@@ -54,7 +55,8 @@ class MemBn254Crs : public Crs<curve::BN254> {
   private:
     g2::affine_element g2_x;
     pairing::miller_lines* precomputed_g2_lines;
-    std::vector<Curve::AffineElement> monomials_;
+    std::shared_ptr<Curve::AffineElement[]> monomials_owner_;
+    std::span<Curve::AffineElement> monomials_;
     std::atomic<bool> points_verified_{ false };
 };
 
@@ -63,7 +65,20 @@ class MemBn254Crs : public Crs<curve::BN254> {
 namespace bb::srs::factories {
 
 MemBn254CrsFactory::MemBn254CrsFactory(std::vector<g1::affine_element> points, g2::affine_element const& g2_point)
-    : crs_(std::make_shared<MemBn254Crs>(std::move(points), g2_point))
+    : crs_([&points, &g2_point] {
+        // The vector stays the owner (aliasing constructor), so its points are not copied.
+        const auto owner = std::make_shared<std::vector<g1::affine_element>>(std::move(points));
+        return std::make_shared<MemBn254Crs>(
+            std::shared_ptr<g1::affine_element[]>(owner, owner->data()), owner->size(), g2_point);
+    }())
+{
+    vinfo("Initialized ", curve::BN254::name, " CRS from memory with num points = ", crs_->get_monomial_size());
+}
+
+MemBn254CrsFactory::MemBn254CrsFactory(std::shared_ptr<g1::affine_element[]> points,
+                                       size_t num_points,
+                                       g2::affine_element const& g2_point)
+    : crs_(std::make_shared<MemBn254Crs>(std::move(points), num_points, g2_point))
 {
     vinfo("Initialized ", curve::BN254::name, " CRS from memory with num points = ", crs_->get_monomial_size());
 }
@@ -71,7 +86,8 @@ MemBn254CrsFactory::MemBn254CrsFactory(std::vector<g1::affine_element> points, g
 template <> std::shared_ptr<Crs<curve::BN254>> CrsFactory<curve::BN254>::get_verifier_crs()
 {
     static const std::shared_ptr<Crs<curve::BN254>> verifier_crs =
-        std::make_shared<MemBn254Crs>(std::vector<g1::affine_element>{}, srs::get_bn254_g2_crs_element());
+        std::make_shared<MemBn254Crs>(
+            std::shared_ptr<g1::affine_element[]>{}, /*num_points=*/0, srs::get_bn254_g2_crs_element());
     return verifier_crs;
 }
 
