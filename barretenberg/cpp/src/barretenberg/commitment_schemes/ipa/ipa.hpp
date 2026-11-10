@@ -1167,8 +1167,36 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
         return all_relations_succeeded;
     }
 
+    /**
+     * @brief Draw the random polynomial, then the random evaluation point, opened by
+     * create_random_valid_ipa_claim_and_proof.
+     * @details Separate from the proving so that a caller can reproduce the draws without proving.
+     */
+    static std::pair<Polynomial<bb::fq>, bb::fq> sample_random_opening(numeric::RNG* engine = nullptr)
+        requires Curve::is_stdlib_type
+    {
+        Polynomial<bb::fq> poly(poly_length);
+        for (size_t i = 0; i < poly_length; i++) {
+            poly.at(i) = bb::fq::random_element(engine);
+        }
+        const bb::fq x = bb::fq::random_element(engine);
+        return { std::move(poly), x };
+    }
+
     static std::pair<OpeningClaim<Curve>, HonkProof> create_random_valid_ipa_claim_and_proof(
         UltraCircuitBuilder& builder)
+        requires Curve::is_stdlib_type
+    {
+        const auto [poly, x] = sample_random_opening();
+        return create_valid_ipa_claim_and_proof(builder, poly, x);
+    }
+
+    /**
+     * @brief Natively prove the opening of poly at x and add the claim to the builder as witnesses.
+     */
+    static std::pair<OpeningClaim<Curve>, HonkProof> create_valid_ipa_claim_and_proof(UltraCircuitBuilder& builder,
+                                                                                      const Polynomial<bb::fq>& poly,
+                                                                                      const bb::fq& x)
         requires Curve::is_stdlib_type
     {
         using NativeCurve = curve::Grumpkin;
@@ -1176,12 +1204,6 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
         using Curve = stdlib::grumpkin<Builder>;
         auto ipa_transcript = std::make_shared<NativeTranscript>();
         CommitmentKey<NativeCurve> ipa_commitment_key(poly_length);
-        size_t n = poly_length;
-        auto poly = Polynomial<bb::fq>(n);
-        for (size_t i = 0; i < n; i++) {
-            poly.at(i) = bb::fq::random_element();
-        }
-        bb::fq x = bb::fq::random_element();
         bb::fq eval = poly.evaluate(x);
         auto commitment = ipa_commitment_key.commit(poly);
         const OpeningPair<NativeCurve> opening_pair = { x, eval };

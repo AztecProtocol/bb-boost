@@ -407,10 +407,20 @@ class RollupIO {
      */
     static void add_default(Builder& builder)
     {
+        const auto [ipa_polynomial, ipa_challenge] = IPA<grumpkin<Builder>>::sample_random_opening();
+        add_default(builder, ipa_polynomial, ipa_challenge);
+    };
+
+    /**
+     * @brief Add default public inputs, with the IPA claim opening ipa_polynomial at ipa_challenge
+     * @details Lets a caller draw the opening (IPA::sample_random_opening) separately from building the circuit.
+     */
+    static void add_default(Builder& builder, const bb::Polynomial<bb::fq>& ipa_polynomial, const bb::fq& ipa_challenge)
+    {
         RollupIO inputs;
         inputs.pairing_inputs = PairingInputs::construct_default();
         auto [stdlib_opening_claim, ipa_proof] =
-            IPA<grumpkin<Builder>>::create_random_valid_ipa_claim_and_proof(builder);
+            IPA<grumpkin<Builder>>::create_valid_ipa_claim_and_proof(builder, ipa_polynomial, ipa_challenge);
         inputs.ipa_claim = stdlib_opening_claim;
         inputs.set_public();
 
