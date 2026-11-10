@@ -1058,9 +1058,10 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
 
     // Compute all intermediate points natively for use as hints in the in-circuit Straus algorithm.
     // Using projective coordinates + batch normalize to avoid per-operation modular inversions.
-    // The per-point lookup tables (point_tables) already hold the precomputed affine entries; we reuse
-    // them directly rather than rebuilding projective copies.
+    // The per-point lookup tables (point_tables) already hold the precomputed affine entries, which the accumulator
+    // adds directly with mixed additions.
     std::vector<Element> operation_transcript;
+    operation_transcript.reserve((num_rounds * num_points) + ((num_rounds - 1) * table_bits));
     Element offset_generator_accumulator = offset_generators[0];
     {
         // Every round adds the same offset generators, so the offset generator accumulator adds their sum once per
@@ -1082,21 +1083,25 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
             }
             for (size_t j = 0; j < num_points; ++j) {
                 auto slice_value = static_cast<size_t>(scalar_slices[j].slices_native[num_rounds - i - 1]);
-                const Element point(point_tables[j].get_native_table()[slice_value]);
-                accumulator += point;
+                accumulator += point_tables[j].get_native_table()[slice_value];
                 operation_transcript.push_back(accumulator);
             }
             offset_generator_accumulator += offset_generator_sum;
         }
     }
 
-    // Batch-normalize all hint points
-    Element::batch_normalize(operation_transcript.data(), operation_transcript.size());
-    std::vector<AffineElement> operation_hints;
-    operation_hints.reserve(operation_transcript.size());
-    for (const Element& element : operation_transcript) {
-        operation_hints.emplace_back(element.x, element.y);
-    }
+    // Normalize the hint points in chunks, one batched inversion per chunk. Affine coordinates are unique, so the
+    // hint values do not depend on where the chunks start.
+    std::vector<AffineElement> operation_hints(operation_transcript.size());
+    parallel_for_heuristic(
+        operation_transcript.size(),
+        [&](size_t start, size_t end, size_t /*chunk_index*/) {
+            Element::batch_normalize(operation_transcript.data() + start, end - start);
+            for (size_t k = start; k < end; ++k) {
+                operation_hints[k] = AffineElement(operation_transcript[k].x, operation_transcript[k].y);
+            }
+        },
+        /*heuristic_cost=*/7 * thread_heuristics::FF_MULTIPLICATION_COST);
 
     // Execute Straus algorithm in-circuit using plookup reads and precomputed hints
     AffineElement* hint_ptr = operation_hints.data();
