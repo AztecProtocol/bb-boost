@@ -1,9 +1,21 @@
 #pragma once
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <vector>
+
+// Storage for the decompression attempt sized from the gzip trailer; nullptr if it cannot be obtained.
+using GzipScratch = std::unique_ptr<uint8_t[], void (*)(uint8_t*)>;
+
+/**
+ * @brief Decompresses the first member of a gzip stream, as libdeflate_gzip_decompress does.
+ * @param scratch Supplies the storage of the attempt sized from the gzip trailer (by default uninitialised new[], or
+ * nullptr when that fails). Tests substitute their own to see what that attempt writes.
+ */
+std::vector<uint8_t> gzip_decompress(const std::vector<uint8_t>& compressed, GzipScratch (*scratch)(size_t) = nullptr);
 
 // Parse JSON file and extract base64-encoded gzipped bytecode
 std::vector<uint8_t> get_bytecode_from_json(const std::string& json_path);

@@ -7,24 +7,70 @@
 #ifndef __wasm__
 #include <fstream>
 #include <libdeflate.h>
+#include <new>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #endif
 
+#ifndef __wasm__
 namespace {
 
-std::vector<uint8_t> gzip_decompress([[maybe_unused]] const std::vector<uint8_t>& compressed)
+// A deflate stream expands its input at most 1032-fold (RFC 1951: a 258-byte match costs at least 2 bits), so a size
+// claim above that bound is wrong and is not tried.
+constexpr size_t DEFLATE_MAX_EXPANSION = 1032;
+constexpr size_t GZIP_TRAILER_ISIZE_BYTES = 4;
+constexpr size_t GZIP_MIN_MEMBER_BYTES = 18; // 10-byte header + 8-byte trailer
+
+GzipScratch allocate_gzip_scratch(size_t size)
+{
+    // new[] of uint8_t default-initialises: pages stay untouched, so not resident, until something is written to them.
+    return { new (std::nothrow) uint8_t[size], [](uint8_t* p) { delete[] p; } };
+}
+
+} // namespace
+#endif
+
+std::vector<uint8_t> gzip_decompress([[maybe_unused]] const std::vector<uint8_t>& compressed,
+                                     [[maybe_unused]] GzipScratch (*scratch)(size_t))
 {
 #ifdef __wasm__
     throw_or_abort("gzip_decompress not supported in WASM");
 #else
+    auto decompressor =
+        std::unique_ptr<libdeflate_decompressor, void (*)(libdeflate_decompressor*)>{ libdeflate_alloc_decompressor(),
+                                                                                      libdeflate_free_decompressor };
+
+    // A gzip member ends with ISIZE, the uncompressed size modulo 2^32 (RFC 1952, section 2.3.1). Inflating once into
+    // storage of that size avoids restarting from the first byte after every doubling of a small guess. In a
+    // multi-member stream ISIZE describes the last member while libdeflate inflates only the first, so the result is
+    // kept only when that one member spans the whole input. The storage is not zero-filled, so a wrong guess costs only
+    // the pages the first member writes; if it cannot be had, or the guess is wrong, the doubling loop runs as before.
+    if (compressed.size() >= GZIP_MIN_MEMBER_BYTES) {
+        const uint8_t* isize_bytes = compressed.data() + compressed.size() - GZIP_TRAILER_ISIZE_BYTES;
+        const size_t isize = static_cast<size_t>(isize_bytes[0]) | (static_cast<size_t>(isize_bytes[1]) << 8) |
+                             (static_cast<size_t>(isize_bytes[2]) << 16) | (static_cast<size_t>(isize_bytes[3]) << 24);
+        if (isize > 0 && (isize + DEFLATE_MAX_EXPANSION - 1) / DEFLATE_MAX_EXPANSION <= compressed.size()) {
+            const GzipScratch buffer = (scratch != nullptr ? scratch : allocate_gzip_scratch)(isize);
+            size_t consumed = 0;
+            size_t actual_size = 0;
+            if (buffer != nullptr &&
+                libdeflate_gzip_decompress_ex(decompressor.get(),
+                                              compressed.data(),
+                                              compressed.size(),
+                                              buffer.get(),
+                                              isize,
+                                              &consumed,
+                                              &actual_size) == LIBDEFLATE_SUCCESS &&
+                consumed == compressed.size()) {
+                return std::vector<uint8_t>(buffer.get(), buffer.get() + actual_size);
+            }
+        }
+    }
+
     std::vector<uint8_t> decompressed;
     decompressed.resize(1024ULL * 128ULL); // Initial size guess
 
     for (;;) {
-        auto decompressor = std::unique_ptr<libdeflate_decompressor, void (*)(libdeflate_decompressor*)>{
-            libdeflate_alloc_decompressor(), libdeflate_free_decompressor
-        };
         size_t actual_size = 0;
         libdeflate_result result = libdeflate_gzip_decompress(decompressor.get(),
                                                               compressed.data(),
@@ -46,7 +92,6 @@ std::vector<uint8_t> gzip_decompress([[maybe_unused]] const std::vector<uint8_t>
     return decompressed;
 #endif
 }
-} // namespace
 
 std::vector<uint8_t> decode_bytecode(const std::string& base64_bytecode)
 {
