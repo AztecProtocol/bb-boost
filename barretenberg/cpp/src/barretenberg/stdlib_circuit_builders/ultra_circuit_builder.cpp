@@ -1159,32 +1159,38 @@ void UltraCircuitBuilder_<ExecutionTrace>::range_constrain_two_limbs(const uint3
     BB_ASSERT_LTE(hi_limb_bits, 14U * 5U);
 
     // If the value is larger than the range, we log the error in builder
-    const bool is_lo_out_of_range = (uint256_t(this->get_variable(lo_idx)) >= (uint256_t(1) << lo_limb_bits));
+    const uint256_t lo_limb(this->get_variable(lo_idx));
+    const bool is_lo_out_of_range = (lo_limb >= (uint256_t(1) << lo_limb_bits));
     if (is_lo_out_of_range && !this->failed()) {
         this->failure(std::string(msg) + ": lo limb.");
     }
-    const bool is_hi_out_of_range = (uint256_t(this->get_variable(hi_idx)) >= (uint256_t(1) << hi_limb_bits));
+    const uint256_t hi_limb(this->get_variable(hi_idx));
+    const bool is_hi_out_of_range = (hi_limb >= (uint256_t(1) << hi_limb_bits));
     if (is_hi_out_of_range && !this->failed()) {
         this->failure(std::string(msg) + ": hi limb.");
     }
 
+    // The five 14-bit sublimbs (bits [14k, 14k + 14)) of the low 70 bits of a limb. We can use the constant 2^14 - 1
+    // mask here: if a sublimb value exceeds its expected range, the witness fails the range check below.
+    const auto get_sublimb_values = [](const uint256_t& limb) {
+        constexpr uint64_t MAX_SUBLIMB_MASK = (1ULL << 14) - 1;
+        const uint64_t low = limb.data[0];
+        const uint64_t high = limb.data[1];
+        return std::array<uint64_t, 5>{ low & MAX_SUBLIMB_MASK,
+                                        (low >> 14) & MAX_SUBLIMB_MASK,
+                                        (low >> 28) & MAX_SUBLIMB_MASK,
+                                        (low >> 42) & MAX_SUBLIMB_MASK,
+                                        ((low >> 56) | (high << 8)) & MAX_SUBLIMB_MASK };
+    };
+
     // Sometimes we try to use limbs that are too large. It's easier to catch this issue here
-    const auto get_sublimbs = [&](const uint32_t& limb_idx, const std::array<uint64_t, 5>& sublimb_masks) {
-        const uint256_t limb = this->get_variable(limb_idx);
-        // we can use constant 2^14 - 1 mask here. If the sublimb value exceeds the expected value then witness will
-        // fail the range check below
-        // We also use zero_idx to substitute variables that should be zero
-        constexpr uint256_t MAX_SUBLIMB_MASK = (uint256_t(1) << 14) - 1;
+    // We also use zero_idx to substitute variables that should be zero
+    const auto get_sublimbs = [&](const std::array<uint64_t, 5>& sublimb_values,
+                                  const std::array<uint64_t, 5>& sublimb_masks) {
         std::array<uint32_t, 5> sublimb_indices;
-        sublimb_indices[0] = sublimb_masks[0] != 0 ? this->add_variable(fr(limb & MAX_SUBLIMB_MASK)) : this->zero_idx();
-        sublimb_indices[1] =
-            sublimb_masks[1] != 0 ? this->add_variable(fr((limb >> 14) & MAX_SUBLIMB_MASK)) : this->zero_idx();
-        sublimb_indices[2] =
-            sublimb_masks[2] != 0 ? this->add_variable(fr((limb >> 28) & MAX_SUBLIMB_MASK)) : this->zero_idx();
-        sublimb_indices[3] =
-            sublimb_masks[3] != 0 ? this->add_variable(fr((limb >> 42) & MAX_SUBLIMB_MASK)) : this->zero_idx();
-        sublimb_indices[4] =
-            sublimb_masks[4] != 0 ? this->add_variable(fr((limb >> 56) & MAX_SUBLIMB_MASK)) : this->zero_idx();
+        for (size_t i = 0; i < 5; ++i) {
+            sublimb_indices[i] = sublimb_masks[i] != 0 ? this->add_variable(fr(sublimb_values[i])) : this->zero_idx();
+        }
         return sublimb_indices;
     };
 
@@ -1204,8 +1210,10 @@ void UltraCircuitBuilder_<ExecutionTrace>::range_constrain_two_limbs(const uint3
 
     const auto lo_masks = get_limb_masks(lo_limb_bits);
     const auto hi_masks = get_limb_masks(hi_limb_bits);
-    const std::array<uint32_t, 5> lo_sublimbs = get_sublimbs(lo_idx, lo_masks);
-    const std::array<uint32_t, 5> hi_sublimbs = get_sublimbs(hi_idx, hi_masks);
+    const std::array<uint64_t, 5> lo_values = get_sublimb_values(lo_limb);
+    const std::array<uint64_t, 5> hi_values = get_sublimb_values(hi_limb);
+    const std::array<uint32_t, 5> lo_sublimbs = get_sublimbs(lo_values, lo_masks);
+    const std::array<uint32_t, 5> hi_sublimbs = get_sublimbs(hi_values, hi_masks);
 
     {
         auto row = nnf_selectors_row(NNF_SELECTORS::LIMB_ACCUMULATE_1);
@@ -1226,12 +1234,12 @@ void UltraCircuitBuilder_<ExecutionTrace>::range_constrain_two_limbs(const uint3
 
     for (size_t i = 0; i < 5; i++) {
         if (lo_masks[i] != 0) {
-            create_small_range_constraint(
-                lo_sublimbs[i], lo_masks[i], "ultra_circuit_builder: sublimb of low too large");
+            register_small_range_constraint(
+                lo_sublimbs[i], lo_masks[i], lo_values[i], "ultra_circuit_builder: sublimb of low too large");
         }
         if (hi_masks[i] != 0) {
-            create_small_range_constraint(
-                hi_sublimbs[i], hi_masks[i], "ultra_circuit_builder: sublimb of hi too large");
+            register_small_range_constraint(
+                hi_sublimbs[i], hi_masks[i], hi_values[i], "ultra_circuit_builder: sublimb of hi too large");
         }
     }
 };
