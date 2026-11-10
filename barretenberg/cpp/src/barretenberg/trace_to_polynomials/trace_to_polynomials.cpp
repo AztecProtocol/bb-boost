@@ -6,6 +6,7 @@
 
 #include "trace_to_polynomials.hpp"
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/scratch_array.hpp"
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/constants.hpp"
 #include "barretenberg/ext/starknet/flavor/ultra_starknet_flavor.hpp"
@@ -19,6 +20,7 @@
 #include "barretenberg/flavor/ultra_keccak_flavor.hpp"
 #include "barretenberg/flavor/ultra_keccak_zk_flavor.hpp"
 #include "barretenberg/flavor/ultra_zk_flavor.hpp"
+#include <algorithm>
 #include <atomic>
 
 namespace bb {
@@ -124,8 +126,8 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
     for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         cell_offsets[block_idx + 1] = cell_offsets[block_idx] + blocks_array[block_idx].size() * NUM_WIRES;
     }
-    // The real variable index of every wire cell.
-    std::vector<uint32_t> cell_real_var_idx(cell_offsets[num_blocks]);
+    // The real variable index of every wire cell; phase 2 writes every cell.
+    ScratchArray<uint32_t> cell_real_var_idx(cell_offsets[num_blocks]);
 
     // Phase 2: populate the wires and record each cell's real variable index, in parallel over row chunks of all
     // blocks (the blocks differ greatly in size). With CopiedCircuitData::RELEASE, the task that finishes a block's
@@ -177,46 +179,64 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
         });
     }
 
-    // Phases 2.5 and 2.6 split the variables into one contiguous range per thread. Each thread scans all cells in
-    // order and handles only its own variables, so every copy cycle is counted and filled by one thread, in cell order.
+    // Phases 2.5 and 2.6 split the variables into one contiguous range per scan task. Each task scans all cells in
+    // order and handles only its own variables, so every copy cycle is counted and filled by one task, in cell order.
+    const size_t num_scan_tasks = std::max<size_t>(get_num_cpus(), 1);
+    const auto scan_task_vars = [&](size_t task_idx) {
+        return ThreadChunk{ .thread_index = task_idx, .total_threads = num_scan_tasks }.range(num_cycles);
+    };
+    // task_node_begin[t] is the first node of task t's variables in the CSR node array.
+    std::vector<uint32_t> task_node_begin(num_scan_tasks + 1, 0);
     {
         BB_BENCH_NAME("counting copy_cycles");
-        // Count copy-cycle sizes per real variable, then take the exclusive prefix sum to get the CSR offsets; a
-        // single flat node array replaces one heap-allocated vector per variable.
-        copy_cycles.offsets.assign(num_cycles + 1, 0);
-        parallel_for([&](const ThreadChunk& chunk) {
-            const auto vars = chunk.range(num_cycles);
+        // Count copy-cycle sizes per real variable; phase 2.6 turns them into CSR offsets. A single flat node array
+        // replaces one heap-allocated vector per variable.
+        copy_cycles.offsets = ScratchArray<uint32_t>(num_cycles + 1);
+        parallel_for(num_scan_tasks, [&](size_t task_idx) {
+            const auto vars = scan_task_vars(task_idx);
             if (vars.empty()) {
                 return;
             }
             const uint32_t var_begin = static_cast<uint32_t>(vars.front());
             const uint32_t num_vars = static_cast<uint32_t>(vars.size());
-            for (const uint32_t real_var_idx : cell_real_var_idx) {
+            uint32_t* counts = &copy_cycles.offsets[var_begin];
+            std::fill_n(counts, num_vars, 0U);
+            for (const uint32_t real_var_idx : cell_real_var_idx.span()) {
                 if (real_var_idx - var_begin < num_vars) {
-                    ++copy_cycles.offsets[real_var_idx];
+                    ++counts[real_var_idx - var_begin];
                 }
             }
+            uint32_t task_nodes = 0;
+            for (uint32_t i = 0; i < num_vars; ++i) {
+                task_nodes += counts[i];
+            }
+            task_node_begin[task_idx + 1] = task_nodes;
         });
-        uint32_t running = 0;
-        for (size_t i = 0; i < num_cycles; ++i) {
-            const uint32_t count = copy_cycles.offsets[i];
-            copy_cycles.offsets[i] = running;
-            running += count;
+        for (size_t task_idx = 0; task_idx < num_scan_tasks; ++task_idx) {
+            task_node_begin[task_idx + 1] += task_node_begin[task_idx];
         }
-        copy_cycles.offsets[num_cycles] = running;
-        copy_cycles.nodes.resize(running);
+        copy_cycles.offsets[num_cycles] = task_node_begin[num_scan_tasks];
+        copy_cycles.nodes = ScratchArray<cycle_node>(task_node_begin[num_scan_tasks]);
     }
 
     {
         BB_BENCH_NAME("fill_copy_cycles");
-        std::vector<uint32_t> cursors(copy_cycles.offsets.begin(), copy_cycles.offsets.end() - 1);
-        parallel_for([&](const ThreadChunk& chunk) {
-            const auto vars = chunk.range(num_cycles);
+        ScratchArray<uint32_t> cursors(num_cycles);
+        parallel_for(num_scan_tasks, [&](size_t task_idx) {
+            const auto vars = scan_task_vars(task_idx);
             if (vars.empty()) {
                 return;
             }
             const uint32_t var_begin = static_cast<uint32_t>(vars.front());
             const uint32_t num_vars = static_cast<uint32_t>(vars.size());
+            // Exclusive prefix sum of this task's counts, starting at the task's first node.
+            uint32_t running = task_node_begin[task_idx];
+            for (uint32_t var = var_begin; var < var_begin + num_vars; ++var) {
+                const uint32_t count = copy_cycles.offsets[var];
+                copy_cycles.offsets[var] = running;
+                cursors[var] = running;
+                running += count;
+            }
             for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
                 const uint32_t offset = blocks_array[block_idx].trace_offset();
                 const uint32_t block_size = static_cast<uint32_t>(blocks_array[block_idx].size());
