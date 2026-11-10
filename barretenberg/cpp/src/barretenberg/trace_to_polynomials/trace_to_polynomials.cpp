@@ -181,7 +181,9 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
 
     // Phases 2.5 and 2.6 split the variables into one contiguous range per scan task. Each task scans all cells in
     // order and handles only its own variables, so every copy cycle is counted and filled by one task, in cell order.
-    const size_t num_scan_tasks = std::max<size_t>(get_num_cpus(), 1);
+    // Every task reads every cell in each phase, so beyond a few tasks more of them only add memory traffic.
+    constexpr size_t MAX_COPY_CYCLE_SCAN_TASKS = 16;
+    const size_t num_scan_tasks = std::clamp<size_t>(get_num_cpus(), 1, MAX_COPY_CYCLE_SCAN_TASKS);
     const auto scan_task_vars = [&](size_t task_idx) {
         return ThreadChunk{ .thread_index = task_idx, .total_threads = num_scan_tasks }.range(num_cycles);
     };
