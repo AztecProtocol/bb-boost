@@ -210,6 +210,18 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
                                          ValueSource value_source,
                                          std::string_view msg);
 
+    // create_lookup_gate with its q_3 selector, FF(table.table_index), supplied by the caller.
+    void append_lookup_gate(uint32_t key_idx,
+                            uint32_t val1_idx,
+                            uint32_t val2_idx,
+                            plookup::BasicTable& table,
+                            const plookup::BasicTable::LookupEntry& entry,
+                            const FF& table_index_selector,
+                            const FF& column_1_step_size,
+                            const FF& column_2_step_size,
+                            const FF& column_3_step_size)
+        requires(ExecutionTrace::has_gate_kind(GateKind::Lookup));
+
     // The set of lookup tables used by the circuit, plus the gate data for the lookups from each table
     std::deque<plookup::BasicTable> lookup_tables;
 
