@@ -794,6 +794,13 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
             native_straus_tables.emplace_back(std::move(table));
         }
 
+        // Every round adds the same offset generators, so the offset generator accumulator adds their sum once per
+        // round.
+        Element offset_generator_sum = Group::point_at_infinity;
+        for (size_t j = 0; j < num_points; ++j) {
+            offset_generator_sum += offset_generators[j + 1];
+        }
+
         // Perform the Straus algorithm natively to generate the witness values (hints) for all intermediate points
         Element accumulator = offset_generators[0];
         for (size_t i = 0; i < num_rounds; ++i) {
@@ -811,10 +818,10 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
                 const Element point = native_straus_tables[j][slice_value];
                 accumulator += point;
 
-                // Populate hint and update offset generator accumulator
+                // Populate hint
                 operation_transcript.push_back(accumulator);
-                offset_generator_accumulator += Element(offset_generators[j + 1]);
             }
+            offset_generator_accumulator += offset_generator_sum;
         }
     }
 
@@ -1056,6 +1063,13 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
     std::vector<Element> operation_transcript;
     Element offset_generator_accumulator = offset_generators[0];
     {
+        // Every round adds the same offset generators, so the offset generator accumulator adds their sum once per
+        // round.
+        Element offset_generator_sum = Group::point_at_infinity;
+        for (size_t j = 0; j < num_points; ++j) {
+            offset_generator_sum += offset_generators[j + 1];
+        }
+
         // Perform Straus algorithm natively
         Element accumulator = offset_generators[0];
         for (size_t i = 0; i < num_rounds; ++i) {
@@ -1071,8 +1085,8 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
                 const Element point(point_tables[j].get_native_table()[slice_value]);
                 accumulator += point;
                 operation_transcript.push_back(accumulator);
-                offset_generator_accumulator += Element(offset_generators[j + 1]);
             }
+            offset_generator_accumulator += offset_generator_sum;
         }
     }
 
