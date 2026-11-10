@@ -265,6 +265,8 @@ template <typename Curve> inline void drain_batch(ThreadScratch<Curve>& s, size_
     // pair_dest[k] is the `next_len` value recorded when the k-th pair was queued, which is < the
     // read cursor at that level — so the write lands on an already-read slot (see tree_reduce_in_place).
     size_t k = 0;
+    s.out.x.require_backing(s.out.num_full_vectors());
+    s.out.y.require_backing(s.out.num_full_vectors());
     for (size_t g = 0; g < s.out.num_full_vectors(); ++g) {
         const auto xs = s.out.x[g].to_array();
         const auto ys = s.out.y[g].to_array();
