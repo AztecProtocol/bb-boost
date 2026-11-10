@@ -412,6 +412,20 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
         //      calling the `send_to_verifier` method, as the verifier knows them.
 
         const auto commitment = ck.commit(polynomial);
+        add_claim_to_hash_buffer(commitment, opening_claim, transcript);
+    }
+
+    /**
+     * @brief Add the opening claim to the hash buffer, given the commitment to its polynomial.
+     *
+     * @param commitment Must equal `ck.commit(opening_claim.polynomial)`; the hash buffer is then the same as with the
+     * overload that computes it.
+     */
+    template <typename Transcript>
+    static void add_claim_to_hash_buffer(const Commitment& commitment,
+                                         const ProverOpeningClaim<Curve>& opening_claim,
+                                         const std::shared_ptr<Transcript>& transcript)
+    {
         transcript->add_to_hash_buffer("IPA:commitment", commitment);
         transcript->add_to_hash_buffer("IPA:challenge", opening_claim.opening_pair.challenge);
         transcript->add_to_hash_buffer("IPA:evaluation", opening_claim.opening_pair.evaluation);
@@ -733,6 +747,22 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
                                       const std::shared_ptr<Transcript>& transcript)
     {
         add_claim_to_hash_buffer(ck, opening_claim, transcript);
+        compute_opening_proof_internal(ck, opening_claim, transcript);
+    }
+
+    /**
+     * @brief Compute an IPA opening proof for a caller that already holds the commitment to the polynomial.
+     *
+     * @param commitment Must equal `ck.commit(opening_claim.polynomial)`; the proof is then identical to the one from
+     * the overload that computes it, without its MSM.
+     */
+    template <typename Transcript = NativeTranscript>
+    static void compute_opening_proof(const CK& ck,
+                                      const ProverOpeningClaim<Curve>& opening_claim,
+                                      const Commitment& commitment,
+                                      const std::shared_ptr<Transcript>& transcript)
+    {
+        add_claim_to_hash_buffer(commitment, opening_claim, transcript);
         compute_opening_proof_internal(ck, opening_claim, transcript);
     }
 
@@ -1207,7 +1237,7 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
         bb::fq eval = poly.evaluate(x);
         auto commitment = ipa_commitment_key.commit(poly);
         const OpeningPair<NativeCurve> opening_pair = { x, eval };
-        IPA<NativeCurve>::compute_opening_proof(ipa_commitment_key, { poly, opening_pair }, ipa_transcript);
+        IPA<NativeCurve>::compute_opening_proof(ipa_commitment_key, { poly, opening_pair }, commitment, ipa_transcript);
 
         auto stdlib_comm = Curve::Group::from_witness(&builder, commitment);
         auto stdlib_x = Curve::ScalarField::from_witness(&builder, x);
