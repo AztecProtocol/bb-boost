@@ -611,6 +611,11 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     void process_range_list(RangeList& list);
     void process_range_lists();
 
+  private:
+    // One delta-range row per `NUM_WIRES` consecutive entries of `variable_indices`.
+    void append_delta_range_rows(const std::vector<uint32_t>& variable_indices);
+
+  public:
     /**
      * Custom Gate Selectors
      **/

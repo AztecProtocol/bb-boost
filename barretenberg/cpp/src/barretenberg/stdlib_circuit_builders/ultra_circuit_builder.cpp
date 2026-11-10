@@ -939,25 +939,26 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::pr
 }
 
 template <typename ExecutionTrace>
+void UltraCircuitBuilder_<ExecutionTrace>::append_delta_range_rows(const std::vector<uint32_t>& variable_indices)
+{
+    // The rows differ only in their wires.
+    GateRowT row{};
+    row.gate_value = fe_constant<FF, 1>;
+    for (size_t i = 0; i < variable_indices.size(); i += NUM_WIRES) {
+        this->increment_num_gates();
+        row.wires = { variable_indices[i], variable_indices[i + 1], variable_indices[i + 2], variable_indices[i + 3] };
+        blocks.delta_range.template append_gate<GateKind::DeltaRange>(row);
+    }
+}
+
+template <typename ExecutionTrace>
 void UltraCircuitBuilder_<ExecutionTrace>::enforce_small_deltas(const std::vector<uint32_t>& variable_indices)
 {
     constexpr size_t gate_width = NUM_WIRES;
     BB_ASSERT_EQ(variable_indices.size() % gate_width, 0U);
     this->assert_valid_variables(variable_indices);
 
-    for (size_t i = 0; i < variable_indices.size(); i += gate_width) {
-
-        this->increment_num_gates();
-        {
-            auto& block_for_row = blocks.delta_range;
-            GateRowT row{};
-            row.wires = {
-                variable_indices[i], variable_indices[i + 1], variable_indices[i + 2], variable_indices[i + 3]
-            };
-            row.gate_value = fe_constant<FF, 1>;
-            block_for_row.template append_gate<GateKind::DeltaRange>(row);
-        }
-    }
+    append_delta_range_rows(variable_indices);
     // dummy gate needed because of widget's check of next row
     create_unconstrained_gate(blocks.delta_range,
                               variable_indices[variable_indices.size() - 1],
@@ -1004,19 +1005,7 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_sort_constraint_with_edges(
 
     // enforce delta range relation for all rows (there are `variabe_indices.size() / gate_width`). note that there are
     // at least two rows.
-    for (size_t i = 0; i < variable_indices.size(); i += gate_width) {
-
-        this->increment_num_gates();
-        {
-            auto& block_for_row = block;
-            GateRowT row{};
-            row.wires = {
-                variable_indices[i], variable_indices[i + 1], variable_indices[i + 2], variable_indices[i + 3]
-            };
-            row.gate_value = fe_constant<FF, 1>;
-            block_for_row.template append_gate<GateKind::DeltaRange>(row);
-        }
-    }
+    append_delta_range_rows(variable_indices);
 
     // the delta_range constraint has to have access to w_1-shift (it checks that w_1-shift - w_4 is in {0, 1, 2, 3}).
     // Therefore, we repeat the last element in an unconstrained gate.
