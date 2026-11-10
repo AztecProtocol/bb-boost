@@ -128,7 +128,20 @@ std::vector<uint8_t> gunzip([[maybe_unused]] const std::string& path)
         throw std::runtime_error("Failed to open file: " + path);
     }
 
-    std::vector<uint8_t> compressed((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    // One bulk read when the size is known; pipes and other unseekable inputs are streamed.
+    file.seekg(0, std::ios::end);
+    const std::streamoff file_size = file.tellg();
+    if (file_size < 0) {
+        file.clear();
+        std::vector<uint8_t> compressed((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        return gzip_decompress(compressed);
+    }
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> compressed(static_cast<size_t>(file_size));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (!file.read(reinterpret_cast<char*>(compressed.data()), file_size)) {
+        throw std::runtime_error("Failed to read file: " + path);
+    }
     return gzip_decompress(compressed);
 #endif
 }
