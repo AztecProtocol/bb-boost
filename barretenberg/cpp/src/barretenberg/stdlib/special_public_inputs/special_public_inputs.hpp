@@ -419,12 +419,13 @@ class RollupIO {
     {
         RollupIO inputs;
         inputs.pairing_inputs = PairingInputs::construct_default();
-        auto [stdlib_opening_claim, ipa_proof] =
-            IPA<grumpkin<Builder>>::create_valid_ipa_claim_and_proof(builder, ipa_polynomial, ipa_challenge);
+        auto [stdlib_opening_claim, ipa_proof_task] =
+            IPA<grumpkin<Builder>>::create_valid_ipa_claim_deferred(builder, ipa_polynomial, ipa_challenge);
+        auto ipa_proof = std::move(ipa_proof_task).launch();
         inputs.ipa_claim = stdlib_opening_claim;
         inputs.set_public();
 
-        builder.ipa_proof = ipa_proof;
+        builder.set_pending_ipa_proof(std::move(ipa_proof));
     };
 };
 } // namespace bb::stdlib::recursion::honk

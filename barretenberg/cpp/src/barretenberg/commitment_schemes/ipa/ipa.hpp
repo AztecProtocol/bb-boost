@@ -10,6 +10,7 @@
 #include "barretenberg/common/assert.hpp"
 #include "barretenberg/common/bb_bench.hpp"
 #include "barretenberg/common/container.hpp"
+#include "barretenberg/common/deferred_value.hpp"
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include "barretenberg/constants.hpp"
@@ -23,11 +24,14 @@
 #include <array>
 #include <cstddef>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace bb {
+template <size_t log_poly_length = CONST_ECCVM_LOG_N> struct IpaOpeningProofTask;
+
 /**
 * @brief IPA (inner product argument) commitment scheme class.
 *
@@ -99,6 +103,8 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
     // polynomial, given as ∏_{i ∈ [k]} (1 + u_{len-i}^{-1}.X^{2^{i-1}}), and the running truth value of the IPA
     // accumulation claim.
     using VerifierAccumulator = stdlib::recursion::honk::IpaAccumulator<Curve>;
+
+    using OpeningProofTask = IpaOpeningProofTask<log_poly_length>;
 
     /**
      * @brief Deferred native IPA verification state — the native counterpart of `VerifierAccumulator`.
@@ -1031,28 +1037,34 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
     }
 
     /**
-     * @brief Prove a native IPA opening of `challenge_poly` at the (challenge, evaluation) carried by `output_claim`,
-     * returning `output_claim` paired with the generated proof. Shared tail of `accumulate` and
-     * `prove_accumulator_claim`.
+     * @brief Run the native opening proof of a deferred (claim, proof task) pair on the calling thread.
      */
-    static std::pair<OpeningClaim<Curve>, HonkProof> prove_challenge_poly_opening(
-        const CommitmentKey<curve::Grumpkin>& ck,
-        OpeningClaim<Curve> output_claim,
-        const Polynomial<bb::fq>& challenge_poly)
+    static std::pair<OpeningClaim<Curve>, HonkProof> prove_now(
+        std::pair<OpeningClaim<Curve>, OpeningProofTask> deferred)
+    {
+        HonkProof proof = deferred.second.prove();
+        return { std::move(deferred.first), std::move(proof) };
+    }
+
+    /**
+     * @brief Set up the native IPA opening of `challenge_poly` at the (challenge, evaluation) carried by
+     * `output_claim`, returning `output_claim` paired with the task that proves it. Shared tail of
+     * `accumulate_deferred` and `prove_accumulator_claim_deferred`.
+     */
+    static std::pair<OpeningClaim<Curve>, OpeningProofTask> defer_challenge_poly_opening(
+        const CommitmentKey<curve::Grumpkin>& ck, OpeningClaim<Curve> output_claim, Polynomial<bb::fq> challenge_poly)
         requires Curve::is_stdlib_type
     {
         using NativeCurve = curve::Grumpkin;
-        auto prover_transcript = std::make_shared<NativeTranscript>();
         const OpeningPair<NativeCurve> opening_pair{ bb::fq(output_claim.opening_pair.challenge.get_value()),
                                                      bb::fq(output_claim.opening_pair.evaluation.get_value()) };
         BB_ASSERT_EQ(challenge_poly.evaluate(opening_pair.challenge),
                      opening_pair.evaluation,
                      "Opening claim does not hold for challenge polynomial.");
-        IPA<NativeCurve, log_poly_length>::compute_opening_proof(
-            ck, { challenge_poly, opening_pair }, prover_transcript);
 
         output_claim.opening_pair.evaluation.self_reduce();
-        return { output_claim, prover_transcript->export_proof() };
+        return { std::move(output_claim),
+                 OpeningProofTask{ ck, { std::move(challenge_poly), opening_pair }, std::nullopt } };
     }
 
     /**
@@ -1067,6 +1079,18 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
     static std::pair<OpeningClaim<Curve>, HonkProof> accumulate(const CommitmentKey<curve::Grumpkin>& ck,
                                                                 VerifierAccumulator verifier_accumulator_1,
                                                                 VerifierAccumulator verifier_accumulator_2)
+        requires Curve::is_stdlib_type
+    {
+        return prove_now(accumulate_deferred(ck, std::move(verifier_accumulator_1), std::move(verifier_accumulator_2)));
+    }
+
+    /**
+     * @brief `accumulate` with the native opening proof returned as a task instead of computed.
+     */
+    static std::pair<OpeningClaim<Curve>, OpeningProofTask> accumulate_deferred(
+        const CommitmentKey<curve::Grumpkin>& ck,
+        VerifierAccumulator verifier_accumulator_1,
+        VerifierAccumulator verifier_accumulator_2)
         requires Curve::is_stdlib_type
     {
         static_assert(IsAnyOf<typename Curve::Builder, UltraCircuitBuilder>);
@@ -1099,7 +1123,7 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
         Polynomial<bb::fq> challenge_poly =
             create_challenge_poly(native_u_challenges_inv_1, native_u_challenges_inv_2, bb::fq(alpha.get_value()));
 
-        return prove_challenge_poly_opening(ck, std::move(output_claim), challenge_poly);
+        return defer_challenge_poly_opening(ck, std::move(output_claim), std::move(challenge_poly));
     }
 
     /**
@@ -1111,6 +1135,16 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
      */
     static std::pair<OpeningClaim<Curve>, HonkProof> prove_accumulator_claim(const CommitmentKey<curve::Grumpkin>& ck,
                                                                              VerifierAccumulator verifier_accumulator)
+        requires Curve::is_stdlib_type
+    {
+        return prove_now(prove_accumulator_claim_deferred(ck, std::move(verifier_accumulator)));
+    }
+
+    /**
+     * @brief `prove_accumulator_claim` with the native opening proof returned as a task instead of computed.
+     */
+    static std::pair<OpeningClaim<Curve>, OpeningProofTask> prove_accumulator_claim_deferred(
+        const CommitmentKey<curve::Grumpkin>& ck, VerifierAccumulator verifier_accumulator)
         requires Curve::is_stdlib_type
     {
         static_assert(IsAnyOf<typename Curve::Builder, UltraCircuitBuilder>);
@@ -1132,7 +1166,7 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
         Polynomial<bb::fq> challenge_poly =
             construct_poly_from_u_challenges_inv(std::span<const bb::fq>(native_u_challenges_inv));
 
-        return prove_challenge_poly_opening(ck, std::move(output_claim), challenge_poly);
+        return defer_challenge_poly_opening(ck, std::move(output_claim), std::move(challenge_poly));
     }
 
     /**
@@ -1246,22 +1280,64 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
                                                                                       const bb::fq& x)
         requires Curve::is_stdlib_type
     {
+        return prove_now(create_valid_ipa_claim_deferred(builder, poly, x));
+    }
+
+    /**
+     * @brief `create_valid_ipa_claim_and_proof` with the native opening proof returned as a task instead of computed.
+     */
+    static std::pair<OpeningClaim<Curve>, OpeningProofTask> create_valid_ipa_claim_deferred(
+        UltraCircuitBuilder& builder, const Polynomial<bb::fq>& poly, const bb::fq& x)
+        requires Curve::is_stdlib_type
+    {
         using NativeCurve = curve::Grumpkin;
         using Builder = typename Curve::Builder;
         using Curve = stdlib::grumpkin<Builder>;
-        auto ipa_transcript = std::make_shared<NativeTranscript>();
+        // Built on the calling thread rather than by the task: the global CRS factory is not safe to use concurrently.
         CommitmentKey<NativeCurve> ipa_commitment_key(poly_length);
         bb::fq eval = poly.evaluate(x);
         auto commitment = ipa_commitment_key.commit(poly);
         const OpeningPair<NativeCurve> opening_pair = { x, eval };
-        IPA<NativeCurve>::compute_opening_proof(ipa_commitment_key, { poly, opening_pair }, commitment, ipa_transcript);
 
         auto stdlib_comm = Curve::Group::from_witness(&builder, commitment);
         auto stdlib_x = Curve::ScalarField::from_witness(&builder, x);
         auto stdlib_eval = Curve::ScalarField::from_witness(&builder, eval);
         OpeningClaim<Curve> stdlib_opening_claim{ { stdlib_x, stdlib_eval }, stdlib_comm };
 
-        return { stdlib_opening_claim, ipa_transcript->export_proof() };
+        return { stdlib_opening_claim,
+                 OpeningProofTask{ std::move(ipa_commitment_key), { poly, opening_pair }, commitment } };
+    }
+};
+
+/**
+ * @brief A native IPA opening proof whose inputs are fixed but which has not been computed yet.
+ * @details Owns everything it reads, draws no randomness and touches no circuit builder, so it can be proven on any
+ * thread.
+ */
+template <size_t log_poly_length> struct IpaOpeningProofTask {
+    CommitmentKey<curve::Grumpkin> ck;
+    ProverOpeningClaim<curve::Grumpkin> claim;
+    // The commitment to claim.polynomial when the caller already holds it, so that the prover need not recompute it.
+    std::optional<curve::Grumpkin::AffineElement> commitment;
+
+    HonkProof prove() const
+    {
+        using NativeIPA = IPA<curve::Grumpkin, log_poly_length>;
+        auto transcript = std::make_shared<NativeTranscript>();
+        if (commitment.has_value()) {
+            NativeIPA::compute_opening_proof(ck, claim, *commitment, transcript);
+        } else {
+            NativeIPA::compute_opening_proof(ck, claim, transcript);
+        }
+        return transcript->export_proof();
+    }
+
+    /**
+     * @brief Compute the proof on a background thread.
+     */
+    DeferredValue<HonkProof> launch() &&
+    {
+        return DeferredValue<HonkProof>::launch([task = std::move(*this)] { return task.prove(); });
     }
 };
 
