@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include "unistd.h"
 #include <atomic>
@@ -118,7 +119,10 @@ template <typename Fr> struct BackingMemory {
             return;
         }
         Fr* ptr = new Fr[size];
-        memory.aligned_memory = std::shared_ptr<Fr[]>(ptr, [](Fr* p) { delete[] p; });
+        memory.aligned_memory = std::shared_ptr<Fr[]>(ptr, [size](Fr* p) {
+            bb::release_pages_in_parallel(p, size * sizeof(Fr));
+            delete[] p;
+        });
         memory.raw_data = ptr;
     }
 
