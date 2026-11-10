@@ -108,14 +108,11 @@ template <uint64_t base, uint64_t num_slices> constexpr std::array<uint256_t, nu
 template <uint64_t base> constexpr uint256_t map_into_sparse_form(const uint64_t input)
 {
     uint256_t out = 0UL;
-    auto converted = input;
 
     constexpr auto base_powers = get_base_powers<base, 32>();
-    for (size_t i = 0; i < 32; ++i) {
-        uint64_t sparse_bit = ((converted >> i) & 1U);
-        if (sparse_bit) {
-            out += base_powers[i];
-        }
+    // Visit only the set bits among the low 32, in increasing order.
+    for (uint64_t remaining = input & 0xffffffffULL; remaining != 0; remaining &= remaining - 1) {
+        out += base_powers[static_cast<size_t>(std::countr_zero(remaining))];
     }
     return out;
 }
