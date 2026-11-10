@@ -25,7 +25,10 @@
 
 #include "barretenberg/crypto/sha256/sha256.hpp"
 #include "barretenberg/serialize/msgpack_impl.hpp"
+#include <bit>
 #include <execution>
+#include <limits>
+#include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -39,6 +42,13 @@ template <typename FF, int value> constexpr FF fe_constant = FF(value);
 // The sorted values of a range list are written to their new variables in chunks of at least this many values: a
 // value is a 32-byte copy, so smaller chunks would not repay a parallel dispatch.
 constexpr size_t SORTED_VALUES_MIN_CHUNK = size_t{ 1 } << 15;
+// The entries of a range list are resolved to real variables, and the values read, in chunks of at least this many
+// entries: each entry is a scattered read, so a chunk of this size outweighs a parallel dispatch.
+constexpr size_t RANGE_LIST_MIN_CHUNK = size_t{ 1 } << 13;
+// A range list is deduplicated through a bitmap over all variables when the bitmap has at most this many 64-bit words
+// per list entry, as scanning a word costs far less than an entry's share of a comparison sort; sparser lists are
+// sorted. Both give the same sorted set of real indices.
+constexpr size_t BITMAP_MAX_WORDS_PER_LIST_ENTRY = 16;
 } // namespace
 
 template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::finalize_circuit()
@@ -865,35 +875,133 @@ void UltraCircuitBuilder_<ExecutionTrace>::register_new_variable_range_constrain
 
 template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::process_range_list(RangeList& list)
 {
+    VariableBitmap real_variables;
+    process_range_list(list, real_variables);
+}
+
+template <typename ExecutionTrace>
+void UltraCircuitBuilder_<ExecutionTrace>::process_range_list(RangeList& list, VariableBitmap& real_variables)
+{
     this->assert_valid_variables(list.variable_indices);
 
     BB_ASSERT_GT(list.variable_indices.size(), 0U);
 
     // replace witness-index in variable_indices with the corresponding real-variable-index i.e., if a copy constraint
     // has been applied on a variable after it was range constrained, this makes sure the indices in list point to the
-    // updated index in the range list so the set equivalence does not fail
-    for (uint32_t& x : list.variable_indices) {
-        x = this->real_variable_index[x];
-    }
-    // Sort `variable_indices` and remove duplicate witness indices to prevent the sorted list set size being wrong!
-    std::sort(list.variable_indices.begin(), list.variable_indices.end());
-    auto back_iterator = std::unique(list.variable_indices.begin(), list.variable_indices.end());
-    list.variable_indices.erase(back_iterator, list.variable_indices.end());
-
-    // Extract the values of each (real) variable into a list to be sorted (in the sense of the range/plookup-style
-    // argument).
+    // updated index in the range list so the set equivalence does not fail. The real indices are sorted and
+    // deduplicated, to prevent the sorted list set size being wrong, and the value of each (real) variable is extracted
+    // into a list to be sorted (in the sense of the range/plookup-style argument).
+    std::vector<uint32_t>& variable_indices = list.variable_indices;
+    const size_t list_size = variable_indices.size();
+    const auto list_chunks = range_sort::Chunks::of_min_size(list_size, RANGE_LIST_MIN_CHUNK);
+    const uint256_t target_range(list.target_range);
     std::vector<uint32_t> sorted_list;
-    sorted_list.reserve(list.variable_indices.size());
-    bool values_in_range = true;
-    for (const auto variable_index : list.variable_indices) {
-        // note that `field_element` is < 32 bits as the corresponding witness has a non-trivial range-constraint.
-        const auto& field_element = this->get_variable(variable_index);
-        // Convert once, as the original uint32_t field conversion did, then validate the full value.
-        const uint256_t native_value = static_cast<uint256_t>(field_element);
-        values_in_range = values_in_range && native_value <= uint256_t(list.target_range);
-        const uint32_t shrinked_value = static_cast<uint32_t>(native_value.data[0]);
-        sorted_list.emplace_back(shrinked_value);
+    std::vector<uint8_t> chunk_values_in_range;
+    // Writes the value of a real variable to sorted_list[position]; returns whether it lies in the range.
+    const auto extract_value = [&](const size_t position, const uint32_t variable_index) {
+        // note that the value is < 32 bits as the corresponding witness has a non-trivial range-constraint. Convert
+        // once, then validate the full value.
+        const auto native_value = static_cast<uint256_t>(this->get_variable(variable_index));
+        sorted_list[position] = static_cast<uint32_t>(native_value.data[0]);
+        return native_value <= target_range;
+    };
+
+    const size_t num_variables = this->get_num_variables();
+    const size_t num_words = (num_variables + 63) / 64;
+    if (num_words > BITMAP_MAX_WORDS_PER_LIST_ENTRY * list_size) {
+        list_chunks.run([&](size_t /*chunk*/, const size_t begin, const size_t end) {
+            for (size_t i = begin; i < end; ++i) {
+                variable_indices[i] = this->real_variable_index[variable_indices[i]];
+            }
+        });
+        std::sort(variable_indices.begin(), variable_indices.end());
+        auto back_iterator = std::unique(variable_indices.begin(), variable_indices.end());
+        variable_indices.erase(back_iterator, variable_indices.end());
+
+        sorted_list.resize(variable_indices.size());
+        const auto value_chunks = range_sort::Chunks::of_min_size(variable_indices.size(), RANGE_LIST_MIN_CHUNK);
+        chunk_values_in_range.assign(value_chunks.count(), 1);
+        value_chunks.run([&](const size_t chunk, const size_t begin, const size_t end) {
+            bool in_range = true;
+            for (size_t i = begin; i < end; ++i) {
+                const bool value_in_range = extract_value(i, variable_indices[i]);
+                in_range = in_range && value_in_range;
+            }
+            chunk_values_in_range[chunk] = static_cast<uint8_t>(in_range);
+        });
+    } else {
+        // Mark the real indices in the bitmap, then read the set bits back in increasing order: the sorted,
+        // deduplicated real indices.
+        if (real_variables.size() < num_words) {
+            VariableBitmap(num_words).swap(real_variables);
+        }
+        std::vector<uint32_t> chunk_lowest(list_chunks.count(), std::numeric_limits<uint32_t>::max());
+        std::vector<uint32_t> chunk_highest(list_chunks.count(), 0);
+        list_chunks.run([&](const size_t chunk, const size_t begin, const size_t end) {
+            uint32_t lowest = std::numeric_limits<uint32_t>::max();
+            uint32_t highest = 0;
+            // Bits of consecutive entries in the same word are set with one atomic operation.
+            size_t word = 0;
+            uint64_t bits = 0;
+            for (size_t i = begin; i < end; ++i) {
+                const uint32_t real_index = this->real_variable_index[variable_indices[i]];
+                BB_ASSERT_DEBUG(real_index < num_variables);
+                lowest = std::min(lowest, real_index);
+                highest = std::max(highest, real_index);
+                if ((real_index >> 6) != word) {
+                    if (bits != 0) {
+                        real_variables[word].fetch_or(bits, std::memory_order_relaxed);
+                    }
+                    word = real_index >> 6;
+                    bits = 0;
+                }
+                bits |= uint64_t{ 1 } << (real_index & 63);
+            }
+            if (bits != 0) {
+                real_variables[word].fetch_or(bits, std::memory_order_relaxed);
+            }
+            chunk_lowest[chunk] = lowest;
+            chunk_highest[chunk] = highest;
+        });
+        const size_t first_word = *std::ranges::min_element(chunk_lowest) >> 6;
+        const size_t num_list_words = (*std::ranges::max_element(chunk_highest) >> 6) + 1 - first_word;
+        const auto word_chunks = range_sort::Chunks::with_count(num_list_words, list_chunks.count());
+        // chunk_offsets[c] is the position in the deduplicated list of the first real index in word chunk c.
+        std::vector<size_t> chunk_offsets(word_chunks.count() + 1, 0);
+        word_chunks.run([&](const size_t chunk, const size_t begin, const size_t end) {
+            size_t count = 0;
+            for (size_t w = first_word + begin; w < first_word + end; ++w) {
+                count += static_cast<size_t>(std::popcount(real_variables[w].load(std::memory_order_relaxed)));
+            }
+            chunk_offsets[chunk + 1] = count;
+        });
+        std::partial_sum(chunk_offsets.begin(), chunk_offsets.end(), chunk_offsets.begin());
+        const size_t num_real_variables = chunk_offsets.back();
+
+        sorted_list.resize(num_real_variables);
+        chunk_values_in_range.assign(word_chunks.count(), 1);
+        word_chunks.run([&](const size_t chunk, const size_t begin, const size_t end) {
+            size_t position = chunk_offsets[chunk];
+            bool in_range = true;
+            for (size_t w = first_word + begin; w < first_word + end; ++w) {
+                uint64_t bits = real_variables[w].load(std::memory_order_relaxed);
+                real_variables[w].store(0, std::memory_order_relaxed);
+                while (bits != 0) {
+                    const auto real_index =
+                        static_cast<uint32_t>((w << 6) + static_cast<size_t>(std::countr_zero(bits)));
+                    bits &= bits - 1;
+                    variable_indices[position] = real_index;
+                    const bool value_in_range = extract_value(position, real_index);
+                    in_range = in_range && value_in_range;
+                    ++position;
+                }
+            }
+            chunk_values_in_range[chunk] = static_cast<uint8_t>(in_range);
+        });
+        variable_indices.resize(num_real_variables);
     }
+    const bool values_in_range =
+        std::ranges::all_of(chunk_values_in_range, [](const uint8_t in_range) { return in_range != 0; });
 
     if (!values_in_range || !range_sort::try_counting_sort(sorted_list, list.target_range)) {
 #ifdef NO_PAR_ALGOS
@@ -939,8 +1047,9 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::pr
 
 template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::process_range_lists()
 {
+    VariableBitmap real_variables;
     for (auto& i : range_lists) {
-        process_range_list(i.second);
+        process_range_list(i.second, real_variables);
     }
 }
 

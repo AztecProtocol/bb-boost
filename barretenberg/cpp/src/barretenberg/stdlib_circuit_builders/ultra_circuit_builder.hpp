@@ -12,6 +12,7 @@
 
 #include "circuit_builder_base.hpp"
 #include "rom_ram_logic.hpp"
+#include <atomic>
 #include <deque>
 #include <optional>
 #include <unordered_set>
@@ -612,6 +613,10 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     void process_range_lists();
 
   private:
+    // One bit per variable; every bit is clear between range lists.
+    using VariableBitmap = std::vector<std::atomic<uint64_t>>;
+    // process_range_list with a bitmap that is kept, all clear, for the next list.
+    void process_range_list(RangeList& list, VariableBitmap& real_variables);
     // One delta-range row per `NUM_WIRES` consecutive entries of `variable_indices`.
     void append_delta_range_rows(const std::vector<uint32_t>& variable_indices);
 
