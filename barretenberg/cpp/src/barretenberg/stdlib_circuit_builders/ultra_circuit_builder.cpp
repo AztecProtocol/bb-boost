@@ -912,9 +912,19 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::pr
         indices.emplace_back(this->zero_idx());
     }
     // tag the elements in the sorted_list to apply the multiset-equality check implicit in range-constraints.
+    // Equal values are adjacent in the sorted list, so each run converts its value to a field element once. Each new
+    // variable is its own real variable and carries DEFAULT_TAG, so it takes the tau tag directly.
+    uint32_t run_value = 0;
+    fr run_element = fr(run_value);
     for (const auto sorted_value : sorted_list) {
-        const uint32_t index = this->add_variable(fr(sorted_value));
-        assign_tag(index, list.tau_tag);
+        if (sorted_value != run_value) {
+            run_value = sorted_value;
+            run_element = fr(run_value);
+        }
+        const uint32_t index = this->add_variable(run_element);
+        BB_ASSERT_DEBUG(this->real_variable_index[index] == index);
+        BB_ASSERT_DEBUG(this->real_variable_tags[index] == DEFAULT_TAG);
+        this->real_variable_tags[index] = list.tau_tag;
         indices.emplace_back(index);
     }
     // constrain the _sorted_ list: starts at 0, ends at `target_range`, consecutive differences in {0, 1, 2, 3}.
