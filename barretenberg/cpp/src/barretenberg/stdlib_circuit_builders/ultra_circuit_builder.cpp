@@ -495,6 +495,9 @@ plookup::ReadData<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_gates_f
     const auto& multi_table = plookup::get_multitable(id);
     const size_t num_lookups = read_values[ColumnIdx::C1].size();
     plookup::ReadData<uint32_t> read_data;
+    read_data[ColumnIdx::C1].reserve(num_lookups);
+    read_data[ColumnIdx::C2].reserve(num_lookups);
+    read_data[ColumnIdx::C3].reserve(num_lookups);
 
     for (size_t i = 0; i < num_lookups; ++i) {
         const bool is_first_lookup = (i == 0);
