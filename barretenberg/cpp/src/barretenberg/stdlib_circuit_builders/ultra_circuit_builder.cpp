@@ -610,7 +610,7 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
     BB_ASSERT_GT(num_bits, 0U);
     BB_ASSERT_GTE(MAX_NUM_BITS_RANGE_CONSTRAINT, num_bits);
 
-    uint256_t val = (uint256_t)(this->get_variable(variable_index));
+    const uint256_t val = (uint256_t)(this->get_variable(variable_index));
 
     // If the value is out of range, set the CircuitBuilder error to the given msg.
     if (val.get_msb() >= num_bits && !this->failed()) {
@@ -620,35 +620,42 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
     // compute limb structure
     const uint64_t sublimb_mask = (1ULL << target_range_bitnum) - 1;
 
-    std::vector<uint64_t> sublimbs;
-    std::vector<uint32_t> sublimb_indices;
-
     const bool has_remainder_bits = (num_bits % target_range_bitnum != 0);
     const uint64_t num_limbs = (num_bits / target_range_bitnum) + has_remainder_bits;
     const uint64_t last_limb_size = num_bits - ((num_bits / target_range_bitnum) * target_range_bitnum);
     const uint64_t last_limb_range = ((uint64_t)1 << last_limb_size) - 1;
 
-    // extract limbs from the value
-    uint256_t accumulator = val;
-    for (size_t i = 0; i < num_limbs; ++i) {
-        sublimbs.push_back(accumulator.data[0] & sublimb_mask);
-        accumulator = accumulator >> target_range_bitnum;
-    }
+    // Limb j holds bits [j * target_range_bitnum, (j + 1) * target_range_bitnum) of the value; the full sublimb mask
+    // also applies to the remainder limb, whose smaller range is enforced by its range constraint.
+    const auto limb_value = [&](const uint64_t j) {
+        const uint64_t shift = j * target_range_bitnum;
+        const uint64_t word = shift / 64;
+        const uint64_t offset = shift % 64;
+        if (word >= 4) {
+            return uint64_t{ 0 };
+        }
+        uint64_t bits = val.data[word] >> offset;
+        if (offset != 0 && word + 1 < 4) {
+            bits |= val.data[word + 1] << (64 - offset);
+        }
+        return bits & sublimb_mask;
+    };
+
     // set the correct range constraint on each limb. note that when there are remainder bits, the last limb must be
     // constrained to a smaller range.
-    const size_t num_full_limbs = has_remainder_bits ? sublimbs.size() - 1 : sublimbs.size();
+    std::vector<uint32_t> sublimb_indices;
+    sublimb_indices.reserve(num_limbs);
     RangeList* list = nullptr;
-    for (size_t i = 0; i < num_full_limbs; ++i) {
-        const auto limb_idx = this->add_variable(bb::fr(sublimbs[i]));
+    for (uint64_t j = 0; j < num_limbs; ++j) {
+        const uint64_t sublimb = limb_value(j);
+        const bool is_remainder_limb = has_remainder_bits && (j == num_limbs - 1);
+        const auto limb_idx = this->add_variable(bb::fr(sublimb));
         sublimb_indices.emplace_back(limb_idx);
-        register_new_variable_range_constraint(
-            limb_idx, sublimb_mask, sublimbs[i], list, "create_small_range_constraint");
-    }
-    if (has_remainder_bits) {
-        const auto limb_idx = this->add_variable(bb::fr(sublimbs.back()));
-        sublimb_indices.emplace_back(limb_idx);
-        register_new_variable_range_constraint(
-            limb_idx, last_limb_range, sublimbs.back(), list, "create_small_range_constraint");
+        register_new_variable_range_constraint(limb_idx,
+                                               is_remainder_limb ? last_limb_range : sublimb_mask,
+                                               sublimb,
+                                               list,
+                                               "create_small_range_constraint");
     }
 
     // Prove that the limbs reconstruct the original value by processing limbs in groups of 3.
@@ -660,7 +667,23 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
     // `leftovers` is the number of real limbs in the final triple (1, 2, or 3).
     const uint64_t leftovers = (num_limbs % 3) == 0 ? 3 : (num_limbs % 3);
 
-    accumulator = val;
+    // The gate scalings FF(uint256_t(1) << shift) for the limb positions of the default limb size, so that the common
+    // case does not convert them to Montgomery form on every call.
+    static constexpr size_t MAX_DEFAULT_LIMBS =
+        (MAX_NUM_BITS_RANGE_CONSTRAINT + DEFAULT_PLOOKUP_RANGE_BITNUM - 1) / DEFAULT_PLOOKUP_RANGE_BITNUM;
+    static constexpr size_t NUM_DEFAULT_SCALINGS = 3 * ((MAX_DEFAULT_LIMBS + 2) / 3);
+    static constexpr std::array<FF, NUM_DEFAULT_SCALINGS> DEFAULT_SCALINGS = [] {
+        std::array<FF, NUM_DEFAULT_SCALINGS> scalings{};
+        for (size_t k = 0; k < NUM_DEFAULT_SCALINGS; ++k) {
+            scalings[k] = FF(uint256_t(1) << (DEFAULT_PLOOKUP_RANGE_BITNUM * k));
+        }
+        return scalings;
+    }();
+    static constexpr FF MINUS_ONE = -1;
+    static constexpr FF ZERO = 0;
+    const bool use_default_scalings =
+        (target_range_bitnum == DEFAULT_PLOOKUP_RANGE_BITNUM) && (3 * num_limb_triples <= NUM_DEFAULT_SCALINGS);
+
     uint32_t accumulator_idx = variable_index;
     // loop goes from `i = 0` to `num_limb_triples`, but some special case must be taken for the last triple (`i ==
     // num_limb_triples - 1`), hence some conditional logic.
@@ -673,12 +696,6 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
             !(i == (num_limb_triples - 1) && (leftovers < 3)),
         };
 
-        // The witness values of the 3 limbs in this triple (0 for padding positions).
-        const uint64_t round_sublimbs[3]{
-            real_limbs[0] ? sublimbs[3 * i] : 0,
-            real_limbs[1] ? sublimbs[3 * i + 1] : 0,
-            real_limbs[2] ? sublimbs[3 * i + 2] : 0,
-        };
         // The witnesss indices of the current 3 limbs (zero_idx for padding positions).
         const uint32_t new_limbs[3]{
             real_limbs[0] ? sublimb_indices[3 * i] : this->zero_idx(),
@@ -691,16 +708,14 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
             target_range_bitnum * (3 * i + 1),
             target_range_bitnum * (3 * i + 2),
         };
-        // Compute the new accumulator after subtracting this triple's contribution.
-        // After the final iteration, accumulator should be 0.
-        uint256_t new_accumulator = accumulator - (uint256_t(round_sublimbs[0]) << shifts[0]) -
-                                    (uint256_t(round_sublimbs[1]) << shifts[1]) -
-                                    (uint256_t(round_sublimbs[2]) << shifts[2]);
+        const auto scaling = [&](const size_t k) {
+            return use_default_scalings ? DEFAULT_SCALINGS[(3 * i) + k] : FF(uint256_t(1) << shifts[k]);
+        };
 
         // This `big_add_gate` has differing behavior depending on whether or not `i == num_limb_triples - 1`.
         // If `i != num_limb_triples - 1`, then the constraint will be limb[0]*2^shift[0] + limb[1]*2^shift[1] +
         // limb[2]*2^shift[2] - acc = new_accumulator (the last argument to `create_big_add_gate` is `true`, means the
-        // sum is w_4-shift, which will be the witness corresponding to what is currently `new_accumulator`.).
+        // sum is w_4-shift, which will be the witness corresponding to the new accumulator.).
         // If `i == num_limb_triples - 1`, then the last argument to `create_big_add_gate` is false, so the constraint
         // is limb[0]*2^shift[0] + limb[1]*2^shift[1] + limb[2]*2^shift[2] - acc = 0.
         //
@@ -713,16 +728,17 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
                 new_limbs[1],
                 new_limbs[2],
                 accumulator_idx,
-                uint256_t(1) << shifts[0],
-                uint256_t(1) << shifts[1],
-                uint256_t(1) << shifts[2],
-                -1,
-                0,
+                scaling(0),
+                scaling(1),
+                scaling(2),
+                MINUS_ONE,
+                ZERO,
             },
             (i != num_limb_triples - 1));
         if (i != num_limb_triples - 1) {
-            accumulator_idx = this->add_variable(fr(new_accumulator));
-            accumulator = new_accumulator;
+            // The accumulator after subtracting limbs 0..3i+2 is the value with those limbs' bits cleared.
+            const uint64_t consumed_bits = target_range_bitnum * (3 * i + 3);
+            accumulator_idx = this->add_variable(fr((val >> consumed_bits) << consumed_bits));
         }
     }
     return sublimb_indices;
