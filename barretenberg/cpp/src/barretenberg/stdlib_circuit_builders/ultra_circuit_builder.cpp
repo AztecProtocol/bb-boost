@@ -35,6 +35,10 @@ namespace {
 // A small integer as a compile-time field element. Writing the integer where a field element is expected converts it
 // to Montgomery form, a field multiplication, every time the line runs.
 template <typename FF, int value> constexpr FF fe_constant = FF(value);
+
+// The sorted values of a range list are written to their new variables in chunks of at least this many values: a
+// value is a 32-byte copy, so smaller chunks would not repay a parallel dispatch.
+constexpr size_t SORTED_VALUES_MIN_CHUNK = size_t{ 1 } << 15;
 } // namespace
 
 template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::finalize_circuit()
@@ -900,33 +904,35 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::pr
     }
     // list must be padded to a multipe of 4 and larger than 4 (gate_width)
     constexpr size_t gate_width = NUM_WIRES;
-    size_t padding = (gate_width - (list.variable_indices.size() % gate_width)) % gate_width;
-
-    std::vector<uint32_t> indices;
-    indices.reserve(padding + sorted_list.size());
-
-    if (list.variable_indices.size() <= gate_width) {
+    const size_t num_values = sorted_list.size();
+    size_t padding = (gate_width - (num_values % gate_width)) % gate_width;
+    if (num_values <= gate_width) {
         padding += gate_width;
     }
-    for (size_t i = 0; i < padding; ++i) {
-        indices.emplace_back(this->zero_idx());
-    }
-    // tag the elements in the sorted_list to apply the multiset-equality check implicit in range-constraints.
-    // Equal values are adjacent in the sorted list, so each run converts its value to a field element once. Each new
-    // variable is its own real variable and carries DEFAULT_TAG, so it takes the tau tag directly.
-    uint32_t run_value = 0;
-    fr run_element = fr(run_value);
-    for (const auto sorted_value : sorted_list) {
-        if (sorted_value != run_value) {
-            run_value = sorted_value;
-            run_element = fr(run_value);
-        }
-        const uint32_t index = this->add_variable(run_element);
-        BB_ASSERT_DEBUG(this->real_variable_index[index] == index);
-        BB_ASSERT_DEBUG(this->real_variable_tags[index] == DEFAULT_TAG);
-        this->real_variable_tags[index] = list.tau_tag;
-        indices.emplace_back(index);
-    }
+    // tag the elements in the sorted_list to apply the multiset-equality check implicit in range-constraints: one new
+    // variable per sorted value, in order, each its own real variable carrying the tau tag. Equal values are adjacent
+    // in the sorted list, so each run within a chunk converts its value to a field element once.
+    const uint32_t first_sorted_index =
+        this->add_tagged_variables(num_values, list.tau_tag, [&](const std::span<FF> values) {
+            range_sort::Chunks::of_min_size(num_values, SORTED_VALUES_MIN_CHUNK)
+                .run([&](size_t /*chunk*/, const size_t begin, const size_t end) {
+                    if (begin == end) {
+                        return;
+                    }
+                    uint32_t run_value = sorted_list[begin];
+                    FF run_element(run_value);
+                    for (size_t i = begin; i < end; ++i) {
+                        if (sorted_list[i] != run_value) {
+                            run_value = sorted_list[i];
+                            run_element = FF(run_value);
+                        }
+                        values[i] = run_element;
+                    }
+                });
+        });
+    std::vector<uint32_t> indices(padding + num_values);
+    std::fill_n(indices.begin(), padding, this->zero_idx());
+    std::iota(indices.begin() + static_cast<std::ptrdiff_t>(padding), indices.end(), first_sorted_index);
     // constrain the _sorted_ list: starts at 0, ends at `target_range`, consecutive differences in {0, 1, 2, 3}.
     create_sort_constraint_with_edges(indices, 0, list.target_range);
 }
