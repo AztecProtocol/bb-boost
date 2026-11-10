@@ -59,6 +59,20 @@ template <typename Builder, typename T> class bigfield {
             os << "{ " << a.element << " <= " << a.maximum_value << " }";
             return os;
         }
+        /**
+         * @brief Construct a constant limb from its integer value, which must be below both the native modulus and
+         * DEFAULT_MAXIMUM_LIMB.
+         * @details Equal to Limb(field_t<Builder>(ctx, bb::fr(value))), whose maximum value is the element converted
+         * back out of Montgomery form, i.e. `value` itself.
+         */
+        static Limb from_constant(Builder* ctx, const uint256_t& value)
+        {
+            BB_ASSERT_DEBUG(value <= DEFAULT_MAXIMUM_LIMB);
+            Limb limb;
+            limb.element = field_t<Builder>(ctx, bb::fr(value));
+            limb.maximum_value = value;
+            return limb;
+        }
         Limb(const Limb& other) = default;
         Limb(Limb&& other) noexcept = default;
         Limb& operator=(const Limb& other) = default;

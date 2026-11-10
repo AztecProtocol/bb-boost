@@ -24,22 +24,22 @@ namespace bb::stdlib {
 template <typename Builder, typename T>
 bigfield<Builder, T>::bigfield(Builder* parent_context)
     : context(parent_context)
-    , binary_basis_limbs{ Limb(field_t<Builder>(parent_context, bb::fr(0))),
-                          Limb(field_t<Builder>(parent_context, bb::fr(0))),
-                          Limb(field_t<Builder>(parent_context, bb::fr(0))),
-                          Limb(field_t<Builder>(parent_context, bb::fr(0))) }
-    , prime_basis_limb(context, 0)
-{}
+    , prime_basis_limb(parent_context)
+{
+    // Default limbs are constant zeros with maximum value 0. bb::fr(0) is the all-zero representation, so this equals
+    // building each limb from field_t(parent_context, bb::fr(0)) without the Montgomery conversions.
+    for (auto& limb : binary_basis_limbs) {
+        limb.element.context = parent_context;
+    }
+}
 
 template <typename Builder, typename T>
 bigfield<Builder, T>::bigfield(Builder* parent_context, const uint256_t& value)
     : context(parent_context)
-    , binary_basis_limbs{ Limb(field_t<Builder>(parent_context, bb::fr(value.slice(0, NUM_LIMB_BITS)))),
-                          Limb(field_t<Builder>(parent_context, bb::fr(value.slice(NUM_LIMB_BITS, NUM_LIMB_BITS * 2)))),
-                          Limb(field_t<Builder>(parent_context,
-                                                bb::fr(value.slice(NUM_LIMB_BITS * 2, NUM_LIMB_BITS * 3)))),
-                          Limb(field_t<Builder>(parent_context,
-                                                bb::fr(value.slice(NUM_LIMB_BITS * 3, NUM_LIMB_BITS * 4)))) }
+    , binary_basis_limbs{ Limb::from_constant(parent_context, value.slice(0, NUM_LIMB_BITS)),
+                          Limb::from_constant(parent_context, value.slice(NUM_LIMB_BITS, NUM_LIMB_BITS * 2)),
+                          Limb::from_constant(parent_context, value.slice(NUM_LIMB_BITS * 2, NUM_LIMB_BITS * 3)),
+                          Limb::from_constant(parent_context, value.slice(NUM_LIMB_BITS * 3, NUM_LIMB_BITS * 4)) }
     , prime_basis_limb(context, value)
 {
     BB_ASSERT_LT(value, modulus);
@@ -890,8 +890,8 @@ bigfield<Builder, T> bigfield<Builder, T>::div_without_denominator_check(const s
 
 template <typename Builder, typename T>
 bigfield<Builder, T> bigfield<Builder, T>::div_without_denominator_check(const std::vector<bigfield>& numerators,
-                                                                        const bigfield& denominator,
-                                                                        NativeDivisionCache& cache)
+                                                                         const bigfield& denominator,
+                                                                         NativeDivisionCache& cache)
 {
     return internal_div(numerators, denominator, false, &cache);
 }
