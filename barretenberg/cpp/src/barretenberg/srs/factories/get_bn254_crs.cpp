@@ -1,6 +1,7 @@
 #include "get_bn254_crs.hpp"
 #include "barretenberg/api/file_io.hpp"
 #include "barretenberg/common/flock.hpp"
+#include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/common/serialize.hpp"
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/crypto/sha256/sha256.hpp"
@@ -397,7 +398,12 @@ Bn254G1Points load_bn254_g1_points(const std::filesystem::path& path, size_t num
     // Fast path, the cached uncompressed file: read straight into uninitialised storage. new T[n] default-initialises,
     // which for the trivially constructible affine_element leaves the memory untouched.
     static_assert(std::is_trivially_default_constructible_v<g1::affine_element>);
-    auto allocate = [](size_t n) { return std::shared_ptr<g1::affine_element[]>(new g1::affine_element[n]); };
+    auto allocate = [](size_t n) {
+        return std::shared_ptr<g1::affine_element[]>(new g1::affine_element[n], [n](g1::affine_element* p) {
+            release_pages_in_parallel(p, n * sizeof(g1::affine_element));
+            delete[] p;
+        });
+    };
     // As get_bn254_g1_data: whole pinned chunks (a verification key is only computed from those), and BB_VERIFY_CRS=1
     // skips the uncompressed cache, which has no pinned hashes.
     num_points = round_up_to_chunk_boundary(num_points);
