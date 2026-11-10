@@ -31,6 +31,12 @@
 
 namespace bb {
 
+namespace {
+// A small integer as a compile-time field element. Writing the integer where a field element is expected converts it
+// to Montgomery form, a field multiplication, every time the line runs.
+template <typename FF, int value> constexpr FF fe_constant = FF(value);
+} // namespace
+
 template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::finalize_circuit()
 {
     /**
@@ -121,7 +127,7 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::cr
                           .a_scaling = in.a_scaling,
                           .b_scaling = in.b_scaling,
                           .c_scaling = in.c_scaling,
-                          .d_scaling = 0,
+                          .d_scaling = fe_constant<FF, 0>,
                           .const_scaling = in.const_scaling });
 }
 
@@ -141,15 +147,15 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_big_mul_add_gate(const mul_qua
     // If include_next_gate_w_4 is true then we set q_arith = 2. In this case, the linear term in the ArithmeticRelation
     // is scaled by a factor of 2. We compensate here by scaling the quadratic term by 2 to achieve the constraint:
     //      2 * [q_m * w_1 * w_2 + \sum_{i=1..4} q_i * w_i + q_c + w_4_shift] = 0
-    const FF mul_scaling = include_next_gate_w_4 ? in.mul_scaling * FF(2) : in.mul_scaling;
+    const FF mul_scaling = include_next_gate_w_4 ? in.mul_scaling * fe_constant<FF, 2> : in.mul_scaling;
     blocks.arithmetic.template append_gate<GateKind::Arith>({ .wires = { in.a, in.b, in.c, in.d },
-                                                              .q_m = mul_scaling,
-                                                              .q_c = in.const_scaling,
-                                                              .q_1 = in.a_scaling,
-                                                              .q_2 = in.b_scaling,
-                                                              .q_3 = in.c_scaling,
-                                                              .q_4 = in.d_scaling,
-                                                              .gate_value = include_next_gate_w_4 ? 2 : 1 });
+                                    .q_m = mul_scaling,
+                                    .q_c = in.const_scaling,
+                                    .q_1 = in.a_scaling,
+                                    .q_2 = in.b_scaling,
+                                    .q_3 = in.c_scaling,
+                                    .q_4 = in.d_scaling,
+                                    .gate_value = include_next_gate_w_4 ? fe_constant<FF, 2> : fe_constant<FF, 1> });
     this->increment_num_gates();
 }
 
@@ -167,12 +173,12 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_big_add_gate(const add_quad_<F
 {
     this->assert_valid_variables({ in.a, in.b, in.c, in.d });
     blocks.arithmetic.template append_gate<GateKind::Arith>({ .wires = { in.a, in.b, in.c, in.d },
-                                                              .q_c = in.const_scaling,
-                                                              .q_1 = in.a_scaling,
-                                                              .q_2 = in.b_scaling,
-                                                              .q_3 = in.c_scaling,
-                                                              .q_4 = in.d_scaling,
-                                                              .gate_value = include_next_gate_w_4 ? 2 : 1 });
+                                    .q_c = in.const_scaling,
+                                    .q_1 = in.a_scaling,
+                                    .q_2 = in.b_scaling,
+                                    .q_3 = in.c_scaling,
+                                    .q_4 = in.d_scaling,
+                                    .gate_value = include_next_gate_w_4 ? fe_constant<FF, 2> : fe_constant<FF, 1> });
     this->increment_num_gates();
 }
 
@@ -208,8 +214,8 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_bilinear_batched_eq_gate(const
         row.q_2 = in.q_r;
         row.q_3 = in.q_o;
         row.q_4 = in.q_4;
-        row.q_5 = in.mode == BilinearBatchedEqMode::Bilinear ? in.q_5 : FF(0);
-        row.gate_value = in.mode == BilinearBatchedEqMode::Bilinear ? 1 : 2;
+        row.q_5 = in.mode == BilinearBatchedEqMode::Bilinear ? in.q_5 : fe_constant<FF, 0>;
+        row.gate_value = in.mode == BilinearBatchedEqMode::Bilinear ? fe_constant<FF, 1> : fe_constant<FF, 2>;
         block_for_row.template append_gate<GateKind::BilinearBatchedEq>(row);
     }
     this->increment_num_gates();
@@ -225,11 +231,10 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_bool_gate(const uint32_t varia
 {
     this->assert_valid_variables({ variable_index });
 
-    blocks.arithmetic.template append_gate<GateKind::Arith>(
-        { .wires = { variable_index, variable_index, this->zero_idx(), this->zero_idx() },
-          .q_m = 1,
-          .q_1 = -1,
-          .gate_value = 1 });
+    blocks.arithmetic.template append_gate<GateKind::Arith>({ .wires = { variable_index, variable_index, this->zero_idx(), this->zero_idx() },
+                                    .q_m = fe_constant<FF, 1>,
+                                    .q_1 = fe_constant<FF, -1>,
+                                    .gate_value = fe_constant<FF, 1> });
     this->increment_num_gates();
 }
 
@@ -245,12 +250,12 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_arithmetic_gate(const arithmet
     this->assert_valid_variables({ in.a, in.b, in.c });
 
     blocks.arithmetic.template append_gate<GateKind::Arith>({ .wires = { in.a, in.b, in.c, this->zero_idx() },
-                                                              .q_m = in.q_m,
-                                                              .q_c = in.q_c,
-                                                              .q_1 = in.q_l,
-                                                              .q_2 = in.q_r,
-                                                              .q_3 = in.q_o,
-                                                              .gate_value = 1 });
+                                    .q_m = in.q_m,
+                                    .q_c = in.q_c,
+                                    .q_1 = in.q_l,
+                                    .q_2 = in.q_r,
+                                    .q_3 = in.q_o,
+                                    .gate_value = fe_constant<FF, 1> });
     this->increment_num_gates();
 }
 
@@ -280,7 +285,7 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_ecc_add_gate(const ecc_add_gat
 
     // Convert bool to field element for the relation: +1 for addition, -1 for subtraction
     // The elliptic curve relation assumes q_sign² = 1 (see elliptic_relation.hpp)
-    const FF q_sign = in.is_addition ? FF(1) : FF(-1);
+    const FF q_sign = in.is_addition ? fe_constant<FF, 1> : fe_constant<FF, -1>;
 
     // Determine whether we can fuse this addition operation into the previous gate in the block
     bool can_fuse_into_previous_gate =
@@ -289,15 +294,16 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_ecc_add_gate(const ecc_add_gat
         block.w_o()[block.size() - 1] == in.y1;   /* output y coord of previous gate is input of this one */
 
     if (can_fuse_into_previous_gate) {
-        block.q_1().set(block.size() - 1, q_sign);                            // set q_sign of previous gate
-        block.gate_selector_for(GateKind::Elliptic).set(block.size() - 1, 1); // set q_ecc of previous gate to 1
+        // set q_sign and q_ecc = 1 on the previous gate
+        block.q_1().set(block.size() - 1, q_sign);
+        block.gate_selector_for(GateKind::Elliptic).set(block.size() - 1, fe_constant<FF, 1>);
     } else {
         {
             auto& block_for_row = block;
             GateRowT row{};
             row.wires = { this->zero_idx(), in.x1, in.y1, this->zero_idx() };
             row.q_1 = q_sign;
-            row.gate_value = 1;
+            row.gate_value = fe_constant<FF, 1>;
             block_for_row.template append_gate<GateKind::Elliptic>(row);
         }
         this->increment_num_gates();
@@ -338,15 +344,16 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_ecc_dbl_gate(const ecc_dbl_gat
 
     // If possible, update the previous gate to be the first gate in the pair, otherwise create a new gate
     if (can_fuse_into_previous_gate) {
-        block.gate_selector_for(GateKind::Elliptic).set(block.size() - 1, 1); // set q_ecc of previous gate to 1
-        block.q_m().set(block.size() - 1, 1); // set q_m (q_is_double) of previous gate to 1
+        // set q_ecc = 1 and q_m (q_is_double) = 1 on the previous gate
+        block.gate_selector_for(GateKind::Elliptic).set(block.size() - 1, fe_constant<FF, 1>);
+        block.q_m().set(block.size() - 1, fe_constant<FF, 1>);
     } else {
         {
             auto& block_for_row = block;
             GateRowT row{};
             row.wires = { this->zero_idx(), in.x1, in.y1, this->zero_idx() };
-            row.q_m = 1;
-            row.gate_value = 1;
+            row.q_m = fe_constant<FF, 1>;
+            row.gate_value = fe_constant<FF, 1>;
             block_for_row.template append_gate<GateKind::Elliptic>(row);
         }
         this->increment_num_gates();
@@ -369,11 +376,10 @@ void UltraCircuitBuilder_<ExecutionTrace>::fix_witness(const uint32_t witness_in
     // Mark as intentionally single-gate for boomerang detection
     update_used_witnesses(witness_index);
 
-    blocks.arithmetic.template append_gate<GateKind::Arith>(
-        { .wires = { witness_index, this->zero_idx(), this->zero_idx(), this->zero_idx() },
-          .q_c = -witness_value,
-          .q_1 = 1,
-          .gate_value = 1 });
+    blocks.arithmetic.template append_gate<GateKind::Arith>({ .wires = { witness_index, this->zero_idx(), this->zero_idx(), this->zero_idx() },
+                                    .q_c = -witness_value,
+                                    .q_1 = fe_constant<FF, 1>,
+                                    .gate_value = fe_constant<FF, 1> });
     this->increment_num_gates();
 }
 
@@ -468,7 +474,7 @@ void UltraCircuitBuilder_<ExecutionTrace>::append_lookup_gate(const uint32_t key
         auto& block_for_row = blocks.lookup;
         GateRowT row{};
         row.wires = { key_idx, val1_idx, val2_idx, this->zero_idx() };
-        row.gate_value = 1;
+        row.gate_value = fe_constant<FF, 1>;
         row.q_m = column_2_step_size;
         row.q_c = column_3_step_size;
         row.q_2 = column_1_step_size;
@@ -547,9 +553,9 @@ plookup::ReadData<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_gates_f
         read_data[ColumnIdx::C3].push_back(third_idx);
 
         // Step size coefficients: zero for last lookup (no next accumulator), negative step sizes otherwise
-        const FF col1_step = is_last_lookup ? FF(0) : -multi_table.column_1_step_sizes[i + 1];
-        const FF col2_step = is_last_lookup ? FF(0) : -multi_table.column_2_step_sizes[i + 1];
-        const FF col3_step = is_last_lookup ? FF(0) : -multi_table.column_3_step_sizes[i + 1];
+        const FF col1_step = is_last_lookup ? fe_constant<FF, 0> : -multi_table.column_1_step_sizes[i + 1];
+        const FF col2_step = is_last_lookup ? fe_constant<FF, 0> : -multi_table.column_2_step_sizes[i + 1];
+        const FF col3_step = is_last_lookup ? fe_constant<FF, 0> : -multi_table.column_3_step_sizes[i + 1];
 
         append_lookup_gate(first_idx,
                            second_idx,
@@ -668,7 +674,7 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
     const uint64_t leftovers = (num_limbs % 3) == 0 ? 3 : (num_limbs % 3);
 
     // The gate scalings FF(uint256_t(1) << shift) for the limb positions of the default limb size, so that the common
-    // case does not convert them to Montgomery form on every call.
+    // case does not convert them to Montgomery form on every call (see fe_constant).
     static constexpr size_t MAX_DEFAULT_LIMBS =
         (MAX_NUM_BITS_RANGE_CONSTRAINT + DEFAULT_PLOOKUP_RANGE_BITNUM - 1) / DEFAULT_PLOOKUP_RANGE_BITNUM;
     static constexpr size_t NUM_DEFAULT_SCALINGS = 3 * ((MAX_DEFAULT_LIMBS + 2) / 3);
@@ -679,8 +685,6 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
         }
         return scalings;
     }();
-    static constexpr FF MINUS_ONE = -1;
-    static constexpr FF ZERO = 0;
     const bool use_default_scalings =
         (target_range_bitnum == DEFAULT_PLOOKUP_RANGE_BITNUM) && (3 * num_limb_triples <= NUM_DEFAULT_SCALINGS);
 
@@ -731,8 +735,8 @@ std::vector<uint32_t> UltraCircuitBuilder_<ExecutionTrace>::create_limbed_range_
                 scaling(0),
                 scaling(1),
                 scaling(2),
-                MINUS_ONE,
-                ZERO,
+                fe_constant<FF, -1>,
+                fe_constant<FF, 0>,
             },
             (i != num_limb_triples - 1));
         if (i != num_limb_triples - 1) {
@@ -940,7 +944,7 @@ void UltraCircuitBuilder_<ExecutionTrace>::enforce_small_deltas(const std::vecto
             row.wires = {
                 variable_indices[i], variable_indices[i + 1], variable_indices[i + 2], variable_indices[i + 3]
             };
-            row.gate_value = 1;
+            row.gate_value = fe_constant<FF, 1>;
             block_for_row.template append_gate<GateKind::DeltaRange>(row);
         }
     }
@@ -999,7 +1003,7 @@ void UltraCircuitBuilder_<ExecutionTrace>::create_sort_constraint_with_edges(
             row.wires = {
                 variable_indices[i], variable_indices[i + 1], variable_indices[i + 2], variable_indices[i + 3]
             };
-            row.gate_value = 1;
+            row.gate_value = fe_constant<FF, 1>;
             block_for_row.template append_gate<GateKind::DeltaRange>(row);
         }
     }
@@ -1043,15 +1047,15 @@ typename UltraCircuitBuilder_<ExecutionTrace>::GateRowT UltraCircuitBuilder_<Exe
     requires(ExecutionTrace::has_gate_kind(GateKind::Memory))
 {
     GateRowT row{};
-    row.gate_value = type == MEMORY_SELECTORS::MEM_NONE ? 0 : 1;
+    row.gate_value = type == MEMORY_SELECTORS::MEM_NONE ? fe_constant<FF, 0> : fe_constant<FF, 1>;
     switch (type) {
     case MEMORY_SELECTORS::ROM_CONSISTENCY_CHECK: {
         // Memory read gate used with the sorted list of memory reads.
         // Apply sorted memory read checks with the following additional check:
         // 1. Assert that if index field across two gates does not change, the value field does not change.
         // Used for ROM reads and RAM reads across write/read boundaries
-        row.q_1 = 1;
-        row.q_2 = 1;
+        row.q_1 = fe_constant<FF, 1>;
+        row.q_2 = fe_constant<FF, 1>;
         break;
     }
     case MEMORY_SELECTORS::RAM_CONSISTENCY_CHECK: {
@@ -1060,22 +1064,22 @@ typename UltraCircuitBuilder_<ExecutionTrace>::GateRowT UltraCircuitBuilder_<Exe
         // 2. Validate record computation (r = read_write_flag + index * \eta + \timestamp * \eta^2 + value * \eta^3)
         // 3. If adjacent index values across 2 gates does not change, and the next gate's read_write_flag is set to
         // 'read', validate adjacent values do not change Used for ROM reads and RAM reads across read/write boundaries
-        row.q_3 = 1;
+        row.q_3 = fe_constant<FF, 1>;
         break;
     }
     case MEMORY_SELECTORS::RAM_TIMESTAMP_CHECK: {
         // For two adjacent RAM entries that share the same index, validate the timestamp value is monotonically
         // increasing
-        row.q_1 = 1;
-        row.q_4 = 1;
+        row.q_1 = fe_constant<FF, 1>;
+        row.q_4 = fe_constant<FF, 1>;
         break;
     }
     case MEMORY_SELECTORS::ROM_READ: {
         // Memory read gate for reading memory cells. Also used for the _initialization_ of ROM memory cells.
         // Validates record witness computation (r = read_write_flag + index * \eta + timestamp * \eta^2 + value *
         // \eta^3)
-        row.q_1 = 1;
-        row.q_m = 1; // validate record witness is correctly computed
+        row.q_1 = fe_constant<FF, 1>;
+        row.q_m = fe_constant<FF, 1>; // validate record witness is correctly computed
         // read/write flag stored in q_c
         break;
     }
@@ -1083,8 +1087,8 @@ typename UltraCircuitBuilder_<ExecutionTrace>::GateRowT UltraCircuitBuilder_<Exe
         // Memory read gate for reading memory cells.
         // Validates record witness computation (r = read_write_flag + index * \eta + timestamp * \eta^2 + value *
         // \eta^3)
-        row.q_1 = 1;
-        row.q_m = 1; // validate record witness is correctly computed
+        row.q_1 = fe_constant<FF, 1>;
+        row.q_m = fe_constant<FF, 1>; // validate record witness is correctly computed
         // read/write flag stored in q_c
         break;
     }
@@ -1092,9 +1096,9 @@ typename UltraCircuitBuilder_<ExecutionTrace>::GateRowT UltraCircuitBuilder_<Exe
         // Memory read gate for writing memory cells.
         // Validates record witness computation (r = read_write_flag + index * \eta + timestamp * \eta^2 + value *
         // \eta^3)
-        row.q_1 = 1;
-        row.q_m = 1; // validate record witness is correctly computed
-        row.q_c = 1; // read/write flag stored in q_c
+        row.q_1 = fe_constant<FF, 1>;
+        row.q_m = fe_constant<FF, 1>; // validate record witness is correctly computed
+        row.q_c = fe_constant<FF, 1>; // read/write flag stored in q_c
         break;
     }
     case MEMORY_SELECTORS::ROM_LOGUP_TABLE: {
@@ -1102,7 +1106,7 @@ typename UltraCircuitBuilder_<ExecutionTrace>::GateRowT UltraCircuitBuilder_<Exe
         // (index, value, multiplicity, inverse) and contributes -m_i * inv to the LogUp sum.
         // Pattern: q_2 = 1 alone (combined with q_1 = 0) uniquely identifies this gate within
         // the q_memory-gated context (ROM_CONSISTENCY_CHECK shares q_2 but also sets q_1).
-        row.q_2 = 1;
+        row.q_2 = fe_constant<FF, 1>;
         break;
     }
     case MEMORY_SELECTORS::ROM_LOGUP_READ: {
@@ -1110,7 +1114,7 @@ typename UltraCircuitBuilder_<ExecutionTrace>::GateRowT UltraCircuitBuilder_<Exe
         // (index, value, +1, inverse) and contributes +inv to the LogUp sum.
         // Pattern: q_4 = 1 alone (combined with q_1 = 0) uniquely identifies this gate within
         // the q_memory-gated context (RAM_TIMESTAMP_CHECK shares q_4 but also sets q_1).
-        row.q_4 = 1;
+        row.q_4 = fe_constant<FF, 1>;
         break;
     }
     default: {
@@ -1149,31 +1153,31 @@ typename UltraCircuitBuilder_<ExecutionTrace>::GateRowT UltraCircuitBuilder_<Exe
     requires(ExecutionTrace::has_gate_kind(GateKind::Nnf))
 {
     GateRowT row{};
-    row.gate_value = type == NNF_SELECTORS::NNF_NONE ? 0 : 1;
+    row.gate_value = type == NNF_SELECTORS::NNF_NONE ? fe_constant<FF, 0> : fe_constant<FF, 1>;
     switch (type) {
     case NNF_SELECTORS::LIMB_ACCUMULATE_1: {
-        row.q_3 = 1;
-        row.q_4 = 1;
+        row.q_3 = fe_constant<FF, 1>;
+        row.q_4 = fe_constant<FF, 1>;
         break;
     }
     case NNF_SELECTORS::LIMB_ACCUMULATE_2: {
-        row.q_3 = 1;
-        row.q_m = 1;
+        row.q_3 = fe_constant<FF, 1>;
+        row.q_m = fe_constant<FF, 1>;
         break;
     }
     case NNF_SELECTORS::NON_NATIVE_FIELD_1: {
-        row.q_2 = 1;
-        row.q_3 = 1;
+        row.q_2 = fe_constant<FF, 1>;
+        row.q_3 = fe_constant<FF, 1>;
         break;
     }
     case NNF_SELECTORS::NON_NATIVE_FIELD_2: {
-        row.q_2 = 1;
-        row.q_4 = 1;
+        row.q_2 = fe_constant<FF, 1>;
+        row.q_4 = fe_constant<FF, 1>;
         break;
     }
     case NNF_SELECTORS::NON_NATIVE_FIELD_3: {
-        row.q_2 = 1;
-        row.q_m = 1;
+        row.q_2 = fe_constant<FF, 1>;
+        row.q_m = fe_constant<FF, 1>;
         break;
     }
     default: {
@@ -1334,6 +1338,8 @@ std::array<uint32_t, 2> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
     constexpr FF LIMB_SHIFT = uint256_t(1) << DEFAULT_NON_NATIVE_FIELD_LIMB_BITS;
     constexpr FF LIMB_RSHIFT = FF(1) / FF(uint256_t(1) << DEFAULT_NON_NATIVE_FIELD_LIMB_BITS);
     constexpr FF LIMB_RSHIFT_2 = FF(1) / FF(uint256_t(1) << (2 * DEFAULT_NON_NATIVE_FIELD_LIMB_BITS));
+    constexpr FF MINUS_LIMB_SHIFT = -LIMB_SHIFT;
+    constexpr FF MINUS_LIMB_SHIFT_SQR = -LIMB_SHIFT.sqr();
 
     // lo_0 = (a0·b0 - r0) + (a1·b0 + a0·b1)·2^L
     FF lo_0 = (a0 * b0 - r0) + (a1 * b0 + a0 * b1) * LIMB_SHIFT;
@@ -1367,9 +1373,9 @@ std::array<uint32_t, 2> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
                           lo_1_idx,
                           input.neg_modulus[0] + input.neg_modulus[1] * LIMB_SHIFT,
                           input.neg_modulus[0] * LIMB_SHIFT,
-                          -LIMB_SHIFT,
-                          -LIMB_SHIFT.sqr(),
-                          0 },
+                          MINUS_LIMB_SHIFT,
+                          MINUS_LIMB_SHIFT_SQR,
+                          fe_constant<FF, 0> },
                         /*include_next_gate_w_4*/ true);
     // Gate 2: unconstrained gate to provide lo_0 via w_4_shift for gate 1
     create_unconstrained_gate(blocks.arithmetic, this->zero_idx(), this->zero_idx(), this->zero_idx(), lo_0_idx);
@@ -1456,9 +1462,9 @@ std::array<uint32_t, 2> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
             hi_1_idx,
             -input.neg_modulus[1] * LIMB_SHIFT - input.neg_modulus[0],
             -input.neg_modulus[0] * LIMB_SHIFT,
-            -1,
-            -1,
-            0,
+            fe_constant<FF, -1>,
+            fe_constant<FF, -1>,
+            fe_constant<FF, 0>,
         },
         /*include_next_gate_w_4*/ true);
 
@@ -1472,11 +1478,11 @@ std::array<uint32_t, 2> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         input.q[0],
         input.q[1],
         hi_2_idx,
-        -1,
+        fe_constant<FF, -1>,
         input.neg_modulus[3] * LIMB_RSHIFT + input.neg_modulus[2] * LIMB_RSHIFT_2,
         input.neg_modulus[2] * LIMB_RSHIFT + input.neg_modulus[1] * LIMB_RSHIFT_2,
         LIMB_RSHIFT_2,
-        0,
+        fe_constant<FF, 0>,
     });
 
     return std::array<uint32_t, 2>{ lo_1_idx, hi_3_idx };
@@ -1660,7 +1666,7 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
     // When q_arith == 3, w_4_shift is scaled by 2 (see ArithmeticRelation for details). Therefore, for consistency we
     // also scale each linear term by this factor of 2 so that the constraint is effectively:
     //      (q_l * w_1) + (q_r * w_2) + (q_o * w_3) + (q_4 * w_4) + q_c + w_4_shift = 0
-    const FF linear_term_scale_factor = 2;
+    constexpr FF linear_term_scale_factor = fe_constant<FF, 2>;
     {
         auto& block_for_row = block;
         GateRowT row{};
@@ -1669,7 +1675,7 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         row.q_c = -addconst0 * linear_term_scale_factor;
         row.q_2 = -x_mulconst0 * linear_term_scale_factor;
         row.q_3 = -y_mulconst0 * linear_term_scale_factor;
-        row.gate_value = 3;
+        row.gate_value = fe_constant<FF, 3>;
         block_for_row.template append_gate<GateKind::Arith>(row);
     }
 
@@ -1680,7 +1686,7 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         row.q_c = -addconst1;
         row.q_2 = -x_mulconst1;
         row.q_3 = -y_mulconst1;
-        row.gate_value = 2;
+        row.gate_value = fe_constant<FF, 2>;
         block_for_row.template append_gate<GateKind::Arith>(row);
     }
 
@@ -1691,8 +1697,8 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         row.q_c = -addconst2;
         row.q_1 = -x_mulconst2;
         row.q_2 = -y_mulconst2;
-        row.q_3 = 1;
-        row.gate_value = 1;
+        row.q_3 = fe_constant<FF, 1>;
+        row.gate_value = fe_constant<FF, 1>;
         block_for_row.template append_gate<GateKind::Arith>(row);
     }
 
@@ -1703,8 +1709,8 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         row.q_c = -addconst3;
         row.q_1 = -x_mulconst3;
         row.q_2 = -y_mulconst3;
-        row.q_3 = 1;
-        row.gate_value = 1;
+        row.q_3 = fe_constant<FF, 1>;
+        row.gate_value = fe_constant<FF, 1>;
         block_for_row.template append_gate<GateKind::Arith>(row);
     }
 
@@ -1794,7 +1800,7 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
     // When q_arith == 3, w_4_shift is scaled by 2 (see ArithmeticRelation for details). Therefore, for consistency we
     // also scale each linear term by this factor of 2 so that the constraint is effectively:
     //      (q_l * w_1) + (q_r * w_2) + (q_o * w_3) + (q_4 * w_4) + q_c + w_4_shift = 0
-    const FF linear_term_scale_factor = 2;
+    constexpr FF linear_term_scale_factor = fe_constant<FF, 2>;
     {
         auto& block_for_row = block;
         GateRowT row{};
@@ -1803,7 +1809,7 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         row.q_c = -addconst0 * linear_term_scale_factor;
         row.q_2 = -x_mulconst0 * linear_term_scale_factor;
         row.q_3 = y_mulconst0 * linear_term_scale_factor;
-        row.gate_value = 3;
+        row.gate_value = fe_constant<FF, 3>;
         block_for_row.template append_gate<GateKind::Arith>(row);
     }
 
@@ -1814,7 +1820,7 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         row.q_c = -addconst1;
         row.q_2 = -x_mulconst1;
         row.q_3 = y_mulconst1;
-        row.gate_value = 2;
+        row.gate_value = fe_constant<FF, 2>;
         block_for_row.template append_gate<GateKind::Arith>(row);
     }
 
@@ -1825,8 +1831,8 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         row.q_c = -addconst2;
         row.q_1 = -x_mulconst2;
         row.q_2 = y_mulconst2;
-        row.q_3 = 1;
-        row.gate_value = 1;
+        row.q_3 = fe_constant<FF, 1>;
+        row.gate_value = fe_constant<FF, 1>;
         block_for_row.template append_gate<GateKind::Arith>(row);
     }
 
@@ -1837,8 +1843,8 @@ std::array<uint32_t, 5> UltraCircuitBuilder_<ExecutionTrace>::evaluate_non_nativ
         row.q_c = -addconst3;
         row.q_1 = -x_mulconst3;
         row.q_2 = y_mulconst3;
-        row.q_3 = 1;
-        row.gate_value = 1;
+        row.q_3 = fe_constant<FF, 1>;
+        row.gate_value = fe_constant<FF, 1>;
         block_for_row.template append_gate<GateKind::Arith>(row);
     }
 
@@ -1991,13 +1997,12 @@ void UltraCircuitBuilder_<FF>::create_poseidon2_external_gate(const poseidon2_ex
 {
     if constexpr (requires { this->blocks.poseidon2_external; }) {
         auto& block = this->blocks.poseidon2_external;
-        block.template append_gate<GateKind::Poseidon2Ext>(
-            { .wires = { in.a, in.b, in.c, in.d },
-              .q_1 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][0],
-              .q_2 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][1],
-              .q_3 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][2],
-              .q_4 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][3],
-              .gate_value = 1 });
+        block.template append_gate<GateKind::Poseidon2Ext>({ .wires = { in.a, in.b, in.c, in.d },
+                            .q_1 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][0],
+                            .q_2 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][1],
+                            .q_3 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][2],
+                            .q_4 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][3],
+                            .gate_value = fe_constant<FF, 1> });
         this->increment_num_gates();
     } else {
         throw_or_abort("create_poseidon2_external_gate base is Ultra-only (Mega overrides into its poseidon2 block)");
@@ -2018,7 +2023,7 @@ void UltraCircuitBuilder_<FF>::create_poseidon2_internal_gate(const poseidon2_in
             GateRowT row{};
             row.wires = { in.a, in.b, in.c, in.d };
             row.q_1 = crypto::Poseidon2Bn254ScalarFieldParams::round_constants[in.round_idx][0];
-            row.gate_value = 1;
+            row.gate_value = fe_constant<FF, 1>;
             block_for_row.template append_gate<GateKind::Poseidon2Int>(row);
         }
         this->increment_num_gates();
