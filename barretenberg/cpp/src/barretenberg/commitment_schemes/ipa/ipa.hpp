@@ -19,6 +19,8 @@
 #include "barretenberg/stdlib/honk_verifier/ipa_accumulator.hpp"
 #include "barretenberg/stdlib/primitives/circuit_builders/circuit_builders_fwd.hpp"
 #include "barretenberg/transcript/transcript.hpp"
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <numeric>
 #include <string>
@@ -1205,9 +1207,24 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
     static std::pair<Polynomial<bb::fq>, bb::fq> sample_random_opening(numeric::RNG* engine = nullptr)
         requires Curve::is_stdlib_type
     {
+        if (engine == nullptr) {
+            engine = &numeric::get_randomness();
+        }
+        // Each coefficient is bb::fq::random_element(engine): the engine is read serially, in the same order (lo then
+        // hi per coefficient), and only the conversion of the drawn words into field elements runs in parallel.
+        constexpr bb::fq pow_2_256 = bb::fq(uint256_t(1) << 128).sqr();
+        constexpr size_t block_size = std::min<size_t>(poly_length, size_t{ 1 } << 12);
         Polynomial<bb::fq> poly(poly_length);
-        for (size_t i = 0; i < poly_length; i++) {
-            poly.at(i) = bb::fq::random_element(engine);
+        std::vector<std::array<uint256_t, 2>> draws(block_size);
+        for (size_t start = 0; start < poly_length; start += block_size) {
+            for (auto& [lo, hi] : draws) {
+                lo = engine->get_random_uint256();
+                hi = engine->get_random_uint256();
+            }
+            parallel_for_heuristic(
+                block_size,
+                [&](size_t k) { poly.at(start + k) = bb::fq(draws[k][0]) + (pow_2_256 * bb::fq(draws[k][1])); },
+                thread_heuristics::FF_MULTIPLICATION_COST * 4);
         }
         const bb::fq x = bb::fq::random_element(engine);
         return { std::move(poly), x };
