@@ -9,6 +9,7 @@
 #include "barretenberg/common/serialize.hpp"
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/numeric/bitop/get_msb.hpp"
+#include "barretenberg/polynomials/backing_memory.hpp"
 #include "barretenberg/vm2/common/constants.hpp"
 #include "barretenberg/vm2/constraining/avm_fixed_vk.hpp"
 #include "barretenberg/vm2/constraining/check_circuit.hpp"
@@ -21,6 +22,8 @@ namespace bb::avm2 {
 
 AvmProvingHelper::Proof AvmProvingHelper::prove(tracegen::TraceContainer&& trace)
 {
+    // Declared first so that it ends after every polynomial below is destroyed.
+    PolynomialMemoryRelease release_polynomials_on_return;
     auto polynomials = AVM_TRACK_TIME_V("proving/prove:compute_polynomials", constraining::compute_polynomials(trace));
     auto proving_key =
         AVM_TRACK_TIME_V("proving/prove:proving_key", constraining::proving_key_from_polynomials(polynomials));
@@ -32,6 +35,8 @@ AvmProvingHelper::Proof AvmProvingHelper::prove(tracegen::TraceContainer&& trace
 
     auto proof = AVM_TRACK_TIME_V("proving/construct_proof", prover.construct_proof());
 
+    // The proof holds no polynomial memory: blocks freed from here on, as this function returns, are released together.
+    release_polynomials_on_return.activate();
     return proof;
 }
 

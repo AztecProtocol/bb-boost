@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <memory>
+#include <vector>
 #if !defined(__wasm__) && !defined(_WIN32)
 #include <sys/mman.h>
 #endif
@@ -28,6 +29,44 @@ extern std::atomic<size_t> current_storage_usage;
 
 // Parse storage size string (e.g., "500m", "2g", "1024k")
 size_t parse_size_string(const std::string& size_str);
+
+namespace bb {
+/**
+ * @brief Releases the memory of polynomials freed together from several threads at once.
+ *
+ * @details A block freed into the allocator's arenas stays resident, and the kernel later frees its pages one at a
+ * time on a single thread, when an arena is trimmed or when the process exits; a block the allocator mapped on its own
+ * is unmapped page by page on the thread that frees it. After activate(), every polynomial backing block whose last
+ * owner is dropped on this thread is collected instead of freed. When the scope ends, if the collected blocks hold at
+ * least 32 MiB, the whole pages inside them are handed back with madvise(MADV_DONTNEED) from up to 16 parallel_for
+ * tasks, and then the blocks are freed as before. Only blocks that are already being freed are touched. The scope must
+ * end on the thread that activated it. Builds without threads or exceptions (WASM) free at once, as before.
+ */
+class PolynomialMemoryRelease {
+  public:
+    PolynomialMemoryRelease() = default;
+    PolynomialMemoryRelease(const PolynomialMemoryRelease&) = delete;
+    PolynomialMemoryRelease& operator=(const PolynomialMemoryRelease&) = delete;
+    PolynomialMemoryRelease(PolynomialMemoryRelease&&) = delete;
+    PolynomialMemoryRelease& operator=(PolynomialMemoryRelease&&) = delete;
+    ~PolynomialMemoryRelease();
+
+    void activate();
+
+    // Takes the block if a scope is active on this thread; otherwise the caller frees it.
+    static bool defer_free(void* ptr, size_t bytes, void (*free_block)(void*)) noexcept;
+
+  private:
+    struct Block {
+        void* ptr;
+        size_t bytes;
+        void (*free_block)(void*);
+    };
+    std::vector<Block> blocks_;
+    PolynomialMemoryRelease* previous_ = nullptr;
+    bool active_ = false;
+};
+} // namespace bb
 
 template <typename Fr> struct BackingMemory {
     // Common raw data pointer used by all storage types
@@ -118,7 +157,11 @@ template <typename Fr> struct BackingMemory {
             return;
         }
         Fr* ptr = new Fr[size];
-        memory.aligned_memory = std::shared_ptr<Fr[]>(ptr, [](Fr* p) { delete[] p; });
+        memory.aligned_memory = std::shared_ptr<Fr[]>(ptr, [bytes = size * sizeof(Fr)](Fr* p) {
+            if (!bb::PolynomialMemoryRelease::defer_free(p, bytes, [](void* q) { delete[] static_cast<Fr*>(q); })) {
+                delete[] p;
+            }
+        });
         memory.raw_data = ptr;
     }
 
