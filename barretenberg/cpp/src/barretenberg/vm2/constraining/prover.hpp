@@ -5,6 +5,8 @@
 // =====================
 #pragma once
 
+#include <future>
+
 #include "barretenberg/relations/relation_parameters.hpp"
 #include "barretenberg/sumcheck/sumcheck_output.hpp"
 #include "barretenberg/transcript/transcript.hpp"
@@ -58,6 +60,10 @@ class AvmProver {
     SumcheckOutput<Flavor> sumcheck_output;
 
     PCSCommitmentKey commitment_key;
+
+  private:
+    // The first challenge's hash input up to the wire commitments, absorbed while the commitments are computed.
+    std::future<ChallengeHashPrefix> first_challenge_prefix;
 };
 
 } // namespace bb::avm2

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <future>
 
 #include "barretenberg/commitment_schemes/claim.hpp"
 #include "barretenberg/commitment_schemes/commitment_key.hpp"
@@ -42,6 +43,13 @@ static_assert(CAN_CACHE_VIRTUAL_ZERO_TERMS<
 #endif
 struct CustomOrAggregateInverseRelation {};
 static_assert(!CAN_CACHE_VIRTUAL_ZERO_TERMS<CustomOrAggregateInverseRelation>);
+
+#ifdef NO_MULTITHREADING
+constexpr auto PREFIX_LAUNCH_POLICY = std::launch::deferred;
+#else
+// Runs deferred, at get(), if the thread cannot be created.
+constexpr auto PREFIX_LAUNCH_POLICY = std::launch::async | std::launch::deferred;
+#endif
 } // namespace
 using FF = Flavor::FF;
 
@@ -107,6 +115,17 @@ void AvmProver::execute_public_inputs_round()
                                            j < public_input_col_size ? public_input_col.at(j) : FF(0));
         }
     }
+
+    // The next challenge hashes what the transcript holds now and then every wire commitment, so the length of its
+    // input is known here and most of the input too: absorb that part while the wire commitments are computed.
+    const size_t num_wire_fields =
+        prover_polynomials.get_wires().size() * Transcript::Codec::template calc_num_fields<Flavor::Commitment>();
+    first_challenge_prefix =
+        std::async(bb::get_num_cpus() > 1 ? PREFIX_LAUNCH_POLICY : std::launch::deferred,
+                   [prefix = transcript->next_challenge_input_so_far(), num_wire_fields]() mutable {
+                       const size_t input_length = prefix.size() + num_wire_fields;
+                       return ChallengeHashPrefix(std::move(prefix), input_length);
+                   });
 }
 /**
  * @brief Compute commitments to all of the witness wires (apart from the logderivative inverse wires)
@@ -128,6 +147,9 @@ void AvmProver::execute_log_derivative_inverse_round()
 {
     BB_BENCH_NAME("AvmProver::execute_log_derivative_inverse_round");
 
+    if (first_challenge_prefix.valid()) {
+        transcript->set_next_challenge_prefix(first_challenge_prefix.get());
+    }
     auto [beta, gamma] = transcript->template get_challenges<FF>(std::array<std::string, 2>{ "beta", "gamma" });
     relation_parameters.beta = beta;
     relation_parameters.gamma = gamma;
