@@ -25,12 +25,69 @@
 #include <cstddef>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace bb {
 template <size_t log_poly_length = CONST_ECCVM_LOG_N> struct IpaOpeningProofTask;
+
+namespace detail {
+// batch_two_round_fold's scratch is proportional to its number of output points, so the SRS fold is cut into blocks.
+inline constexpr size_t SRS_FOLD_BLOCK = 2048;
+
+/**
+ * @brief Folds an SRS two IPA rounds at once, in place: for q = G.size() / 4 and every i < q,
+ * G[i] ← u1·u2·G[i] + u1·G[i+q] + u2·G[i+2q] + G[i+3q].
+ * @details Calls `Curve::Element::batch_two_round_fold` on at most `block` output points at a time, so the fold's
+ * scratch memory is proportional to `block` rather than to q. Each output point depends only on its four inputs and
+ * the challenges, so the result is that of a single call on the whole span. Entries [q, 4q) are left unchanged.
+ * @param G 4q affine points, none at infinity; q need not be a power of two.
+ * @param u1 First-round challenge, below 2^127.
+ * @param u2 Second-round challenge, below 2^127.
+ * @param block Maximum number of output points per fold call; must be positive.
+ */
+template <typename Curve>
+void two_round_fold_srs(std::span<typename Curve::AffineElement> G,
+                        const typename Curve::ScalarField& u1,
+                        const typename Curve::ScalarField& u2,
+                        size_t block = SRS_FOLD_BLOCK)
+{
+    using Commitment = typename Curve::AffineElement;
+    using GroupElement = typename Curve::Element;
+    BB_ASSERT_EQ(G.size() % 4, 0U, "the two-round SRS fold needs four equal quarters");
+    BB_ASSERT_GT(block, 0U, "the SRS fold block must hold at least one output point");
+    const size_t quarter = G.size() / 4;
+
+    if (quarter <= block) {
+        auto G_folded =
+            GroupElement::batch_two_round_fold(std::span<const Commitment>{ G.data(), 4 * quarter }, u1, u2);
+        parallel_for_heuristic(
+            quarter, [&](size_t idx) { G[idx] = G_folded[idx]; }, thread_heuristics::FF_COPY_COST * 2);
+        return;
+    }
+
+    std::vector<Commitment> block_inputs(4 * block);
+    for (size_t start = 0; start < quarter; start += block) {
+        const size_t len = std::min(block, quarter - start);
+        parallel_for_heuristic(
+            len,
+            [&](size_t idx) {
+                for (size_t k = 0; k < 4; ++k) {
+                    block_inputs[(k * len) + idx] = G[(k * quarter) + start + idx];
+                }
+            },
+            thread_heuristics::FF_COPY_COST * 8);
+        auto G_folded =
+            GroupElement::batch_two_round_fold(std::span<const Commitment>{ block_inputs.data(), 4 * len }, u1, u2);
+        // Writing G[start, start + len) in place is safe: later blocks read only G[s, s + len') for s ≥ start + len
+        // and entries of the quarters [q, 4q), which are never written.
+        parallel_for_heuristic(
+            len, [&](size_t idx) { G[start + idx] = G_folded[idx]; }, thread_heuristics::FF_COPY_COST * 2);
+    }
+}
+} // namespace detail
 
 /**
 * @brief IPA (inner product argument) commitment scheme class.
@@ -374,10 +431,7 @@ template <typename Curve_, size_t log_poly_length = CONST_ECCVM_LOG_N> class IPA
             // Step 6.e, fused: G_vec_new[i] = u1·u2·G[i] + u1·G[i+q] + u2·G[i+2q] + G[i+3q].
             // Round challenges are 127-bit limbs (transcript split_challenge); batch_two_round_fold
             // BB_ASSERTs that precondition.
-            auto G_folded = GroupElement::batch_two_round_fold(
-                std::span<const Commitment>{ G_vec_local.data(), 4 * quarter }, u1, u2);
-            parallel_for_heuristic(
-                quarter, [&](size_t idx) { G_vec_local[idx] = G_folded[idx]; }, thread_heuristics::FF_COPY_COST * 2);
+            detail::two_round_fold_srs<Curve>(std::span<Commitment>{ G_vec_local.data(), 4 * quarter }, u1, u2);
 
             round_size = quarter;
             round_idx += 2;
