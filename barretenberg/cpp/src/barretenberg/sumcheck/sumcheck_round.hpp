@@ -21,8 +21,10 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <memory>
 #include <optional>
 #include <variant>
+#include <vector>
 
 namespace bb {
 
@@ -650,14 +652,12 @@ template <typename Flavor> class SumcheckProverRound {
         const size_t num_slots = chunks.num_slots();
         const auto element_parameters = relation_parameters.template convert_to<Element>();
 
-        std::vector<AccumulatorsFor<Element>> slot_wide_accumulators(num_slots);
-        std::vector<SumcheckTupleOfTuplesOfUnivariates> slot_results(num_slots);
-
-        parallel_for(num_slots, [&](size_t slot_id) {
+        // Accumulates the chunks a slot pops into `wide_accumulator` (full groups) and `result` (leftover pairs), then
+        // folds the former into the latter.
+        auto accumulate_slot = [&](AccumulatorsFor<Element>& wide_accumulator,
+                                   SumcheckTupleOfTuplesOfUnivariates& result) {
             auto edges = make_extended_edges<Element>(polynomials);
             auto tail_edges = make_extended_edges(polynomials);
-            auto& wide_accumulator = slot_wide_accumulators[slot_id];
-            auto& result = slot_results[slot_id];
             while (auto chunk = chunks.pop()) {
                 // Both passes call the same `accumulate_edge`, differing only in the element folded in: the
                 // full-group pass a wide `Element` batch (`edges`) into `wide_accumulator`, the leftover pass
@@ -686,11 +686,53 @@ template <typename Flavor> class SumcheckProverRound {
                     });
             }
             reduce_accumulator<Element>(result, wide_accumulator);
-        });
+        };
 
-        for (auto& result : slot_results) {
-            Utils::add_nested_tuples(univariate_accumulators, result);
+        if constexpr (LARGE_ACCUMULATORS) {
+            // Each slot allocates and value-initializes its own accumulators on its own thread, instead of the calling
+            // thread building all of them (about 40 MB per round for AVM at 64 slots).
+            std::vector<std::unique_ptr<SumcheckTupleOfTuplesOfUnivariates>> slot_results(num_slots);
+            parallel_for(num_slots, [&](size_t slot_id) {
+                const auto wide_accumulator = std::make_unique<AccumulatorsFor<Element>>();
+                slot_results[slot_id] = std::make_unique<SumcheckTupleOfTuplesOfUnivariates>();
+                accumulate_slot(*wide_accumulator, *slot_results[slot_id]);
+            });
+            add_slot_results(slot_results);
+        } else {
+            std::vector<AccumulatorsFor<Element>> slot_wide_accumulators(num_slots);
+            std::vector<SumcheckTupleOfTuplesOfUnivariates> slot_results(num_slots);
+            parallel_for(num_slots, [&](size_t slot_id) {
+                accumulate_slot(slot_wide_accumulators[slot_id], slot_results[slot_id]);
+            });
+            for (auto& result : slot_results) {
+                Utils::add_nested_tuples(univariate_accumulators, result);
+            }
         }
+    }
+
+    // Accumulator tuples this large make building and summing the per-slot copies on the calling thread a serial cost
+    // per round (AVM: ~10k coefficients, 304 KiB, one copy per thread). Smaller flavors keep the plain serial form.
+    static constexpr bool LARGE_ACCUMULATORS = sizeof(SumcheckTupleOfTuplesOfUnivariates) >= (size_t{ 1 } << 16);
+
+    // Adds the slot results into `univariate_accumulators` slot by slot. With several slots the work is split by
+    // relation, and each relation still adds the slots in slot order, so every coefficient goes through the same
+    // additions in the same order as in the serial loop: the same field elements, raw limbs included.
+    void add_slot_results(const std::vector<std::unique_ptr<SumcheckTupleOfTuplesOfUnivariates>>& slot_results)
+    {
+        if (slot_results.size() == 1) {
+            Utils::add_nested_tuples(univariate_accumulators, *slot_results.front());
+            return;
+        }
+        parallel_for(NUM_RELATIONS, [&](size_t relation) {
+            constexpr_for<0, NUM_RELATIONS, 1>([&]<size_t relation_idx>() {
+                if (relation_idx == relation) {
+                    for (const auto& slot_result : slot_results) {
+                        Utils::add_tuples(std::get<relation_idx>(univariate_accumulators),
+                                          std::get<relation_idx>(*slot_result));
+                    }
+                }
+            });
+        });
     }
 
     // True when the flavor exposes a static row-skip manifest: a contiguous prefix [head, active_prefix_end) holding
