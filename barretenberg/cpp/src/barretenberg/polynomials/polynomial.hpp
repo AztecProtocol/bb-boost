@@ -284,6 +284,20 @@ template <typename Fr> class Polynomial {
     Polynomial share() const;
 
     /**
+     * @brief Before the listed polynomials are destroyed together, release the pages of the memory that only they hold,
+     * with one team of threads (see BackingMemory::release_pages_of_sole_owned). Their contents are lost.
+     */
+    template <size_t N>
+    static void release_pages_before_destruction(const std::array<const Polynomial*, N>& polys) noexcept
+    {
+        std::array<const BackingMemory<Fr>*, N> handles{};
+        for (size_t i = 0; i < N; ++i) {
+            handles[i] = &polys[i]->coefficients_.backing_memory_;
+        }
+        BackingMemory<Fr>::release_pages_of_sole_owned(handles);
+    }
+
+    /**
      * @brief Check whether or not a polynomial is identically zero
      *
      */

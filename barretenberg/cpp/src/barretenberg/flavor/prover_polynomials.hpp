@@ -8,6 +8,9 @@
 #include "barretenberg/common/zip_view.hpp"
 #include "barretenberg/polynomials/polynomial.hpp"
 
+#include <array>
+#include <span>
+
 namespace bb {
 
 /**
@@ -30,7 +33,7 @@ class ProverPolynomialsBase : public AllEntitiesBase {
     ProverPolynomialsBase(const ProverPolynomialsBase& o) = delete;
     ProverPolynomialsBase(ProverPolynomialsBase&& o) noexcept = default;
     ProverPolynomialsBase& operator=(ProverPolynomialsBase&& o) noexcept = default;
-    ~ProverPolynomialsBase() = default;
+    ~ProverPolynomialsBase() { release_pages_of(static_cast<const ProverPolynomialsBase&>(*this).get_all()); }
     [[nodiscard]] size_t get_polynomial_size() const { return this->q_c().virtual_size(); }
     [[nodiscard]] AllValuesType get_row(size_t row_idx) const
     {
@@ -79,6 +82,19 @@ class ProverPolynomialsBase : public AllEntitiesBase {
         for (auto& polynomial : this->get_all()) {
             polynomial.increase_virtual_size(size_in);
         }
+    }
+
+  private:
+    // The shifted polynomials share memory with their unshifted ones; both die here, so such a block still counts as
+    // held only by this object.
+    template <size_t N> static void release_pages_of(std::span<const Polynomial, N> all) noexcept
+    {
+        static_assert(N != std::dynamic_extent);
+        std::array<const Polynomial*, N> polys{};
+        for (size_t i = 0; i < N; ++i) {
+            polys[i] = &all[i];
+        }
+        Polynomial::release_pages_before_destruction(polys);
     }
 };
 
