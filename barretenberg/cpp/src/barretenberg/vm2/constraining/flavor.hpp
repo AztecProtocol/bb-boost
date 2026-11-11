@@ -86,6 +86,10 @@ class AvmFlavor {
 
     static constexpr size_t NUM_SUBRELATIONS = compute_number_of_subrelations<Relations>();
 
+    // Hundreds of relations make the per-round batching a serial cost that does not shrink with the trace, so AVM
+    // opts into parallel relation batching (see ParallelizesRelationBatching).
+    static constexpr bool PARALLELIZE_RELATION_BATCHING = true;
+
     static constexpr size_t MAX_PARTIAL_RELATION_LENGTH = compute_max_partial_relation_length<Relations>();
 
     static_assert(MAX_PARTIAL_RELATION_LENGTH < 8, "MAX_PARTIAL_RELATION_LENGTH must be less than 8");
