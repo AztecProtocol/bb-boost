@@ -1,6 +1,7 @@
 #include "barretenberg/vm2/tracegen/lib/interaction_builder.hpp"
 
 #include <algorithm>
+#include <iterator>
 
 #include "barretenberg/vm2/common/set.hpp"
 
@@ -27,6 +28,23 @@ void order_jobs_by_destination_columns(std::vector<std::unique_ptr<InteractionBu
     for (size_t i = 0; i < tagged.size(); ++i) {
         jobs[i] = std::move(tagged[i].second);
     }
+}
+
+void split_jobs(std::vector<std::unique_ptr<InteractionBuilderInterface>>& jobs, const TraceContainer& trace)
+{
+    std::vector<std::unique_ptr<InteractionBuilderInterface>> parts;
+    std::vector<std::unique_ptr<InteractionBuilderInterface>> whole;
+    whole.reserve(jobs.size());
+    for (auto& job : jobs) {
+        auto job_parts = job->split(trace);
+        if (job_parts.empty()) {
+            whole.push_back(std::move(job));
+        } else {
+            std::ranges::move(job_parts, std::back_inserter(parts));
+        }
+    }
+    std::ranges::move(whole, std::back_inserter(parts));
+    jobs = std::move(parts);
 }
 
 } // namespace bb::avm2::tracegen

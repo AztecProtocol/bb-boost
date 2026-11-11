@@ -48,6 +48,12 @@ class InteractionBuilderInterface {
     // Used to identify jobs that share the same destination columns and prevent them
     // from building the index at the same time.
     virtual size_t get_destination_columns_fingerprint() const { return 0; }
+    // Jobs that together write exactly what process() writes and may run concurrently with each other and with
+    // every other job; empty if this job runs whole. Called once the trace columns are filled.
+    virtual std::vector<std::unique_ptr<InteractionBuilderInterface>> split(const TraceContainer&) { return {}; }
+    // Raises a failure that process() recorded instead of throwing. Called on the calling thread once every job's
+    // process() has returned.
+    virtual void finish() {}
 };
 
 // A concatenate that works with movable objects.
@@ -66,5 +72,9 @@ template <typename T> std::vector<T> concatenate_jobs(std::vector<T>&& first, au
 // This ordering helps the SharedIndexCache by ensuring that when multiple jobs share
 // the same destination, only the first one builds the index while others wait.
 void order_jobs_by_destination_columns(std::vector<std::unique_ptr<InteractionBuilderInterface>>& jobs);
+
+// Replaces each job that splits by its parts, and runs the parts first: a job splits because it is too long to run
+// as one.
+void split_jobs(std::vector<std::unique_ptr<InteractionBuilderInterface>>& jobs, const TraceContainer& trace);
 
 } // namespace bb::avm2::tracegen

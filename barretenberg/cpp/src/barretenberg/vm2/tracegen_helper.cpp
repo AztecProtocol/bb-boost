@@ -465,9 +465,13 @@ void AvmTraceGenHelper::fill_trace_interactions(TraceContainer& trace)
         // Jobs with unique destination columns come first, then jobs that share destinations with earlier ones.
         AVM_TRACK_TIME("tracegen/order_jobs_by_destination_columns",
                        order_jobs_by_destination_columns(jobs_interactions));
+        split_jobs(jobs_interactions, trace);
 
         AVM_TRACK_TIME("tracegen/interactions",
                        parallel_for(jobs_interactions.size(), [&](size_t i) { jobs_interactions[i]->process(trace); }));
+        for (auto& job : jobs_interactions) {
+            job->finish();
+        }
     }
 }
 
