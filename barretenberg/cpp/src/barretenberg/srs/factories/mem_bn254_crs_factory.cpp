@@ -6,6 +6,7 @@
 #include "barretenberg/ecc/scalar_multiplication/scalar_multiplication.hpp"
 #include "bn254_crs_data.hpp"
 #include "crs_integrity.hpp"
+#include "get_bn254_crs.hpp"
 #include <atomic>
 
 namespace {
@@ -66,10 +67,8 @@ namespace bb::srs::factories {
 
 MemBn254CrsFactory::MemBn254CrsFactory(std::vector<g1::affine_element> points, g2::affine_element const& g2_point)
     : crs_([&points, &g2_point] {
-        // The vector stays the owner (aliasing constructor), so its points are not copied.
-        const auto owner = std::make_shared<std::vector<g1::affine_element>>(std::move(points));
-        return std::make_shared<MemBn254Crs>(
-            std::shared_ptr<g1::affine_element[]>(owner, owner->data()), owner->size(), g2_point);
+        const size_t num_points = points.size();
+        return std::make_shared<MemBn254Crs>(share_bn254_g1_points(std::move(points)), num_points, g2_point);
     }())
 {
     vinfo("Initialized ", curve::BN254::name, " CRS from memory with num points = ", crs_->get_monomial_size());

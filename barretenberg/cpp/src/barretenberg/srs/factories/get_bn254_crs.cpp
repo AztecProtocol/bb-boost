@@ -403,11 +403,22 @@ Bn254G1Points load_bn254_g1_points(const std::filesystem::path& path, size_t num
     }
 #endif
     // Decompression and download paths are rare (they populate the cache); reuse them as they are.
-    // The vector stays the owner (aliasing constructor), so its points are not copied.
-    auto points =
-        std::make_shared<std::vector<g1::affine_element>>(get_bn254_g1_data(path, num_points, allow_download));
-    const size_t size = points->size();
-    return { std::shared_ptr<g1::affine_element[]>(points, points->data()), size };
+    auto points = get_bn254_g1_data(path, num_points, allow_download);
+    const size_t size = points.size();
+    return { share_bn254_g1_points(std::move(points)), size };
+}
+
+std::shared_ptr<g1::affine_element[]> share_bn254_g1_points(std::vector<g1::affine_element>&& points)
+{
+    // The vector stays the owner of the points; the deleter owns the vector.
+    auto* owner = new std::vector<g1::affine_element>(std::move(points));
+    return std::shared_ptr<g1::affine_element[]>(owner->data(), [owner](g1::affine_element* /*unused*/) {
+        const PageBlock block{ owner->data(),
+                               owner->capacity() * sizeof(g1::affine_element),
+                               owner->size() * sizeof(g1::affine_element) };
+        static_cast<void>(release_pages_in_parallel(std::span<const PageBlock>(&block, 1)));
+        delete owner;
+    });
 }
 
 // Loads the canonical 128-byte serialization of [x]_2 from disk and verifies it against the pinned
