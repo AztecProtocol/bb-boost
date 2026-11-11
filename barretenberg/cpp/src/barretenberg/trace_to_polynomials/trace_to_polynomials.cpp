@@ -74,23 +74,39 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
     // selector, sourced from the unique block that owns the matching `GateKind`.
     {
         BB_BENCH_NAME("populate_selectors");
+        // One task per row chunk of a (block, selector) pair: the blocks differ greatly in size, and with one task
+        // per pair the few pairs of the largest blocks would run alone after every other task has finished.
+        constexpr uint32_t SELECTOR_ROWS_PER_TASK = 1 << 15;
         struct SelectorTask {
             Selector<FF>* source;
             size_t target_poly_idx;
             uint32_t trace_offset;
-            uint32_t block_size;
+            uint32_t row_begin;
+            uint32_t row_end;
         };
 
         const auto& polynomials_ref = polynomials;
         const size_t num_non_gate = polynomials_ref.get_non_gate_selectors().size();
 
         std::vector<SelectorTask> selector_tasks;
+        const auto add_selector_tasks = [&](Selector<FF>* source,
+                                            size_t target_poly_idx,
+                                            uint32_t trace_offset,
+                                            uint32_t block_size) {
+            for (uint32_t row_begin = 0; row_begin < block_size; row_begin += SELECTOR_ROWS_PER_TASK) {
+                selector_tasks.emplace_back(SelectorTask{ source,
+                                                          target_poly_idx,
+                                                          trace_offset,
+                                                          row_begin,
+                                                          std::min(row_begin + SELECTOR_ROWS_PER_TASK, block_size) });
+            }
+        };
         for (auto& block : blocks_array) {
             const uint32_t offset = block.trace_offset();
             const uint32_t block_size = static_cast<uint32_t>(block.size());
             auto non_gate = Flavor::Generated::get_block_non_gate_selectors(block);
             for (size_t i = 0; i < non_gate.size(); ++i) {
-                selector_tasks.emplace_back(SelectorTask{ &non_gate[i], i, offset, block_size });
+                add_selector_tasks(&non_gate[i], i, offset, block_size);
             }
         }
 
@@ -98,10 +114,10 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
         constexpr auto& gate_kinds = Flavor::Generated::GATE_KINDS;
         for (size_t i = 0; i < gate_kinds.size(); ++i) {
             auto& block = gate_blocks[i];
-            selector_tasks.emplace_back(SelectorTask{ &block.gate_selector_for(gate_kinds[i]),
-                                                      num_non_gate + i,
-                                                      block.trace_offset(),
-                                                      static_cast<uint32_t>(block.size()) });
+            add_selector_tasks(&block.gate_selector_for(gate_kinds[i]),
+                               num_non_gate + i,
+                               block.trace_offset(),
+                               static_cast<uint32_t>(block.size()));
         }
 
         parallel_for(selector_tasks.size(), [&](size_t task_idx) {
@@ -111,8 +127,8 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
             // Bulk-copy the range that lands inside the polynomial's backing store (tile-wise, no
             // per-element virtual call); rows clamped off by the store bounds would previously have
             // been dropped by set_if_valid_index and must be zero.
-            const size_t dst_begin = std::max<size_t>(task.trace_offset, poly.start_index());
-            const size_t dst_end = std::min<size_t>(task.trace_offset + task.block_size, poly.end_index());
+            const size_t dst_begin = std::max<size_t>(task.trace_offset + task.row_begin, poly.start_index());
+            const size_t dst_end = std::min<size_t>(task.trace_offset + task.row_end, poly.end_index());
             if (dst_begin < dst_end) {
                 source.copy_into(&poly.at(dst_begin), dst_begin - task.trace_offset, dst_end - dst_begin);
             }
