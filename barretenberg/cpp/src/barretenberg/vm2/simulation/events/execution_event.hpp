@@ -1,12 +1,14 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <vector>
 
 #include "barretenberg/vm2/common/memory_types.hpp"
 #include "barretenberg/vm2/common/opcodes.hpp"
 #include "barretenberg/vm2/simulation/events/addressing_event.hpp"
 #include "barretenberg/vm2/simulation/events/context_events.hpp"
+#include "barretenberg/vm2/simulation/events/event_emitter.hpp"
 #include "barretenberg/vm2/simulation/events/gas_event.hpp"
 #include "barretenberg/vm2/simulation/lib/serialization.hpp"
 
@@ -51,6 +53,11 @@ struct ExecutionEvent {
 
     // function to determine whether the event represents a context "exit"
     bool is_exit() const { return is_failure() || wire_instruction.get_exec_opcode() == ExecutionOpCode::RETURN; }
+};
+
+// One event per executed instruction, about 2 KB each: a deque grows without moving the events already emitted.
+template <> struct EventContainer<ExecutionEvent> {
+    using type = std::deque<ExecutionEvent>;
 };
 
 } // namespace bb::avm2::simulation

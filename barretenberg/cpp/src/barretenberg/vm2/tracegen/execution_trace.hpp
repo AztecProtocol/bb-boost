@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -20,6 +21,9 @@ class ExecutionTraceBuilder final {
   public:
     void process(const simulation::EventEmitterInterface<simulation::ExecutionEvent>::Container& ex_events,
                  TraceContainer& trace);
+    // The same for events held in a vector. A template, so that a braced list selects the overload above.
+    template <std::same_as<std::vector<simulation::ExecutionEvent>> Events>
+    void process(const Events& ex_events, TraceContainer& trace);
 
     // Public for testing.
     void process_instr_fetching(const simulation::Instruction& instruction, TraceContainer& trace, uint32_t row);
@@ -49,6 +53,9 @@ class ExecutionTraceBuilder final {
                                     uint32_t row);
 
     static const InteractionDefinition interactions;
+
+  private:
+    template <typename Events> void process_events(const Events& ex_events, TraceContainer& trace);
 };
 
 } // namespace bb::avm2::tracegen

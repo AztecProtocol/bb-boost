@@ -8,9 +8,14 @@
 
 namespace bb::avm2::simulation {
 
+// The container emitters collect `Event`s in. An event type may specialize it.
+template <typename Event> struct EventContainer {
+    using type = std::vector<Event>;
+};
+
 template <typename Event> class EventEmitterInterface {
   public:
-    using Container = std::vector<Event>;
+    using Container = typename EventContainer<Event>::type;
 
     virtual ~EventEmitterInterface() = default;
     // Pushes the event to the event container.
@@ -19,7 +24,7 @@ template <typename Event> class EventEmitterInterface {
 
 template <typename Event> class EventEmitter : public EventEmitterInterface<Event> {
   public:
-    using Container = std::vector<Event>;
+    using Container = typename EventEmitterInterface<Event>::Container;
 
     virtual ~EventEmitter() = default;
     void emit(Event&& event) override { events.push_back(std::move(event)); };
@@ -58,7 +63,7 @@ template <typename Event> class DeduplicatingEventEmitter : public EventEmitter<
 
 template <typename Event> class NoopEventEmitter : public EventEmitterInterface<Event> {
   public:
-    using Container = std::vector<Event>;
+    using Container = typename EventEmitterInterface<Event>::Container;
 
     virtual ~NoopEventEmitter() = default;
 

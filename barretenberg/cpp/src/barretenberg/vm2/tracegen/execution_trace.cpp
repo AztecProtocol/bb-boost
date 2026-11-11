@@ -213,8 +213,7 @@ struct FailingContexts {
  * @param ex_events The execution events.
  * @return The failing contexts.
  */
-FailingContexts preprocess_for_discard(
-    const simulation::EventEmitterInterface<simulation::ExecutionEvent>::Container& ex_events)
+template <typename Events> FailingContexts preprocess_for_discard(const Events& ex_events)
 {
     FailingContexts dying_info;
 
@@ -224,7 +223,7 @@ FailingContexts preprocess_for_discard(
     // would lead to the same results.
 
     // Preprocessing pass 1: find the events that exit the app logic and teardown phases
-    for (const auto& ex_event : ex_events) {
+    for (const simulation::ExecutionEvent& ex_event : ex_events) {
         bool is_exit = ex_event.is_exit();
         bool is_top_level = ex_event.after_context_event.parent_id == 0;
 
@@ -241,7 +240,7 @@ FailingContexts preprocess_for_discard(
     }
 
     // Preprocessing pass 2: find all contexts that fail and mark them
-    for (const auto& ex_event : ex_events) {
+    for (const simulation::ExecutionEvent& ex_event : ex_events) {
         if (ex_event.is_failure()) {
             dying_info.does_context_fail.insert(ex_event.after_context_event.id);
         }
@@ -325,6 +324,20 @@ uint32_t dying_context_for_phase(TransactionPhase phase, const FailingContexts& 
 void ExecutionTraceBuilder::process(
     const simulation::EventEmitterInterface<simulation::ExecutionEvent>::Container& ex_events, TraceContainer& trace)
 {
+    process_events(ex_events, trace);
+}
+
+template <std::same_as<std::vector<simulation::ExecutionEvent>> Events>
+void ExecutionTraceBuilder::process(const Events& ex_events, TraceContainer& trace)
+{
+    process_events(ex_events, trace);
+}
+
+template void ExecutionTraceBuilder::process(const std::vector<simulation::ExecutionEvent>& ex_events,
+                                             TraceContainer& trace);
+
+template <typename Events> void ExecutionTraceBuilder::process_events(const Events& ex_events, TraceContainer& trace)
+{
     // Resolve the small chronological state machine before filling independent rows.
     const FailingContexts failures = preprocess_for_discard(ex_events);
     struct RowState {
@@ -337,7 +350,7 @@ void ExecutionTraceBuilder::process(
     uint32_t discarding_context_id = 0;
     bool next_enqueued_call_start = true;
     bool previous_entered_call = false;
-    for (const auto& event : ex_events) {
+    for (const simulation::ExecutionEvent& event : ex_events) {
         if (discarding_context_id == 0 && next_enqueued_call_start &&
             is_phase_discarded(event.after_context_event.phase, failures)) {
             discarding_context_id = dying_context_for_phase(event.after_context_event.phase, failures);
@@ -362,7 +375,7 @@ void ExecutionTraceBuilder::process(
     }
 
     const auto process_event = [&](size_t index) {
-        const auto& ex_event = ex_events[index];
+        const simulation::ExecutionEvent& ex_event = ex_events[index];
         const uint32_t row = static_cast<uint32_t>(index + 1); // Row zero is reserved for shifted columns.
         const auto& state = row_states[index];
         const uint32_t dying_context_id = state.dying_context_id;
