@@ -10,6 +10,7 @@
 #include "bn254_crs_data.hpp"
 #include "bn254_g1_chunk_hashes.hpp"
 #include "http_download.hpp"
+#include "pread.hpp"
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -48,28 +49,6 @@ void write_uncompressed_g1_points(const std::vector<bb::g1::affine_element>& poi
 
 #if !defined(__wasm__) && !defined(_WIN32)
 /**
- * @brief pread exactly `size` bytes at `offset`, retrying short reads and EINTR. Returns false on error or EOF.
- */
-bool pread_exact(int fd, uint8_t* dst, size_t size, size_t offset)
-{
-    while (size > 0) {
-        const ssize_t got = ::pread(fd, dst, size, static_cast<off_t>(offset));
-        if (got < 0 && errno == EINTR) {
-            continue;
-        }
-        if (got <= 0) {
-            return false;
-        }
-        dst += got;
-        size -= static_cast<size_t>(got);
-        offset += static_cast<size_t>(got);
-    }
-    return true;
-}
-#endif
-
-#if !defined(__wasm__) && !defined(_WIN32)
-/**
  * @brief Read `num_points` uncompressed G1 points (64 bytes each) from a file into `dst`, which may be uninitialised.
  *
  * @details Each thread preads its own contiguous slice of the file into a small buffer and deserializes straight into
@@ -102,7 +81,8 @@ void read_uncompressed_g1_points_into(const std::filesystem::path& path, bb::g1:
             const size_t end = begin + range.size();
             for (size_t first = begin; first < end; first += POINTS_PER_READ) {
                 const size_t count = std::min(POINTS_PER_READ, end - first);
-                if (!pread_exact(fd, buf.data(), count * UNCOMPRESSED_POINT_SIZE, first * UNCOMPRESSED_POINT_SIZE)) {
+                if (!bb::srs::pread_exact(
+                        fd, buf.data(), count * UNCOMPRESSED_POINT_SIZE, first * UNCOMPRESSED_POINT_SIZE)) {
                     read_failed.store(true, std::memory_order_relaxed);
                     return;
                 }
