@@ -6,6 +6,7 @@
 
 #pragma once
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/ecc/curves/bn254/bn254.hpp"
 #include "barretenberg/ecc/curves/bn254/fr.hpp"
 #include "barretenberg/ecc/curves/grumpkin/grumpkin.hpp"
@@ -340,6 +341,23 @@ template <typename FF_> class CircuitBuilderBase {
 
   protected:
     std::unordered_map<uint32_t, std::string> variable_names;
+
+    /**
+     * @brief Adds the storage of the witness values and the copy-constraint bookkeeping to `blocks`, so their pages can
+     * be released just before they are freed. Each vector qualifies by its capacity, but only its elements are
+     * released.
+     */
+    template <size_t N> void add_variable_storage_to(PageBlockList<N>& blocks) noexcept
+    {
+        const auto add = [&blocks]<typename T>(std::vector<T>& vec) noexcept {
+            blocks.add(vec.data(), vec.capacity() * sizeof(T), vec.size() * sizeof(T));
+        };
+        add(variables);
+        add(next_var_index);
+        add(prev_var_index);
+        add(real_variable_index);
+        add(real_variable_tags);
+    }
 
   public:
     /**

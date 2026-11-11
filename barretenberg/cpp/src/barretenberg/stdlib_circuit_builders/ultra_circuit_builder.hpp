@@ -344,7 +344,7 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     UltraCircuitBuilder_(UltraCircuitBuilder_&& other) = default;
     UltraCircuitBuilder_& operator=(const UltraCircuitBuilder_& other) = default;
     UltraCircuitBuilder_& operator=(UltraCircuitBuilder_&& other) = default;
-    ~UltraCircuitBuilder_() override = default;
+    ~UltraCircuitBuilder_() override { release_storage_pages(); }
 
     void finalize_circuit();
 
@@ -630,6 +630,10 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     void process_range_lists();
 
   private:
+    // Releases the pages of the gate tiles and the variable arrays from one team of threads, just before they are
+    // freed.
+    void release_storage_pages() noexcept;
+
     // One bit per variable; every bit is clear between range lists.
     using VariableBitmap = std::vector<std::atomic<uint64_t>>;
     // process_range_list with a bitmap that is kept, all clear, for the next list.

@@ -11,6 +11,7 @@
 #include "barretenberg/common/mem.hpp"
 #include "barretenberg/common/ref_array.hpp"
 #include "barretenberg/common/ref_vector.hpp"
+#include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/common/serialize.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include <algorithm>
@@ -203,6 +204,20 @@ template <typename Tile, size_t ChunkShift = 8> class TileChunks {
 
     size_t size() const { return size_; }
     size_t capacity() const { return chunks_.size() * CHUNK_TILES; }
+
+    /**
+     * @brief Adds every chunk to `blocks`, so the pages of the tiles can be released just before the store is freed.
+     * @details Chunks under the release floor (all of them at the default chunk size) are skipped by `blocks.add`.
+     */
+    template <size_t N> void add_chunks_to(PageBlockList<N>& blocks) const noexcept
+    {
+        // Tiles fill the chunks in order, so the tiles in use in a chunk are a prefix of it.
+        for (size_t c = 0; c < chunks_.size(); ++c) {
+            const size_t first_tile = c * CHUNK_TILES;
+            const size_t used_tiles = std::min(size_ - std::min(size_, first_tile), CHUNK_TILES);
+            blocks.add(chunks_[c].get(), sizeof(Chunk), sizeof(Tile) * used_tiles);
+        }
+    }
 
     void clear()
     {

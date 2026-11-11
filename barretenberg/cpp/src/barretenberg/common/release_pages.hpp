@@ -18,7 +18,20 @@ namespace bb {
  */
 struct PageBlock {
     void* ptr = nullptr;
+    // The allocation's size, which decides whether the block is large enough to release.
     size_t bytes = 0;
+    // The bytes in use from ptr, at most `bytes`; only pages inside them are released and counted.
+    size_t used_bytes = 0;
+
+    constexpr PageBlock() noexcept = default;
+    constexpr PageBlock(void* block, size_t block_bytes) noexcept
+        : PageBlock(block, block_bytes, block_bytes)
+    {}
+    constexpr PageBlock(void* block, size_t block_bytes, size_t block_used_bytes) noexcept
+        : ptr(block)
+        , bytes(block_bytes)
+        , used_bytes(std::min(block_used_bytes, block_bytes))
+    {}
 };
 
 /**
@@ -41,7 +54,7 @@ struct PageRange {
     uintptr_t end = 0;
 };
 
-// The whole pages strictly inside an eligible block, so allocator metadata next to it is never touched.
+// The whole pages strictly inside an eligible block's used bytes, never allocator metadata next to the block.
 inline PageRange whole_pages(const PageBlock& block, uintptr_t page)
 {
     if (block.ptr == nullptr || block.bytes < MIN_PAGE_RELEASE_BLOCK_BYTES) {
@@ -49,7 +62,7 @@ inline PageRange whole_pages(const PageBlock& block, uintptr_t page)
     }
     const auto lo = reinterpret_cast<uintptr_t>(block.ptr);
     const uintptr_t begin = (lo + page - 1) & ~(page - 1);
-    const uintptr_t end = (lo + block.bytes) & ~(page - 1);
+    const uintptr_t end = (lo + std::min(block.used_bytes, block.bytes)) & ~(page - 1);
     return end > begin ? PageRange{ begin, end } : PageRange{};
 }
 
@@ -89,13 +102,14 @@ inline void* release_slice(void* arg)
  *
  * @details Freeing a multi-megabyte block unmaps it on the calling thread, and the kernel then frees its pages one at a
  * time (on the order of 0.1 ms per MiB), so gigabytes of memory take a noticeable serial pause to tear down.
- * madvise(MADV_DONTNEED) on disjoint ranges runs concurrently, after which each free only unmaps an empty range. The
- * whole pages of all blocks are split evenly over up to 16 threads, one per 16 MiB, whatever the block boundaries.
- * Only whole pages strictly inside each block are released. Blocks under MIN_PAGE_RELEASE_BLOCK_BYTES (32 MiB) are
- * skipped, since the allocator may keep them in a malloc arena rather than unmap them on free, and nothing is released
- * when the remaining blocks total under 64 MiB. The released blocks' contents are lost: call this only immediately
- * before freeing them. Never throws, and uses short-lived threads rather than the parallel_for pool, so it is safe from
- * destructors running on any thread, including inside a parallel_for. A no-op without native threads.
+ * madvise(MADV_DONTNEED) on disjoint ranges runs concurrently, after which each free only unmaps an empty range. Only
+ * whole pages strictly inside each block's used bytes are released, split evenly over up to 16 threads, one per 16 MiB,
+ * whatever the block boundaries. Blocks whose allocation is under MIN_PAGE_RELEASE_BLOCK_BYTES (32 MiB) are skipped,
+ * since the allocator may keep them in a malloc arena rather than unmap them on free, and nothing is released when the
+ * used bytes of the remaining blocks total under 64 MiB, so a large reserve that was never written starts no threads.
+ * The released blocks' contents are lost: call this only immediately before freeing them. Never throws, and uses
+ * short-lived threads rather than the parallel_for pool, so it is safe from destructors running on any thread,
+ * including inside a parallel_for. A no-op without native threads.
  *
  * @return Whether the release was attempted: true once the qualifying pages have been handed to madvise, whether or not
  * every call succeeded, so the caller need not release them again; false when nothing qualified or without native
@@ -111,7 +125,7 @@ inline bool release_pages_in_parallel([[maybe_unused]] std::span<const PageBlock
     for (const PageBlock& block : blocks) {
         const PageRange range = whole_pages(block, page);
         if (range.end > range.begin) {
-            eligible_bytes += block.bytes;
+            eligible_bytes += std::min(block.used_bytes, block.bytes);
             num_pages += (range.end - range.begin) / page;
         }
     }
@@ -168,17 +182,23 @@ inline void release_pages_in_parallel(void* ptr, size_t bytes)
 template <size_t N> class PageBlockList {
   public:
     /**
-     * @brief Adds a block if it is at least MIN_PAGE_RELEASE_BLOCK_BYTES and the list has room.
+     * @brief Adds a block of `bytes` whose first `used_bytes` are in use, if the block is at least
+     * MIN_PAGE_RELEASE_BLOCK_BYTES and the list has room; only pages inside the used bytes are released.
      * @return Whether the block was added; a block that was not is left to the allocator.
      */
-    bool add(void* ptr, size_t bytes) noexcept
+    bool add(void* ptr, size_t bytes, size_t used_bytes) noexcept
     {
         if (ptr == nullptr || bytes < MIN_PAGE_RELEASE_BLOCK_BYTES || size_ == N) {
             return false;
         }
-        blocks_[size_++] = { ptr, bytes };
+        blocks_[size_++] = PageBlock{ ptr, bytes, used_bytes };
         return true;
     }
+
+    /**
+     * @brief Adds a block that is in use in full; see the three-argument add.
+     */
+    bool add(void* ptr, size_t bytes) noexcept { return add(ptr, bytes, bytes); }
 
     /**
      * @brief Releases the pages of every added block (see release_pages_in_parallel); call it only immediately before

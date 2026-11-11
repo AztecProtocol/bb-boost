@@ -60,8 +60,8 @@ size_t page_size()
     return static_cast<size_t>(sysconf(_SC_PAGESIZE));
 }
 
-// Checks page by page that exactly the whole pages strictly inside `released` read as zero and every other byte of the
-// mapping still holds FILL.
+// Checks page by page that exactly the whole pages strictly inside the used bytes of `released` read as zero and every
+// other byte of the mapping still holds FILL.
 void expect_only_whole_pages_released(const Mapping& mapping, const std::vector<PageBlock>& released)
 {
     ASSERT_NE(mapping.at(0), nullptr);
@@ -74,7 +74,7 @@ void expect_only_whole_pages_released(const Mapping& mapping, const std::vector<
         bool is_released = false;
         for (const PageBlock& block : released) {
             const auto begin = reinterpret_cast<uintptr_t>(block.ptr);
-            is_released = is_released || (lo >= begin && lo + page <= begin + block.bytes);
+            is_released = is_released || (lo >= begin && lo + page <= begin + block.used_bytes);
         }
         const auto& expected = is_released ? zeros : filled;
         ASSERT_EQ(std::memcmp(mapping.at(offset), expected.data(), page), 0)
@@ -143,6 +143,33 @@ TEST(ReleasePages, SmallTotalsAndFullListsAreLeftAlone)
 
     // The single-block form keeps its own 64 MiB minimum.
     release_pages_in_parallel(mapping.at(1), (64 * MIB) - 1);
+    expect_only_whole_pages_released(mapping, {});
+#endif
+}
+
+TEST(ReleasePages, BlocksQualifyByCapacityButReleaseOnlyTheirUsedBytes)
+{
+#ifndef BB_RELEASE_PAGES_TESTABLE
+    GTEST_SKIP() << "needs Linux and native threads";
+#else
+    {
+        // `sparse` qualifies by its capacity and its used bytes end mid-page; with `full` they just reach the minimum.
+        Mapping mapping(96 * MIB);
+        const PageBlock sparse{ mapping.at(100), 32 * MIB, (8 * MIB) + 1234 };
+        const PageBlock full{ mapping.at(40 * MIB), 56 * MIB };
+        PageBlockList<2> list;
+        EXPECT_TRUE(list.add(sparse.ptr, sparse.bytes, sparse.used_bytes));
+        EXPECT_TRUE(list.add(full.ptr, full.bytes));
+        EXPECT_TRUE(list.release());
+        expect_only_whole_pages_released(mapping, { sparse, full });
+    }
+
+    // Capacities reaching the minimum do not count; the used bytes are under it.
+    Mapping mapping(64 * MIB);
+    PageBlockList<2> list;
+    EXPECT_TRUE(list.add(mapping.at(0), 32 * MIB, 16 * MIB));
+    EXPECT_TRUE(list.add(mapping.at(32 * MIB), 32 * MIB, 16 * MIB));
+    EXPECT_FALSE(list.release());
     expect_only_whole_pages_released(mapping, {});
 #endif
 }

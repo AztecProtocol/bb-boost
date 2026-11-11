@@ -2312,6 +2312,18 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::fr
     std::unordered_set<uint32_t>().swap(finalize_witnesses);
 }
 
+template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::release_storage_pages() noexcept
+{
+    // Holds far more blocks than a circuit has at or above the release floor; blocks past it are just freed as usual.
+    constexpr size_t MAX_RELEASED_BLOCKS = 128;
+    PageBlockList<MAX_RELEASED_BLOCKS> released;
+    for (const auto& block : blocks.get()) {
+        block.tiles.add_chunks_to(released);
+    }
+    this->add_variable_storage_to(released);
+    released.release();
+}
+
 template class UltraCircuitBuilder_<UltraExecutionTraceBlocks>;
 template class UltraCircuitBuilder_<MegaExecutionTraceBlocks>;
 template class UltraCircuitBuilder_<MegaKernelExecutionTraceBlocks>;
