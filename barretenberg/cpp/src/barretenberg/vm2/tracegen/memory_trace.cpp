@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <type_traits>
 
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/thread.hpp"
 #include "barretenberg/vm2/common/field.hpp"
 #include "barretenberg/vm2/common/memory_types.hpp"
 #include "barretenberg/vm2/common/tagged_value.hpp"
@@ -49,24 +51,29 @@ std::array<uint64_t, 2> MemoryTraceBuilder::get_event_sort_key(const simulation:
 void MemoryTraceBuilder::process(const simulation::EventEmitterInterface<simulation::MemoryEvent>::Container& events,
                                  TraceContainer& trace)
 {
-    using simulation::MemoryEvent;
-    using simulation::MemoryMode;
+    sort_events(events);
+    write_rows(trace);
+}
 
-    // Cache immutable comparison keys beside pointers, avoiding scattered event
-    // reads on every comparison. No event payloads are copied or moved.
-    struct SortEntry {
-        std::array<uint64_t, 2> key;
-        const MemoryEvent* event;
-    };
-    std::vector<SortEntry> sorted_events;
-    const size_t trace_size = events.size();
-    sorted_events.reserve(trace_size);
+void MemoryTraceBuilder::sort_events(
+    const simulation::EventEmitterInterface<simulation::MemoryEvent>::Container& events)
+{
+    sorted_events.clear();
+    sorted_events.reserve(events.size());
 
     for (const auto& event : events) {
         sorted_events.push_back({ get_event_sort_key(event), &event });
     }
 
     std::ranges::sort(sorted_events, [](const auto& lhs, const auto& rhs) { return lhs.key < rhs.key; });
+}
+
+void MemoryTraceBuilder::write_rows(TraceContainer& trace) const
+{
+    using simulation::MemoryEvent;
+    using simulation::MemoryMode;
+
+    const size_t trace_size = sorted_events.size();
 
     using C = Column;
 
@@ -84,10 +91,11 @@ void MemoryTraceBuilder::process(const simulation::EventEmitterInterface<simulat
     }
     FF::batch_invert(tag_inverts);
 
-    // We use shift in this trace and keep the first row empty.
-    uint32_t row = 1;
-
-    for (uint32_t i = 0; i < trace_size; i++) {
+    // Row i + 1 depends only on sorted events i and i + 1 (row 0 is left empty because shifted columns are used).
+    // Without assert_diff, a diff that is too large skips the row and sets write_in_order instead.
+    std::atomic<bool> write_in_order = false;
+    const auto write_row = [&](uint32_t i, bool assert_diff) {
+        const uint32_t row = i + 1;
         const auto& event = *sorted_events[i].event;
         const bool is_last = i + 1 == trace_size;
         const bool sel_tag_is_ff = event.value.get_tag() == MemoryTag::FF;
@@ -111,6 +119,10 @@ void MemoryTraceBuilder::process(const simulation::EventEmitterInterface<simulat
             diff = last_access ? global_addr_diff : (next_timestamp - timestamp - two_consecutive_writes);
 
             // Defensive: diff must fit in 48 bits for the 3x16-bit limb decomposition.
+            if (!assert_diff && diff >= (1ULL << 48)) {
+                write_in_order.store(true, std::memory_order_relaxed);
+                return;
+            }
             BB_ASSERT(diff < (1ULL << 48));
         }
 
@@ -135,7 +147,33 @@ void MemoryTraceBuilder::process(const simulation::EventEmitterInterface<simulat
                       { C::memory_sel_rng_write, (event.mode == MemoryMode::WRITE && !sel_tag_is_ff) ? 1 : 0 },
                       { C::memory_max_bits, get_tag_bits(event.value.get_tag()) },
                   } });
-        row++;
+    };
+
+    // Align chunks to trace shards: writers never share a cell, and normally share no shard.
+    constexpr size_t chunk_size = TraceContainer::INTERVAL_SIZE;
+    const size_t num_chunks = (trace_size + chunk_size) / chunk_size;
+    if (num_chunks < 4) {
+        for (uint32_t i = 0; i < trace_size; i++) {
+            write_row(i, /*assert_diff=*/true);
+        }
+    } else {
+        parallel_for(num_chunks, [&](size_t chunk) {
+            const size_t first_row = std::max<size_t>(1, chunk * chunk_size);
+            const size_t end_row = std::min(trace_size + 1, (chunk + 1) * chunk_size);
+            try {
+                for (size_t row = first_row; row < end_row; ++row) {
+                    write_row(static_cast<uint32_t>(row - 1), /*assert_diff=*/false);
+                }
+            } catch (...) {
+                write_in_order.store(true, std::memory_order_relaxed);
+            }
+        });
+        // Errors are raised on this thread, by the serial loop: it stops at the same row with the same error.
+        if (write_in_order.load()) {
+            for (uint32_t i = 0; i < trace_size; i++) {
+                write_row(i, /*assert_diff=*/true);
+            }
+        }
     }
 
     // Batch invert the columns.

@@ -192,6 +192,8 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
 {
     // We process the events in parallel. Ideally the jobs should access disjoint column sets.
     {
+        // The longest builder: its sort is a job below, its rows are written once the jobs are done.
+        MemoryTraceBuilder memory_trace_builder;
         auto jobs = concatenate(
             // Precomputed column jobs.
             build_precomputed_columns_jobs(trace),
@@ -338,11 +340,7 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
                                    indexed_tree_check_trace_builder.process(events.indexed_tree_check_events, trace));
                     clear_events(events.indexed_tree_check_events);
                 },
-                [&]() {
-                    MemoryTraceBuilder memory_trace_builder;
-                    AVM_TRACK_TIME("tracegen/memory", memory_trace_builder.process(events.memory, trace));
-                    clear_events(events.memory);
-                },
+                [&]() { AVM_TRACK_TIME("tracegen/memory_sort", memory_trace_builder.sort_events(events.memory)); },
                 [&]() {
                     DataCopyTraceBuilder data_copy_trace_builder;
                     AVM_TRACK_TIME("tracegen/data_copy",
@@ -420,6 +418,8 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
             AVM_TRACK_TIME("tracegen/execution", exec_builder.process(events.execution, trace));
             clear_events(events.execution);
             execute_jobs(jobs);
+            AVM_TRACK_TIME("tracegen/memory", memory_trace_builder.write_rows(trace));
+            clear_events(events.memory);
         });
     }
 }
