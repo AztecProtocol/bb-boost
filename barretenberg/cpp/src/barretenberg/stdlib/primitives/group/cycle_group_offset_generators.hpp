@@ -35,7 +35,9 @@ template <typename Curve> class cycle_group_offset_generators {
      */
     static const cycle_group_offset_generators& default_generators()
     {
-        static const cycle_group_offset_generators instance;
+        // Never destroyed: freeing the memoized generators at exit only delays the exit.
+        // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+        static const cycle_group_offset_generators& instance = *new cycle_group_offset_generators();
         return instance;
     }
 
