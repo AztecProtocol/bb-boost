@@ -283,10 +283,27 @@ RecursionSplicer::RecursionSplicer(bb::numeric::RNG& engine)
 
 RecursionSplicer::~RecursionSplicer()
 {
+    reap();
+}
+
+void RecursionSplicer::reap()
+{
+    // Requested of every running build first, so a join waits only until that build's next recording, or its end.
+    for (const auto& scratch : scratches_) {
+        if (scratch->running) {
+            scratch->cancellation.request();
+        }
+    }
     for (const auto& scratch : scratches_) {
         scratch->join();
         scratch->discard();
     }
+}
+
+void RecursionSplicer::finish()
+{
+    reap();
+    report();
 }
 
 std::unique_ptr<RecursionSplicer> RecursionSplicer::launch(const UltraCircuitBuilder& builder,
@@ -349,6 +366,7 @@ std::optional<HonkRecursionConstraintOutput<UltraCircuitBuilder>> RecursionSplic
     }
     Scratch& scratch = *scratches_[index];
     if (!(constraint == scratch.original)) {
+        scratch.cancellation.request();
         scratch.join();
         refuse(scratch, "the constraint changed since the scratch build started");
         return std::nullopt;
@@ -460,6 +478,8 @@ std::optional<HonkRecursionConstraintOutput<UltraCircuitBuilder>> RecursionSplic
 {
     return std::nullopt;
 }
+
+void RecursionSplicer::finish() {}
 
 void RecursionSplicer::report() const {}
 

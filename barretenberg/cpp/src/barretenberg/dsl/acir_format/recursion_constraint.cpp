@@ -165,6 +165,10 @@ HonkRecursionConstraintsOutput<UltraCircuitBuilder> create_recursion_constraints
 
         gate_counter.track_diff(gates_per_opcode, opcode_idx);
     }
+    // No scratch builder outlives the Honk recursion constraints.
+    if (splicer != nullptr) {
+        splicer->finish();
+    }
     BB_ASSERT(
         !(output.is_root_rollup && output.nested_ipa_claims.size() + output.nested_triple_ipa_openings.size() != 2),
         "Root rollup must accumulate two IPA proofs.");
@@ -183,10 +187,6 @@ HonkRecursionConstraintsOutput<UltraCircuitBuilder> create_recursion_constraints
         output.update_triple_ipa_opening(avm_output.points_accumulator, std::move(avm_output.triple_ipa_opening));
 
         gate_counter.track_diff(gates_per_opcode, opcode_idx);
-    }
-
-    if (splicer != nullptr) {
-        splicer->report();
     }
 
     return output;

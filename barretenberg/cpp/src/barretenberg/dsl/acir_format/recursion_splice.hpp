@@ -75,8 +75,9 @@ struct RecursionSpliceTestHooks {
  * cancelled and the constraint is built in place, so which path builds it depends on timing. A cancelled build only
  * ever had its own builder and its own draws: it never touches the real builder or the real engine, its draws come
  * from its draw scope under an engine with positions and from its thread's own buffer otherwise, and they are dropped
- * as a refused build's are. It stops by throwing at its next recording. Its thread is joined, never detached, before
- * its builder is destroyed, and its freed memory is returned the same way as every other scratch build's.
+ * as a refused build's are. It stops by throwing at its next recording. Once the last Honk recursion constraint is
+ * built, its thread is joined, never detached, its builder destroyed, and its freed memory returned the same way as
+ * every other scratch build's.
  */
 class RecursionSplicer {
   public:
@@ -97,7 +98,7 @@ class RecursionSplicer {
     RecursionSplicer& operator=(RecursionSplicer&&) = delete;
 
     /**
-     * @brief Join every scratch thread, including those of cancelled builds, and destroy every scratch builder,
+     * @brief Cancel every scratch build still running, join every scratch thread and destroy every scratch builder,
      * returning first, on glibc, the memory freed into malloc arenas to the operating system.
      */
     ~RecursionSplicer();
@@ -115,10 +116,11 @@ class RecursionSplicer {
                                                                                bb::UltraCircuitBuilder& builder);
 
     /**
-     * @brief Log how many constraints were spliced, refused and built in place, why the first refusal happened, and
-     * how far scratch build 0 was ahead of the building thread.
+     * @brief Once the last Honk recursion constraint is built: cancel, join and destroy every scratch build still held,
+     * as the destructor does, then log how many constraints were spliced, refused and built in place, why the first
+     * refusal happened, and how far scratch build 0 was ahead of the building thread.
      */
-    void report() const;
+    void finish();
 
   private:
     struct Scratch;
@@ -127,6 +129,8 @@ class RecursionSplicer {
     explicit RecursionSplicer(bb::numeric::RNG& engine);
     void refuse(Scratch& scratch, std::string reason);
     bool wait_for_first(Scratch& scratch);
+    void reap();
+    void report() const;
     std::string summary() const;
 
     // Unread in builds without native threads, where nothing is ever launched.

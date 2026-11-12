@@ -17,6 +17,7 @@
 #include "barretenberg/ultra_honk/ultra_prover.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -416,7 +417,7 @@ TEST_F(RecursionSpliceTest, RefusesAConstraintOtherThanTheLaunchedOne)
     const Builder before = builder;
     EXPECT_FALSE(splicer->take(0, other, builder).has_value());
     expect_same_builder_state(builder, before);
-    splicer->report();
+    splicer->finish();
     EXPECT_EQ(stats.spliced, 0);
     EXPECT_EQ(stats.refused, 1);
     EXPECT_EQ(stats.first_refusal, "the constraint changed since the scratch build started");
@@ -472,11 +473,13 @@ TEST_F(RecursionSpliceTest, FirstTakeByTiming)
 }
 
 /**
- * The first scratch build is held at a chosen recording while the building thread cancels it and builds the
- * constraint in place, then released: it stops at that very recording, its thread has exited by the time its builder
- * is discarded, and the real builder and engine end as in the serial build.
+ * The first scratch build is cancelled while the building thread builds the constraint in place, at four points: held
+ * at its first, a middle and its last recording, then released, and after it finished. It stops at that very
+ * recording, its thread has exited by the time its builder is discarded, which happens before the Honk recursion
+ * constraints are reported and so before any later kind of constraint is built, and the real builder and engine end as
+ * in the serial build.
  */
-TEST_F(RecursionSpliceTest, CancelsTheFirstScratchBuildAtAnyPoint)
+TEST_F(RecursionSpliceTest, CancelsTheFirstScratchBuildAtFourPoints)
 {
     const HookReset reset;
     const AcirProgram program = make_program({ &honk_proofs[0] });
@@ -505,6 +508,7 @@ TEST_F(RecursionSpliceTest, CancelsTheFirstScratchBuildAtAnyPoint)
         std::atomic<bool> exited = false;
         std::vector<size_t> discarded;
         bool exited_before_discard = false;
+        bool reported_before_discard = true;
         const Hooks hooks{
             .spliced_before_constraint =
                 [&](Builder&, const RecursionConstraint&, size_t index) {
@@ -545,6 +549,7 @@ TEST_F(RecursionSpliceTest, CancelsTheFirstScratchBuildAtAnyPoint)
                     discarded.push_back(index);
                     if (index == 0) {
                         exited_before_discard = exited.load();
+                        reported_before_discard = RecursionSpliceTestHooks::stats->launched != 0;
                     }
                 },
             .first_take = FirstTake::InPlace,
@@ -558,7 +563,66 @@ TEST_F(RecursionSpliceTest, CancelsTheFirstScratchBuildAtAnyPoint)
         EXPECT_EQ(finished.load(), after_finish);
         EXPECT_EQ(discarded, std::vector<size_t>{ 0 });
         EXPECT_TRUE(exited_before_discard);
+        EXPECT_FALSE(reported_before_discard);
+        EXPECT_EQ(spliced.stats.launched, 1);
     }
+}
+
+/**
+ * An error on the building thread cancels every scratch build it has not taken before joining it. Builds 1 and 2 are
+ * held at their first recording until build 0 has been joined and discarded, which the splicer reaches only after
+ * requesting every cancellation, so on release each throws at that recording. Were a build joined before its
+ * cancellation was requested, builds 1 and 2 would run on to their end once released. Build 0 is joined first and so
+ * cannot be held; whether it stops early or finishes depends on timing, and it is not checked.
+ */
+TEST_F(RecursionSpliceTest, AnErrorOnTheBuildingThreadCancelsTheScratchBuilds)
+{
+    const HookReset reset;
+    std::mutex mutex;
+    std::condition_variable recorded;
+    size_t num_recording = 0;
+    std::array<std::atomic<bool>, 3> finished{};
+    Signal first_discarded;
+    std::vector<size_t> discarded;
+    const Hooks hooks{
+        .spliced_before_constraint =
+            [&](Builder&, const RecursionConstraint&, size_t index) {
+                if (index != 0) {
+                    return;
+                }
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    EXPECT_TRUE(recorded.wait_for(lock, std::chrono::minutes(2), [&] { return num_recording == 3; }));
+                }
+                throw_or_abort("forced building thread failure");
+            },
+        .after_scratch_build = [&](size_t index) { finished[index].store(true); },
+        .scratch_recording =
+            [&](size_t index, size_t count) {
+                if (count != 1) {
+                    return;
+                }
+                {
+                    const std::lock_guard<std::mutex> lock(mutex);
+                    ++num_recording;
+                }
+                recorded.notify_all();
+                if (index != 0) {
+                    EXPECT_TRUE(first_discarded.wait());
+                }
+            },
+        .discarded =
+            [&](size_t index) {
+                discarded.push_back(index);
+                if (index == 0) {
+                    first_discarded.set();
+                }
+            },
+    };
+    EXPECT_THROW((void)build(make_program(three_honk_proofs()), {}, /*splice=*/true, start, hooks), std::runtime_error);
+    EXPECT_FALSE(finished[1].load());
+    EXPECT_FALSE(finished[2].load());
+    EXPECT_EQ(discarded, (std::vector<size_t>{ 0, 1, 2 }));
 }
 
 // The forced refusals hit the middle of three constraints; the first is spliced either way.
