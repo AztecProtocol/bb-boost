@@ -14,6 +14,7 @@
 #include "barretenberg/public_input_component/public_component_key.hpp"
 #include "barretenberg/serialize/msgpack.hpp"
 #include "pairing_points_tagging.hpp"
+#include <tuple>
 #include <utility>
 
 #include <algorithm>
@@ -192,6 +193,33 @@ template <typename FF_> class CircuitBuilderBase {
     virtual ~CircuitBuilderBase() = default;
 
     bool operator==(const CircuitBuilderBase& other) const = default;
+
+    /**
+     * @brief Whether this builder equals `other` in every member but the variable values, of which only the number
+     * is compared.
+     */
+    bool equal_except_values(const CircuitBuilderBase& other) const
+    {
+        const auto members = [](const CircuitBuilderBase& builder) {
+            return std::tie(builder._public_inputs,
+                            builder._public_inputs_finalized,
+                            builder.next_var_index,
+                            builder.prev_var_index,
+                            builder._zero_idx,
+                            builder._num_gates,
+                            builder._tau,
+                            builder._current_tag,
+                            builder.real_variable_index,
+                            builder.real_variable_tags,
+                            builder.circuit_finalized,
+                            builder._failed,
+                            builder._err,
+                            builder._is_write_vk_mode,
+                            builder.variable_names,
+                            builder.pairing_points_tagging);
+        };
+        return variables.size() == other.variables.size() && members(*this) == members(other);
+    }
 
     virtual size_t get_num_finalized_gates() const;
     virtual size_t get_num_variables() const;
