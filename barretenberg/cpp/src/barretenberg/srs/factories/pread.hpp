@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <filesystem>
+#include <memory>
 #include <unistd.h>
 
 namespace bb::srs {
@@ -42,6 +43,9 @@ inline bool pread_prefix_in_parallel(const std::filesystem::path& path, uint8_t*
     if (fd < 0) {
         return false;
     }
+    // Closed on every exit, including an exception from starting the workers.
+    const auto close_fd = [](const int* owned) { ::close(*owned); };
+    const std::unique_ptr<const int, decltype(close_fd)> fd_owner(&fd, close_fd);
     std::atomic<bool> failed{ false };
     parallel_for([&](ThreadChunk chunk) {
         const auto range = chunk.range(size);
@@ -49,7 +53,6 @@ inline bool pread_prefix_in_parallel(const std::filesystem::path& path, uint8_t*
             failed.store(true, std::memory_order_relaxed);
         }
     });
-    ::close(fd);
     return !failed.load();
 }
 
