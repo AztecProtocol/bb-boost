@@ -7,12 +7,14 @@
 #include "engine.hpp"
 #include "barretenberg/common/assert.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
+#include "entropy_buffer_observer.hpp"
 #include <array>
 #include <cerrno>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <random>
+#include <string>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR
@@ -60,8 +62,12 @@ struct RandomBufferWrapper {
     std::unique_ptr<uint8_t[]> buffer;
     // Offset into the unused part of the buffer
     ssize_t offset = -1;
+    // Identity of the current fill as reported to an observer; 0 when the fill was made with none installed
+    uint64_t fill_id = 0;
 };
 thread_local RandomBufferWrapper random_buffer_wrapper;
+std::atomic<EntropyBufferObserver*> entropy_buffer_observer{ nullptr };
+std::atomic<uint64_t> entropy_buffer_fill_count{ 0 };
 /**
  * @brief Generate an array of random unsigned ints sampled from a CSPRNG
  *
@@ -74,6 +80,7 @@ template <size_t size_in_unsigned_ints> std::array<unsigned int, size_in_unsigne
     static_assert(size_in_unsigned_ints <= 32);
     std::array<unsigned int, size_in_unsigned_ints> random_data;
     constexpr size_t random_data_buffer_size = sizeof(random_data);
+    EntropyBufferObserver* const observer = entropy_buffer_observer.load(std::memory_order_acquire);
 
     // if the buffer is not initialized or doesn't contain enough bytes, sample randomness
     // We could preserve the leftover bytes, but it's a bit messy
@@ -128,13 +135,64 @@ template <size_t size_in_unsigned_ints> std::array<unsigned int, size_in_unsigne
             throw_or_abort("CSPRNG read failed: cannot retrieve entropy from system source");
         }
         random_buffer_wrapper.offset = 0;
+        random_buffer_wrapper.fill_id = 0;
+        if (BB_UNLIKELY(observer != nullptr)) {
+            random_buffer_wrapper.fill_id = entropy_buffer_fill_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            observer->on_fill(random_buffer_wrapper.fill_id, RANDOM_BUFFER_SIZE);
+        }
     }
 
+    if (BB_UNLIKELY(observer != nullptr)) {
+        observer->on_consume(
+            random_buffer_wrapper.fill_id, static_cast<size_t>(random_buffer_wrapper.offset), random_data_buffer_size);
+    }
     memcpy(&random_data, random_buffer_wrapper.buffer.get() + random_buffer_wrapper.offset, random_data_buffer_size);
     random_buffer_wrapper.offset += static_cast<ssize_t>(random_data_buffer_size);
     return random_data;
 }
+
+class SubstituteStream;
+// The substitute stream installed on this thread by a DebugEngine, if any.
+thread_local SubstituteStream* active_substitute = nullptr;
+
+/**
+ * @brief A private copy of a DebugEngine's generator that the engine reads, on the thread that created it, in place of
+ * its own generator.
+ */
+class SubstituteStream final : public RNG::DrawScope {
+  public:
+    SubstituteStream(const RNG* issuer, const std::mt19937_64& start)
+        : owner(issuer)
+        , generator(start)
+    {
+        if (active_substitute != nullptr) {
+            throw_or_abort("RNG::draw_from: a draw scope is already active on this thread");
+        }
+        active_substitute = this;
+    }
+    SubstituteStream(const SubstituteStream&) = delete;
+    SubstituteStream(SubstituteStream&&) = delete;
+    SubstituteStream& operator=(const SubstituteStream&) = delete;
+    SubstituteStream& operator=(SubstituteStream&&) = delete;
+    ~SubstituteStream() override
+    {
+        // Destroying a scope on another thread would leave the creating thread reading freed memory.
+        BB_ASSERT(active_substitute == this, "RNG::DrawScope destroyed on a thread other than the one that created it");
+        active_substitute = nullptr;
+    }
+
+    [[nodiscard]] RNG::Position reached() const override { return { owner, generator }; }
+
+    const RNG* const owner;
+    std::mt19937_64 generator;
+    std::uniform_int_distribution<uint64_t> dist{ 0ULL, UINT64_MAX };
+};
 } // namespace
+
+EntropyBufferObserver* set_entropy_buffer_observer(EntropyBufferObserver* observer)
+{
+    return entropy_buffer_observer.exchange(observer, std::memory_order_acq_rel);
+}
 
 class RandomEngine : public RNG {
   public:
@@ -209,28 +267,87 @@ class DebugEngine : public RNG {
         : engine(std::mt19937_64(seed))
     {}
 
-    uint8_t get_random_uint8() override { return static_cast<uint8_t>(dist(engine)); }
+    Position position() const override
+    {
+        reject_inside_own_scope("position");
+        return { this, engine };
+    }
 
-    uint16_t get_random_uint16() override { return static_cast<uint16_t>(dist(engine)); }
+    Position after(const Position& start, const std::function<void(RNG&)>& draws) override
+    {
+        auto scope = draw_from(start);
+        draws(*this);
+        return scope->reached();
+    }
 
-    uint32_t get_random_uint32() override { return static_cast<uint32_t>(dist(engine)); }
+    std::unique_ptr<DrawScope> draw_from(const Position& start) override
+    {
+        reject_foreign("draw_from", start);
+        return std::make_unique<SubstituteStream>(this, *start.state);
+    }
 
-    uint64_t get_random_uint64() override { return dist(engine); }
+    bool at(const Position& where) const override
+    {
+        reject_inside_own_scope("at");
+        return where.issuer == this && where.state.has_value() && *where.state == engine;
+    }
+
+    void adopt(const Position& where) override
+    {
+        reject_inside_own_scope("adopt");
+        reject_foreign("adopt", where);
+        engine = *where.state;
+    }
+
+  private:
+    // Reads the calling thread's substitute stream when it has one for this engine, so no draw can bypass a scope.
+    uint64_t draw()
+    {
+        SubstituteStream* const substitute = active_substitute;
+        if (BB_UNLIKELY(substitute != nullptr && substitute->owner == this)) {
+            return substitute->dist(substitute->generator);
+        }
+        return dist(engine);
+    }
+
+    // Inside its own scope a thread must not touch the shared generator, which another thread may be advancing.
+    void reject_inside_own_scope(const char* operation) const
+    {
+        if (active_substitute != nullptr && active_substitute->owner == this) {
+            throw_or_abort(std::string("RNG::") + operation + ": called inside a draw scope of this engine");
+        }
+    }
+
+    void reject_foreign(const char* operation, const Position& where) const
+    {
+        if (where.empty() || where.issuer != this) {
+            throw_or_abort(std::string("RNG::") + operation + ": position is empty or issued by another engine");
+        }
+    }
+
+  public:
+    uint8_t get_random_uint8() override { return static_cast<uint8_t>(draw()); }
+
+    uint16_t get_random_uint16() override { return static_cast<uint16_t>(draw()); }
+
+    uint32_t get_random_uint32() override { return static_cast<uint32_t>(draw()); }
+
+    uint64_t get_random_uint64() override { return draw(); }
 
     uint128_t get_random_uint128() override
     {
-        uint128_t hi = dist(engine);
-        uint128_t lo = dist(engine);
+        uint128_t hi = draw();
+        uint128_t lo = draw();
         return (hi << 64) | lo;
     }
 
     uint256_t get_random_uint256() override
     {
         // Do not inline in constructor call. Evaluation order is important for cross-compiler consistency.
-        auto a = dist(engine);
-        auto b = dist(engine);
-        auto c = dist(engine);
-        auto d = dist(engine);
+        auto a = draw();
+        auto b = draw();
+        auto c = draw();
+        auto d = draw();
         return { a, b, c, d };
     }
 
