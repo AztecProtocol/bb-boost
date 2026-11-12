@@ -238,6 +238,11 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
     //   - max n <= Σn / pool_width (n is the work proxy): with largest-first ordering (below) the
     //     makespan is max(largest, Σn / pool_width), so a dominant member can't strand one worker.
     //   - pool_width >= CONCURRENT_MIN_POOL_WIDTH: fewer threads make the win too small to justify.
+    // A batch of a few large members also qualifies when each member's share of the pool, pool_width / members, is at
+    // least 8/3 threads and its 2^16-point chunks fill the pool. Spreading one member over that many threads costs
+    // CPU and leaves threads idle in its reductions, which single-threaded chunks avoid; with fewer threads per
+    // member there is no such cost to remove, and the chunked path's tail makes it a loss.
+    static constexpr size_t CONCURRENT_CHUNK_POINTS = size_t{ 1 } << 16;
 #ifdef __wasm__
     // wasm keeps large members on the sequential shared-arena dispatch: with single-threaded MSMs the
     // concurrent path's per-worker live arenas buy nothing over one reused arena.
@@ -268,9 +273,15 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
         }
         return true;
     };
-    const bool large_members_concurrent = pool_width >= CONCURRENT_MIN_POOL_WIDTH &&
-                                          large_members.size() > CONCURRENT_MIN_MEMBERS &&
-                                          max_large_n <= total_large_n / pool_width && scalar_spans_disjoint();
+    size_t min_chunks = 0;
+    for (size_t m : large_members) {
+        min_chunks += (n_input[m] + CONCURRENT_CHUNK_POINTS - 1) / CONCURRENT_CHUNK_POINTS;
+    }
+    const bool many_balanced_members =
+        large_members.size() > CONCURRENT_MIN_MEMBERS && max_large_n <= total_large_n / pool_width;
+    const bool few_wide_members = (3 * pool_width) >= (8 * large_members.size()) && min_chunks >= pool_width;
+    const bool large_members_concurrent = pool_width >= CONCURRENT_MIN_POOL_WIDTH && !large_members.empty() &&
+                                          (many_balanced_members || few_wide_members) && scalar_spans_disjoint();
 #endif
 
     // A few independent large native MSMs can instead share the CPU budget,
@@ -412,7 +423,6 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
         // many points: an MSM is a sum over its terms, so a member's result is the sum of its chunks' results.
         // Chunks run longest-first to bound the tail.
         BB_BENCH_NAME("MSM_fast::pippenger_round_parallel_batched/large_members_concurrent");
-        constexpr size_t CONCURRENT_CHUNK_POINTS = size_t{ 1 } << 16;
         struct Chunk {
             size_t member;
             size_t offset;

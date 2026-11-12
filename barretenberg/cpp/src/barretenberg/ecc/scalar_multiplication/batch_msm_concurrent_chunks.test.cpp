@@ -5,6 +5,7 @@
 #include "barretenberg/numeric/random/engine.hpp"
 #include "barretenberg/polynomials/polynomial.hpp"
 #include "scalar_multiplication.hpp"
+#include <algorithm>
 #include <gtest/gtest.h>
 
 using namespace bb;
@@ -182,6 +183,123 @@ TYPED_TEST(BatchMsmConcurrentChunksTest, MatchesStandaloneMsm)
                 << "pool " << pool_width << ", MSM " << k << " (n=" << sizes[k] << ")";
             EXPECT_EQ(batch_scalars[k], original_scalars[k]) << "scalars of MSM " << k << " not restored";
         }
+    }
+#endif
+}
+
+// A batch of three wide members takes the chunked path only where each member's share of the pool is at least 8/3
+// threads and its 2^16-point chunks fill the pool: at pool width 8 here (10 minimum chunks, raised to 16 unequal
+// parts), not at 4 or 12. Every width must give each member's stand-alone MSM byte for byte and restore its scalars.
+TYPED_TEST(BatchMsmConcurrentChunksTest, FewWideMembersMatchStandaloneMsm)
+{
+#if defined(__wasm__) || defined(NO_MULTITHREADING)
+    GTEST_SKIP() << "no concurrent large-member path without threads";
+#else
+    using AffineElement = typename TypeParam::AffineElement;
+    using ScalarField = typename TypeParam::ScalarField;
+
+    constexpr size_t CHUNK = size_t{ 1 } << 16;
+    const std::vector<size_t> sizes = { (3 * CHUNK) + 5, (2 * CHUNK) + 777, (3 * CHUNK) - 3 };
+    const size_t max_n = *std::max_element(sizes.begin(), sizes.end());
+    std::vector<AffineElement> points(max_n);
+    std::vector<ScalarField> pool(max_n);
+    parallel_for_range(max_n, [&](size_t start, size_t end) {
+        for (size_t i = start; i < end; ++i) {
+            points[i] = AffineElement::random_element(&engine);
+            pool[i] = ScalarField::random_element(&engine);
+        }
+    });
+
+    for (const size_t pool_width : { size_t{ 4 }, size_t{ 8 }, size_t{ 12 } }) {
+        ConcurrencyScope concurrency(pool_width);
+        std::vector<std::vector<ScalarField>> batch_scalars(sizes.size());
+        std::vector<PolynomialSpan<ScalarField>> spans;
+        std::vector<AffineElement> expected(sizes.size());
+        for (size_t k = 0; k < sizes.size(); ++k) {
+            // The second member is sparse, so the parts of one batch differ in cost as well as in length.
+            batch_scalars[k].resize(sizes[k]);
+            for (size_t i = 0; i < sizes[k]; ++i) {
+                const ScalarField& random = pool[((k * 17) + i) % max_n];
+                batch_scalars[k][i] = (k == 1 && i % 3 != 0) ? ScalarField::zero() : random;
+            }
+            spans.emplace_back(0, std::span<ScalarField>(batch_scalars[k]));
+            expected[k] = scalar_multiplication::MSM<TypeParam>::msm(
+                points, PolynomialSpan<const ScalarField>(0, std::span<const ScalarField>(batch_scalars[k])));
+        }
+        const auto original_scalars = batch_scalars;
+        const auto result = scalar_multiplication::MSM_fast<TypeParam>::batch_multi_scalar_mul(
+            points, spans, /*handle_edge_cases=*/false);
+        for (size_t k = 0; k < sizes.size(); ++k) {
+            EXPECT_EQ(to_buffer(result[k]), to_buffer(expected[k]))
+                << "pool " << pool_width << ", MSM " << k << " (n=" << sizes[k] << ")";
+            EXPECT_EQ(batch_scalars[k], original_scalars[k]) << "scalars of MSM " << k << " not restored";
+        }
+    }
+
+    // Members of 3, 3 and 2 times 2^16 points at pool width 8 are admitted and cut into exactly eight parts, one per
+    // 2^16 points. Member 0's chunks sum to equal points (each chunk doubles the points and halves the scalars),
+    // member 1's middle chunk is all zero, and member 2's two chunks sum to opposite points, so its MSM is the point at
+    // infinity. The same shape with member 1 reading part of member 0's scalars must not be admitted, and must still
+    // give every stand-alone MSM and restore the shared scalars.
+    using Element = typename TypeParam::Element;
+    ConcurrencyScope concurrency(8);
+    std::vector<AffineElement> chunk_points(3 * CHUNK);
+    parallel_for_range(CHUNK, [&](size_t start, size_t end) {
+        for (size_t j = start; j < end; ++j) {
+            Element p(points[j]);
+            for (size_t c = 0; c < 3; ++c) {
+                chunk_points[(c * CHUNK) + j] = AffineElement(p);
+                p = p.dbl();
+            }
+        }
+    });
+    const ScalarField half = ScalarField(2).invert();
+    std::vector<std::vector<ScalarField>> edge(3);
+    edge[0].resize(3 * CHUNK);
+    edge[1].resize(3 * CHUNK);
+    edge[2].resize(2 * CHUNK);
+    for (size_t j = 0; j < CHUNK; ++j) {
+        edge[0][j] = pool[j];
+        edge[0][CHUNK + j] = pool[j] * half;
+        edge[0][(2 * CHUNK) + j] = pool[j] * half * half;
+        edge[1][j] = pool[(j + 7) % max_n];
+        edge[1][CHUNK + j] = ScalarField::zero();
+        edge[1][(2 * CHUNK) + j] = pool[(j + 11) % max_n];
+        edge[2][j] = pool[(j + 13) % max_n];
+        edge[2][CHUNK + j] = -(edge[2][j] * half);
+    }
+    auto standalone = [&](std::span<const ScalarField> scalars) {
+        return scalar_multiplication::MSM<TypeParam>::msm(
+            chunk_points, PolynomialSpan<const ScalarField>(0, scalars), /*handle_edge_cases=*/true);
+    };
+    {
+        std::vector<PolynomialSpan<ScalarField>> spans;
+        for (auto& scalars : edge) {
+            spans.emplace_back(0, std::span<ScalarField>(scalars));
+        }
+        const auto original = edge;
+        const auto result =
+            scalar_multiplication::MSM_fast<TypeParam>::batch_multi_scalar_mul(chunk_points, spans, false);
+        const AffineElement first_chunk = standalone(std::span<const ScalarField>(edge[0]).first(CHUNK));
+        EXPECT_EQ(to_buffer(result[0]), to_buffer(AffineElement(Element(first_chunk) * ScalarField(3))));
+        EXPECT_TRUE(result[2].is_point_at_infinity());
+        for (size_t k = 0; k < edge.size(); ++k) {
+            EXPECT_EQ(to_buffer(result[k]), to_buffer(standalone(edge[k]))) << "edge-case MSM " << k;
+            EXPECT_EQ(edge[k], original[k]) << "scalars of edge-case MSM " << k << " not restored";
+        }
+    }
+    {
+        std::vector<PolynomialSpan<ScalarField>> spans;
+        spans.emplace_back(0, std::span<ScalarField>(edge[0]));
+        spans.emplace_back(0, std::span<ScalarField>(edge[0]).subspan(CHUNK));
+        spans.emplace_back(0, std::span<ScalarField>(edge[1]));
+        const auto original = edge;
+        const auto result =
+            scalar_multiplication::MSM_fast<TypeParam>::batch_multi_scalar_mul(chunk_points, spans, false);
+        EXPECT_EQ(to_buffer(result[0]), to_buffer(standalone(edge[0])));
+        EXPECT_EQ(to_buffer(result[1]), to_buffer(standalone(std::span<const ScalarField>(edge[0]).subspan(CHUNK))));
+        EXPECT_EQ(to_buffer(result[2]), to_buffer(standalone(edge[1])));
+        EXPECT_EQ(edge, original) << "aliased scalars not restored";
     }
 #endif
 }
