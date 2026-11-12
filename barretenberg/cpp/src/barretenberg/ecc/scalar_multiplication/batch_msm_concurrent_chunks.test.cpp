@@ -28,6 +28,29 @@ class ConcurrencyScope {
     ConcurrencyScope(ConcurrencyScope&&) = delete;
     ConcurrencyScope& operator=(ConcurrencyScope&&) = delete;
 };
+
+// Independent random points and scalars: the affine batch addition assumes no two partial sums in a bucket coincide,
+// which structured points under repeated scalars can violate. Every draw stays on this thread, since under
+// BBERG_DEBUG_LOG the engine is one shared unsynchronised generator; only the point arithmetic runs in parallel.
+template <class Curve>
+void random_points_and_scalars(size_t n,
+                               std::vector<typename Curve::AffineElement>& points,
+                               std::vector<typename Curve::ScalarField>& scalars)
+{
+    using ScalarField = typename Curve::ScalarField;
+    std::vector<ScalarField> discrete_logs(n);
+    scalars.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        discrete_logs[i] = ScalarField::random_element(&engine);
+        scalars[i] = ScalarField::random_element(&engine);
+    }
+    points.resize(n);
+    parallel_for_range(n, [&](size_t start, size_t end) {
+        for (size_t i = start; i < end; ++i) {
+            points[i] = Curve::Group::one * discrete_logs[i];
+        }
+    });
+}
 } // namespace
 
 template <class Curve> class BatchMsmConcurrentChunksTest : public ::testing::Test {};
@@ -121,16 +144,9 @@ TYPED_TEST(BatchMsmConcurrentChunksTest, MatchesStandaloneMsm)
     const std::vector<size_t> wide = { CHUNK, CHUNK + 1, (2 * CHUNK) + 12345 };
     const size_t max_wide = wide.back();
 
-    // Independent random points and scalars: the affine batch addition assumes no two partial sums in a bucket
-    // coincide, which structured points under repeated scalars can violate.
-    std::vector<AffineElement> points(max_wide);
-    std::vector<ScalarField> pool(max_wide);
-    parallel_for_range(max_wide, [&](size_t start, size_t end) {
-        for (size_t i = start; i < end; ++i) {
-            points[i] = AffineElement::random_element(&engine);
-            pool[i] = ScalarField::random_element(&engine);
-        }
-    });
+    std::vector<AffineElement> points;
+    std::vector<ScalarField> pool;
+    random_points_and_scalars<TypeParam>(max_wide, points, pool);
 
     const uint256_t high_bit(0, 0, 0, uint64_t{ 1 } << (200 - 192));
     for (const size_t pool_width : { size_t{ 4 }, size_t{ 8 } }) {
@@ -201,14 +217,9 @@ TYPED_TEST(BatchMsmConcurrentChunksTest, FewWideMembersMatchStandaloneMsm)
     constexpr size_t CHUNK = size_t{ 1 } << 16;
     const std::vector<size_t> sizes = { (3 * CHUNK) + 5, (2 * CHUNK) + 777, (3 * CHUNK) - 3 };
     const size_t max_n = *std::max_element(sizes.begin(), sizes.end());
-    std::vector<AffineElement> points(max_n);
-    std::vector<ScalarField> pool(max_n);
-    parallel_for_range(max_n, [&](size_t start, size_t end) {
-        for (size_t i = start; i < end; ++i) {
-            points[i] = AffineElement::random_element(&engine);
-            pool[i] = ScalarField::random_element(&engine);
-        }
-    });
+    std::vector<AffineElement> points;
+    std::vector<ScalarField> pool;
+    random_points_and_scalars<TypeParam>(max_n, points, pool);
 
     for (const size_t pool_width : { size_t{ 4 }, size_t{ 8 }, size_t{ 12 } }) {
         ConcurrencyScope concurrency(pool_width);
