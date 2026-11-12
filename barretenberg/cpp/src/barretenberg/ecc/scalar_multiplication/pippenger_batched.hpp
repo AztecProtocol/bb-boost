@@ -418,13 +418,44 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
             size_t offset;
             size_t length;
         };
+        // Each member needs at least ceil(n / CONCURRENT_CHUNK_POINTS) parts. The total is then raised to a whole
+        // number of rounds of the pool, because a count just past a multiple of the pool width runs its last round
+        // on a few workers while the rest idle. Each extra part goes to the member whose parts are currently the
+        // largest, so parts stay as equal as the member boundaries allow. When the arena budget below fits fewer
+        // workers than the pool, the last round may be partial.
+        std::vector<size_t> parts(large_members.size());
+        size_t total_parts = 0;
+        for (size_t i = 0; i < large_members.size(); ++i) {
+            parts[i] = (n_input[large_members[i]] + CONCURRENT_CHUNK_POINTS - 1) / CONCURRENT_CHUNK_POINTS;
+            total_parts += parts[i];
+        }
+        const size_t whole_rounds = ((total_parts + pool_width - 1) / pool_width) * pool_width;
+        // Orders members by part size n / parts, compared exactly by cross-multiplication; ties go to the lower index.
+        const auto smaller_parts = [&](size_t a, size_t b) {
+            const size_t lhs = n_input[large_members[a]] * parts[b];
+            const size_t rhs = n_input[large_members[b]] * parts[a];
+            return lhs != rhs ? lhs < rhs : a > b;
+        };
+        std::priority_queue<size_t, std::vector<size_t>, decltype(smaller_parts)> largest_parts(smaller_parts);
+        for (size_t i = 0; i < large_members.size(); ++i) {
+            largest_parts.push(i);
+        }
+        for (size_t added = total_parts; added < whole_rounds; ++added) {
+            const size_t i = largest_parts.top();
+            if (n_input[large_members[i]] <= parts[i]) {
+                break;
+            }
+            largest_parts.pop();
+            ++parts[i];
+            largest_parts.push(i);
+        }
         std::vector<Chunk> chunks;
-        for (size_t m : large_members) {
+        for (size_t i = 0; i < large_members.size(); ++i) {
+            const size_t m = large_members[i];
             const size_t n = n_input[m];
-            const size_t parts = (n + CONCURRENT_CHUNK_POINTS - 1) / CONCURRENT_CHUNK_POINTS;
-            for (size_t k = 0; k < parts; ++k) {
-                const size_t begin = (n * k) / parts;
-                chunks.push_back({ m, begin, ((n * (k + 1)) / parts) - begin });
+            for (size_t k = 0; k < parts[i]; ++k) {
+                const size_t begin = (n * k) / parts[i];
+                chunks.push_back({ m, begin, ((n * (k + 1)) / parts[i]) - begin });
             }
         }
         std::sort(chunks.begin(), chunks.end(), [](const Chunk& a, const Chunk& b) {
