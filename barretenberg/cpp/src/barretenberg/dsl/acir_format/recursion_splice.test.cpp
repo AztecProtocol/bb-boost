@@ -47,6 +47,8 @@ using bb::test_utils::CompareValues;
 using bb::test_utils::expect_same_builder;
 
 constexpr size_t NUM_INNER_PUBLIC_INPUTS = 2;
+// The largest range a small range constraint accepts.
+constexpr uint64_t MAX_SMALL_RANGE = (1ULL << 16) - 1;
 
 // A recursion constraint with a constant-true predicate and the witness vector its indices point into.
 struct InnerProof {
@@ -100,6 +102,15 @@ AcirProgram make_program(const std::vector<const InnerProof*>& proofs)
         constraints.push_back(std::move(constraint));
     }
     return AcirProgram{ .constraints = constraint_to_acir_format(constraints), .witness = witness };
+}
+
+std::vector<uint32_t> inputs_of(const RecursionConstraint& constraint)
+{
+    std::vector<uint32_t> inputs = constraint.proof;
+    inputs.insert(inputs.end(), constraint.key.begin(), constraint.key.end());
+    inputs.insert(inputs.end(), constraint.public_inputs.begin(), constraint.public_inputs.end());
+    inputs.push_back(constraint.key_hash);
+    return inputs;
 }
 
 // Clears every hook when a test ends, whatever its outcome.
@@ -238,6 +249,188 @@ TEST_F(RecursionSpliceTest, RollupConstraint)
 TEST_F(RecursionSpliceTest, EligibleAfterIneligibleIsBuiltSerially)
 {
     expect_spliced({ &*zk_proof, &honk_proofs[0] }, 0);
+}
+
+// The forced refusals hit the middle of three constraints; the first is spliced either way.
+
+TEST_F(RecursionSpliceTest, RefusesWhenTheEngineMoved)
+{
+    const auto [serial, spliced] =
+        build_both(make_program(three_honk_proofs()), {}, [](Builder&, const RecursionConstraint&, size_t index) {
+            if (index == 1) {
+                [[maybe_unused]] const uint64_t extra_draw = numeric::get_randomness().get_random_uint64();
+            }
+        });
+    if (seeded()) {
+        // Every later start position was predicted without the extra draw.
+        EXPECT_EQ(spliced.stats.spliced, 1);
+        EXPECT_EQ(spliced.stats.refused, 2);
+        EXPECT_EQ(spliced.stats.first_refusal, "the engine moved since the scratch build started");
+    } else {
+        // An engine without an order has no position to miss.
+        EXPECT_EQ(spliced.stats.spliced, 3);
+        EXPECT_EQ(spliced.stats.refused, 0);
+    }
+}
+
+TEST_F(RecursionSpliceTest, RefusesATaggedInput)
+{
+    const auto [serial, spliced] =
+        build_both(make_program(three_honk_proofs()),
+                   {},
+                   [](Builder& builder, const RecursionConstraint& constraint, size_t index) {
+                       if (index != 1) {
+                           return;
+                       }
+                       const std::vector<uint32_t> inputs = inputs_of(constraint);
+                       const auto small = std::ranges::find_if(inputs, [&](uint32_t input) {
+                           return uint256_t(builder.get_variable(input)) <= MAX_SMALL_RANGE;
+                       });
+                       ASSERT_NE(small, inputs.end());
+                       builder.create_small_range_constraint(*small, MAX_SMALL_RANGE);
+                   });
+    EXPECT_EQ(spliced.stats.spliced, 2);
+    EXPECT_EQ(spliced.stats.refused, 1);
+    EXPECT_EQ(spliced.stats.first_refusal, "an input carries a range tag");
+}
+
+TEST_F(RecursionSpliceTest, RefusesInputsSharingACycle)
+{
+    const auto [serial, spliced] =
+        build_both(make_program(three_honk_proofs()),
+                   {},
+                   [](Builder& builder, const RecursionConstraint& constraint, size_t index) {
+                       if (index != 1) {
+                           return;
+                       }
+                       std::unordered_map<fr, uint32_t> first_with_value;
+                       for (const uint32_t input : inputs_of(constraint)) {
+                           const auto [it, inserted] = first_with_value.try_emplace(builder.get_variable(input), input);
+                           if (!inserted && it->second != input) {
+                               builder.assert_equal(it->second, input);
+                               return;
+                           }
+                       }
+                       FAIL() << "no two inputs share a value";
+                   });
+    EXPECT_EQ(spliced.stats.spliced, 2);
+    EXPECT_EQ(spliced.stats.refused, 1);
+    EXPECT_EQ(spliced.stats.first_refusal, "inputs share a copy cycle");
+}
+
+TEST_F(RecursionSpliceTest, RefusesAScratchBuildThatThrew)
+{
+    const auto [serial, spliced] = build_both(make_program(three_honk_proofs()), {}, {}, [](size_t index) {
+        if (index == 1) {
+            throw_or_abort("forced scratch build failure");
+        }
+    });
+    EXPECT_EQ(spliced.stats.spliced, 2);
+    EXPECT_EQ(spliced.stats.refused, 1);
+    EXPECT_EQ(spliced.stats.first_refusal, "the scratch build threw");
+}
+
+/**
+ * @brief Records, per thread, each refill of the default engine's entropy buffer and each range a draw consumes.
+ */
+class BufferLog final : public numeric::EntropyBufferObserver {
+  public:
+    struct Fill {
+        std::thread::id thread;
+        size_t size;
+    };
+    struct Consume {
+        std::thread::id thread;
+        uint64_t fill;
+        size_t offset;
+        size_t length;
+    };
+
+    BufferLog() = default;
+    BufferLog(const BufferLog&) = delete;
+    BufferLog(BufferLog&&) = delete;
+    BufferLog& operator=(const BufferLog&) = delete;
+    BufferLog& operator=(BufferLog&&) = delete;
+    // Draws after a failed test must not reach a destroyed log.
+    ~BufferLog() override { numeric::set_entropy_buffer_observer(nullptr); }
+
+    void on_fill(const uint64_t fill, const size_t size) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        fills.emplace(fill, Fill{ std::this_thread::get_id(), size });
+    }
+
+    void on_consume(const uint64_t fill, const size_t offset, const size_t length) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        consumes.push_back({ std::this_thread::get_id(), fill, offset, length });
+    }
+
+    std::mutex mutex;
+    std::unordered_map<uint64_t, Fill> fills;
+    std::vector<Consume> consumes;
+};
+
+TEST_F(RecursionSpliceTest, ScratchThreadsDrawOnlyFromTheirOwnBuffers)
+{
+    if (seeded()) {
+        GTEST_SKIP() << "the entropy buffer belongs to the default engine";
+    }
+    const HookReset reset;
+    constexpr size_t REFUSED = 1;
+    std::mutex mutex;
+    std::map<size_t, std::thread::id> scratch_threads;
+    BufferLog log;
+    numeric::set_entropy_buffer_observer(&log);
+    const Build spliced = build(make_program(three_honk_proofs()), {}, /*splice=*/true, start, {}, [&](size_t index) {
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            scratch_threads.emplace(index, std::this_thread::get_id());
+        }
+        if (index == REFUSED) {
+            throw_or_abort("forced scratch build failure");
+        }
+    });
+    numeric::set_entropy_buffer_observer(nullptr);
+
+    EXPECT_EQ(spliced.stats.spliced, 2);
+    EXPECT_EQ(spliced.stats.refused, 1);
+    ASSERT_EQ(scratch_threads.size(), 3);
+    std::unordered_set<std::thread::id> scratch_ids;
+    for (const auto& [index, thread] : scratch_threads) {
+        scratch_ids.insert(thread);
+    }
+
+    // A scratch thread starts after the observer, so each of its fills is seen and belongs to it.
+    size_t refused_consumes = 0;
+    for (const BufferLog::Consume& consume : log.consumes) {
+        if (consume.fill == 0) {
+            EXPECT_FALSE(scratch_ids.contains(consume.thread));
+            continue;
+        }
+        const auto fill = log.fills.find(consume.fill);
+        ASSERT_NE(fill, log.fills.end());
+        EXPECT_EQ(fill->second.thread, consume.thread);
+        EXPECT_LE(consume.offset + consume.length, fill->second.size);
+        if (fill->second.thread == scratch_threads.at(REFUSED)) {
+            ++refused_consumes;
+        }
+    }
+    // The refused build drew: its draws are consumed by nothing else, because no other thread reads its fills.
+    EXPECT_GT(refused_consumes, 0);
+
+    // No two consumed ranges of one buffer overlap; an unobserved fill is told apart by its thread.
+    std::map<std::pair<uint64_t, std::thread::id>, std::vector<std::pair<size_t, size_t>>> ranges;
+    for (const BufferLog::Consume& consume : log.consumes) {
+        const std::thread::id owner = consume.fill == 0 ? consume.thread : std::thread::id{};
+        ranges[{ consume.fill, owner }].emplace_back(consume.offset, consume.length);
+    }
+    for (auto& [buffer, consumed] : ranges) {
+        std::ranges::sort(consumed);
+        for (size_t i = 1; i < consumed.size(); ++i) {
+            EXPECT_LE(consumed[i - 1].first + consumed[i - 1].second, consumed[i].first);
+        }
+    }
 }
 
 } // namespace
