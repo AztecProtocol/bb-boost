@@ -392,7 +392,9 @@ Bn254G1Points load_bn254_g1_points(const std::filesystem::path& path, size_t num
         std::filesystem::create_directories(path);
         const auto uncompressed_path = path / "bn254_g1.dat";
         FileLockGuard lock((path / "crs.lock").string());
-        if (get_file_size(uncompressed_path) / UNCOMPRESSED_POINT_SIZE >= num_points) {
+        // As in get_bn254_g1_data: the uncompressed cache has no pinned hashes, so a BB_VERIFY_CRS load skips it.
+        if (std::getenv("BB_VERIFY_CRS") == nullptr &&
+            get_file_size(uncompressed_path) / UNCOMPRESSED_POINT_SIZE >= num_points) {
             vinfo("using cached uncompressed bn254 crs at ", uncompressed_path);
             Bn254G1Points result{ allocate(num_points), num_points };
             read_uncompressed_g1_points_into(uncompressed_path, result.points.get(), num_points);
