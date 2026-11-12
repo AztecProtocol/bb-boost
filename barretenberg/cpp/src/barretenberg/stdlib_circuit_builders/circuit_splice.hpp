@@ -7,9 +7,31 @@
 namespace bb {
 
 /**
+ * @brief Lets another thread abandon a build on a recording builder: the builder calls check() before each recording.
+ */
+class SpliceCancellation {
+  public:
+    SpliceCancellation() = default;
+    SpliceCancellation(const SpliceCancellation&) = delete;
+    SpliceCancellation(SpliceCancellation&&) = delete;
+    SpliceCancellation& operator=(const SpliceCancellation&) = delete;
+    SpliceCancellation& operator=(SpliceCancellation&&) = delete;
+    virtual ~SpliceCancellation() = default;
+
+    /**
+     * @brief Runs on the recording thread before each recording; a throw abandons the build, whose builder must then
+     * only be destroyed.
+     */
+    virtual void check() = 0;
+};
+
+/**
  * @brief Selects the builder constructor whose builder records what UltraCircuitBuilder_::splice must replay of it.
  */
-struct SpliceRecording {};
+struct SpliceRecording {
+    // Checked before each recording when set; it must outlive the builder.
+    SpliceCancellation* cancellation = nullptr;
+};
 
 /**
  * @brief What a builder constructed with SpliceRecording records of its own construction: the changes to copy cycles
@@ -49,6 +71,8 @@ struct SpliceLog {
     std::vector<Event> events;
     std::vector<Constant> constants;
     std::vector<RangeList> range_lists;
+
+    SpliceCancellation* cancellation = nullptr;
 };
 
 /**

@@ -241,6 +241,15 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     // Set only on a builder constructed with SpliceRecording.
     std::optional<SpliceLog> splice_log_;
 
+    // The log of a recording builder, once its cancellation, if any, has let the recording go on.
+    SpliceLog& recording_log()
+    {
+        if (splice_log_->cancellation != nullptr) {
+            splice_log_->cancellation->check();
+        }
+        return *splice_log_;
+    }
+
   public:
     // Storage for wires and selectors for all gate types
     ExecutionTrace blocks;
@@ -349,9 +358,10 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     /**
      * @brief A builder that records what splice must replay of the circuit then built on it.
      * @details Its variables start with one per value of `seed_values`, in order, followed by the zero constant; the
-     * circuit is built on these seeds and later appended to another builder by that builder's splice.
+     * circuit is built on these seeds and later appended to another builder by that builder's splice. Each recording
+     * first calls `recording.cancellation->check()` when it is set.
      */
-    UltraCircuitBuilder_(SpliceRecording /*unused*/, std::span<const FF> seed_values)
+    UltraCircuitBuilder_(SpliceRecording recording, std::span<const FF> seed_values)
         requires(!ExecutionTrace::IS_MEGA_ARITHMETIZATION)
         : CircuitBuilderBase<FF>(false)
     {
@@ -369,6 +379,7 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         log.num_prefix_arithmetic_rows = blocks.arithmetic.size();
         log.num_prefix_gates = this->num_gates();
         log.num_prefix_used_witnesses = used_witnesses.size();
+        log.cancellation = recording.cancellation;
         splice_log_.emplace(std::move(log));
     }
 
@@ -523,7 +534,7 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     void assert_equal(const uint32_t a_idx, const uint32_t b_idx, std::string const& msg = "assert_equal") override
     {
         if (splice_log_.has_value()) [[unlikely]] {
-            splice_log_->events.push_back({ SpliceLog::Event::Kind::AssertEqual, a_idx, b_idx });
+            recording_log().events.push_back({ SpliceLog::Event::Kind::AssertEqual, a_idx, b_idx });
         }
         CircuitBuilderBase<FF>::assert_equal(a_idx, b_idx, msg);
     }
@@ -646,7 +657,7 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
 
         BB_ASSERT_EQ(this->real_variable_tags[this->real_variable_index[variable_index]], DEFAULT_TAG);
         if (splice_log_.has_value()) [[unlikely]] {
-            splice_log_->events.push_back({ SpliceLog::Event::Kind::Tag, variable_index, tag });
+            recording_log().events.push_back({ SpliceLog::Event::Kind::Tag, variable_index, tag });
         }
         this->real_variable_tags[this->real_variable_index[variable_index]] = tag;
     }

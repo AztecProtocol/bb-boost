@@ -1,3 +1,5 @@
+#include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/throw_or_abort.hpp"
 #include "barretenberg/stdlib_circuit_builders/ultra_circuit_builder.hpp"
 #include "barretenberg/stdlib_circuit_builders/ultra_circuit_builder_test_utils.hpp"
 
@@ -393,6 +395,34 @@ TEST(UltraCircuitBuilderSplice, RecordingBuilderReleasesBlocksUnderTheDefaultFlo
     recording.release_storage_pages();
     EXPECT_TRUE(probes_released(recording));
 #endif
+}
+
+// Counts the checks of a recording builder and throws from them once requested.
+class CountingCancellation final : public SpliceCancellation {
+  public:
+    void check() override
+    {
+        ++checks;
+        if (requested) {
+            throw_or_abort("cancelled");
+        }
+    }
+
+    size_t checks = 0;
+    bool requested = false;
+};
+
+TEST(UltraCircuitBuilderSplice, RecordingChecksItsCancellationBeforeEachRecording)
+{
+    CountingCancellation cancellation;
+    Builder recording(SpliceRecording{ .cancellation = &cancellation }, std::vector<fr>{ fr(5), fr(5), fr(7) });
+    recording.assert_equal(0, 1);
+    EXPECT_EQ(cancellation.checks, 1);
+    // A gate records nothing.
+    recording.create_add_gate({ 0, 1, 2, fr(1), fr(1), fr(-1), fr(-3) });
+    EXPECT_EQ(cancellation.checks, 1);
+    cancellation.requested = true;
+    EXPECT_THROW_OR_ABORT(recording.assert_equal(0, 2), "cancelled");
 }
 
 } // namespace
