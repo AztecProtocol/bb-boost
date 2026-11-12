@@ -2328,6 +2328,10 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::fr
 
 template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::release_storage_pages() noexcept
 {
+    if (splice_log_.has_value()) {
+        release_recording_storage_pages();
+        return;
+    }
     // Holds far more blocks than a circuit has at or above the release floor; blocks past it are just freed as usual.
     constexpr size_t MAX_RELEASED_BLOCKS = 128;
     PageBlockList<MAX_RELEASED_BLOCKS> released;
@@ -2335,6 +2339,48 @@ template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::re
         block.tiles.add_chunks_to(released);
     }
     this->add_variable_storage_to(released);
+    released.release();
+}
+
+template <typename ExecutionTrace> void UltraCircuitBuilder_<ExecutionTrace>::release_recording_storage_pages() noexcept
+{
+    constexpr size_t BATCH_BLOCKS = 128;
+    BatchedPageRelease<BATCH_BLOCKS> released(
+        PageReleaseFloors{ .min_block_bytes = RECORDING_RELEASE_MIN_BLOCK_BYTES, .min_total_bytes = 0 });
+    // Only elements that own nothing: zeroing a vector of vectors would leak the inner ones.
+    const auto add = [&released]<typename T>(std::vector<T>& vec) noexcept {
+        static_assert(std::is_trivially_destructible_v<T>);
+        released.add(vec.data(), vec.capacity() * sizeof(T), vec.size() * sizeof(T));
+    };
+    for (const auto& block : blocks.get()) {
+        block.tiles.add_chunks_to(released);
+    }
+    this->add_variable_storage_to(released);
+    for (auto& [target_range, list] : range_lists) {
+        add(list.variable_indices);
+    }
+    for (auto& array : rom_ram_logic.rom_arrays) {
+        add(array.state);
+        add(array.records);
+    }
+    for (auto& array : rom_ram_logic.ram_arrays) {
+        add(array.state);
+        add(array.records);
+    }
+    for (auto& table : lookup_tables) {
+        add(table.column_1);
+        add(table.column_2);
+        add(table.column_3);
+        add(table.lookup_gate_rows);
+    }
+    add(memory_read_records);
+    add(memory_write_records);
+    add(rom_logup_records);
+    add(cached_partial_non_native_field_multiplications);
+    add(used_witnesses);
+    add(splice_log_->events);
+    add(splice_log_->constants);
+    add(splice_log_->range_lists);
     released.release();
 }
 

@@ -404,5 +404,41 @@ TEST(UltraCircuitBuilderSplice, RefusesEllipticRow)
         SpliceRefusal::RowForm);
 }
 
+TEST(UltraCircuitBuilderSplice, RecordingBuilderReleasesBlocksUnderTheDefaultFloors)
+{
+// Released anonymous pages read back as zeros only on Linux.
+#if !defined(__linux__) || defined(NO_MULTITHREADING)
+    GTEST_SKIP() << "needs Linux and native threads";
+#else
+    // About 27 MiB of gate tiles and 4 MiB of values: every block is under the 32 MiB floor, and the total is under the
+    // 64 MiB minimum, of a builder that does not record.
+    constexpr size_t NUM_WITNESSES = 100'000;
+    // A tile in the middle of the largest tile chunk, and a variable in the middle of every per-variable array.
+    constexpr size_t PROBE_TILE = 10'000;
+    constexpr uint32_t PROBE_VARIABLE = NUM_WITNESSES / 2;
+    const auto fill = [](Builder& builder) {
+        for (size_t i = 0; i < NUM_WITNESSES; ++i) {
+            add_witness(builder, fr(i + 1));
+        }
+    };
+    const auto probes_released = [](const Builder& builder) {
+        return builder.get_variables()[PROBE_VARIABLE] == fr(0) && builder.real_variable_index[PROBE_VARIABLE] == 0 &&
+               builder.blocks.arithmetic.tiles[PROBE_TILE].wires[0][0] == 0;
+    };
+
+    Builder plain;
+    fill(plain);
+    ASSERT_FALSE(probes_released(plain));
+    plain.release_storage_pages();
+    EXPECT_FALSE(probes_released(plain));
+
+    Builder recording(SpliceRecording{}, std::vector<fr>{ fr(5) });
+    fill(recording);
+    ASSERT_FALSE(probes_released(recording));
+    recording.release_storage_pages();
+    EXPECT_TRUE(probes_released(recording));
+#endif
+}
+
 } // namespace
 } // namespace bb

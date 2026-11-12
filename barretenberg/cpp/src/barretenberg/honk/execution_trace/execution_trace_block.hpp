@@ -218,10 +218,11 @@ template <typename Tile, size_t ChunkShift = 8> class TileChunks {
     size_t capacity() const { return chunks_.size() * CHUNK_TILES; }
 
     /**
-     * @brief Adds every chunk to `blocks`, so the pages of the tiles can be released just before the store is freed.
-     * @details Chunks under the release floor (all of them at the default chunk size) are skipped by `blocks.add`.
+     * @brief Adds every chunk to `blocks` (a PageBlockList or BatchedPageRelease), so the pages of the tiles can be
+     * released just before the store is freed.
+     * @details Chunks under the release floor are skipped by `blocks.add`.
      */
-    template <size_t N> void add_chunks_to(PageBlockList<N>& blocks) const noexcept
+    template <typename Blocks> void add_chunks_to(Blocks& blocks) const noexcept
     {
         // Tiles fill the chunks in order, so the tiles in use in a chunk are a prefix of it.
         for (size_t c = 0; c < chunks_.size(); ++c) {

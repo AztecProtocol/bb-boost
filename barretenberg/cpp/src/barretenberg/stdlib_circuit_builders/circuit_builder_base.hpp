@@ -349,7 +349,7 @@ template <typename FF_> class CircuitBuilderBase {
      * be released just before they are freed. Each vector qualifies by its capacity, but only its elements are
      * released.
      */
-    template <size_t N> void add_variable_storage_to(PageBlockList<N>& blocks) noexcept
+    template <typename Blocks> void add_variable_storage_to(Blocks& blocks) noexcept
     {
         const auto add = [&blocks]<typename T>(std::vector<T>& vec) noexcept {
             blocks.add(vec.data(), vec.capacity() * sizeof(T), vec.size() * sizeof(T));

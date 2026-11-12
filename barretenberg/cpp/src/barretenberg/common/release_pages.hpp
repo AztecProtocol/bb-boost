@@ -48,6 +48,20 @@ inline constexpr size_t MIN_PARALLEL_RELEASE_BYTES = size_t{ 64 } << 20;
 inline constexpr size_t BYTES_PER_THREAD = size_t{ 16 } << 20;
 inline constexpr size_t MAX_THREADS = 16;
 
+} // namespace release_pages_detail
+
+/**
+ * @brief The sizes below which the list form of release_pages_in_parallel leaves memory to the allocator.
+ */
+struct PageReleaseFloors {
+    // A block whose allocation is smaller is skipped.
+    size_t min_block_bytes = MIN_PAGE_RELEASE_BLOCK_BYTES;
+    // Nothing is released when the used bytes of the blocks that are not skipped total less.
+    size_t min_total_bytes = release_pages_detail::MIN_PARALLEL_RELEASE_BYTES;
+};
+
+namespace release_pages_detail {
+
 #if !defined(__wasm__) && !defined(_WIN32) && !defined(NO_MULTITHREADING) && defined(MADV_DONTNEED)
 struct PageRange {
     uintptr_t begin = 0;
@@ -55,9 +69,9 @@ struct PageRange {
 };
 
 // The whole pages strictly inside an eligible block's used bytes, never allocator metadata next to the block.
-inline PageRange whole_pages(const PageBlock& block, uintptr_t page)
+inline PageRange whole_pages(const PageBlock& block, uintptr_t page, size_t min_block_bytes)
 {
-    if (block.ptr == nullptr || block.bytes < MIN_PAGE_RELEASE_BLOCK_BYTES) {
+    if (block.ptr == nullptr || block.bytes < min_block_bytes) {
         return {};
     }
     const auto lo = reinterpret_cast<uintptr_t>(block.ptr);
@@ -70,6 +84,7 @@ inline PageRange whole_pages(const PageBlock& block, uintptr_t page)
 struct Slice {
     const PageBlock* blocks = nullptr;
     size_t num_blocks = 0;
+    size_t min_block_bytes = 0;
     uintptr_t page = 0;
     size_t first_page = 0;
     size_t end_page = 0;
@@ -80,7 +95,7 @@ inline void* release_slice(void* arg)
     const auto* slice = static_cast<const Slice*>(arg);
     size_t block_first_page = 0;
     for (size_t i = 0; i < slice->num_blocks && block_first_page < slice->end_page; ++i) {
-        const PageRange range = whole_pages(slice->blocks[i], slice->page);
+        const PageRange range = whole_pages(slice->blocks[i], slice->page, slice->min_block_bytes);
         const size_t num_pages = (range.end - range.begin) / slice->page;
         const size_t lo = std::max(block_first_page, slice->first_page);
         const size_t hi = std::min(block_first_page + num_pages, slice->end_page);
@@ -107,15 +122,16 @@ inline void* release_slice(void* arg)
  * whatever the block boundaries. Blocks whose allocation is under MIN_PAGE_RELEASE_BLOCK_BYTES (32 MiB) are skipped,
  * since the allocator may keep them in a malloc arena rather than unmap them on free, and nothing is released when the
  * used bytes of the remaining blocks total under 64 MiB, so a large reserve that was never written starts no threads.
- * The released blocks' contents are lost: call this only immediately before freeing them. Never throws, and uses
- * short-lived threads rather than the parallel_for pool, so it is safe from destructors running on any thread,
- * including inside a parallel_for. A no-op without native threads.
+ * Both floors can be lowered through `floors`. The released blocks' contents are lost: call this only immediately
+ * before freeing them. Never throws, and uses short-lived threads rather than the parallel_for pool, so it is safe from
+ * destructors running on any thread, including inside a parallel_for. A no-op without native threads.
  *
  * @return Whether the release was attempted: true once the qualifying pages have been handed to madvise, whether or not
  * every call succeeded, so the caller need not release them again; false when nothing qualified or without native
  * threads.
  */
-inline bool release_pages_in_parallel([[maybe_unused]] std::span<const PageBlock> blocks) noexcept
+inline bool release_pages_in_parallel([[maybe_unused]] std::span<const PageBlock> blocks,
+                                      [[maybe_unused]] const PageReleaseFloors& floors = {}) noexcept
 {
 #if !defined(__wasm__) && !defined(_WIN32) && !defined(NO_MULTITHREADING) && defined(MADV_DONTNEED)
     using namespace release_pages_detail;
@@ -123,21 +139,24 @@ inline bool release_pages_in_parallel([[maybe_unused]] std::span<const PageBlock
     size_t eligible_bytes = 0;
     size_t num_pages = 0;
     for (const PageBlock& block : blocks) {
-        const PageRange range = whole_pages(block, page);
+        const PageRange range = whole_pages(block, page, floors.min_block_bytes);
         if (range.end > range.begin) {
             eligible_bytes += std::min(block.used_bytes, block.bytes);
             num_pages += (range.end - range.begin) / page;
         }
     }
-    if (eligible_bytes < MIN_PARALLEL_RELEASE_BYTES || num_pages == 0) {
+    if (eligible_bytes < floors.min_total_bytes || num_pages == 0) {
         return false;
     }
     const size_t num_threads = std::clamp<size_t>((num_pages * page) / BYTES_PER_THREAD, 1, MAX_THREADS);
     std::array<Slice, MAX_THREADS> slices{};
     for (size_t t = 0; t < num_threads; ++t) {
-        slices[t] = {
-            blocks.data(), blocks.size(), page, (num_pages * t) / num_threads, (num_pages * (t + 1)) / num_threads
-        };
+        slices[t] = { blocks.data(),
+                      blocks.size(),
+                      floors.min_block_bytes,
+                      page,
+                      (num_pages * t) / num_threads,
+                      (num_pages * (t + 1)) / num_threads };
     }
     // pthread_create reports failure by its return value and the handles live in a fixed array, so nothing here can
     // throw, including a failed allocation: this runs inside deleters and noexcept releases.
@@ -181,14 +200,19 @@ inline void release_pages_in_parallel(void* ptr, size_t bytes)
  */
 template <size_t N> class PageBlockList {
   public:
+    constexpr PageBlockList() noexcept = default;
+    constexpr explicit PageBlockList(const PageReleaseFloors& floors) noexcept
+        : floors_(floors)
+    {}
+
     /**
-     * @brief Adds a block of `bytes` whose first `used_bytes` are in use, if the block is at least
-     * MIN_PAGE_RELEASE_BLOCK_BYTES and the list has room; only pages inside the used bytes are released.
+     * @brief Adds a block of `bytes` whose first `used_bytes` are in use, if the block reaches the list's block floor
+     * (MIN_PAGE_RELEASE_BLOCK_BYTES by default) and the list has room; only pages inside the used bytes are released.
      * @return Whether the block was added; a block that was not is left to the allocator.
      */
     bool add(void* ptr, size_t bytes, size_t used_bytes) noexcept
     {
-        if (ptr == nullptr || bytes < MIN_PAGE_RELEASE_BLOCK_BYTES || size_ == N) {
+        if (ptr == nullptr || bytes < floors_.min_block_bytes || size_ == N) {
             return false;
         }
         blocks_[size_++] = PageBlock{ ptr, bytes, used_bytes };
@@ -207,12 +231,51 @@ template <size_t N> class PageBlockList {
      */
     bool release() const noexcept
     {
-        return release_pages_in_parallel(std::span<const PageBlock>(blocks_.data(), size_));
+        return release_pages_in_parallel(std::span<const PageBlock>(blocks_.data(), size_), floors_);
+    }
+
+    bool full() const noexcept { return size_ == N; }
+
+    void clear() noexcept { size_ = 0; }
+
+  private:
+    PageReleaseFloors floors_{};
+    std::array<PageBlock, N> blocks_{};
+    size_t size_ = 0;
+};
+
+/**
+ * @brief A PageBlockList that releases its blocks whenever it is full, so it takes any number of blocks; adding never
+ * allocates or throws.
+ */
+template <size_t N> class BatchedPageRelease {
+  public:
+    constexpr explicit BatchedPageRelease(const PageReleaseFloors& floors) noexcept
+        : list_(floors)
+    {}
+
+    /**
+     * @brief Adds a block as PageBlockList::add does, first releasing the blocks added so far if the list is full.
+     */
+    void add(void* ptr, size_t bytes, size_t used_bytes) noexcept
+    {
+        if (list_.full()) {
+            release();
+        }
+        list_.add(ptr, bytes, used_bytes);
+    }
+
+    /**
+     * @brief Releases the blocks added since the last release; call it only immediately before freeing them.
+     */
+    void release() noexcept
+    {
+        list_.release();
+        list_.clear();
     }
 
   private:
-    std::array<PageBlock, N> blocks_{};
-    size_t size_ = 0;
+    PageBlockList<N> list_;
 };
 
 } // namespace bb

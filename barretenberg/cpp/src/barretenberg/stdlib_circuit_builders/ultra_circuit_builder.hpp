@@ -690,10 +690,22 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     void process_range_list(RangeList& list);
     void process_range_lists();
 
-  private:
-    // Releases the pages of the gate tiles and the variable arrays from one team of threads, just before they are
-    // freed.
+    /**
+     * @brief Hand the pages of the builder's storage back to the OS from one team of threads; the destructor calls it.
+     * @details The builder's contents are lost: call it only right before destroying the builder. A builder that does
+     * not record releases its gate tiles and variable arrays under the default floors of release_pages_in_parallel. A
+     * recording builder releases every block of at least RECORDING_RELEASE_MIN_BLOCK_BYTES that it owns with trivially
+     * destructible elements (gate tiles, variable arrays, range lists, ROM/RAM transcripts and records, cached
+     * multiplications, lookup tables, tooling lists and its log), whatever their total.
+     */
     void release_storage_pages() noexcept;
+
+    // A recording builder is filled on another thread, so the allocator keeps even its smaller blocks in that thread's
+    // malloc arena, where free() leaves their pages resident and unusable by the thread that frees them.
+    static constexpr size_t RECORDING_RELEASE_MIN_BLOCK_BYTES = size_t{ 64 } << 10;
+
+  private:
+    void release_recording_storage_pages() noexcept;
 
     // One bit per variable; every bit is clear between range lists.
     using VariableBitmap = std::vector<std::atomic<uint64_t>>;
