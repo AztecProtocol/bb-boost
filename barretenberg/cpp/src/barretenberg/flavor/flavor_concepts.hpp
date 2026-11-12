@@ -2,8 +2,11 @@
 
 // Establish concepts for testing flavor attributes
 #include "barretenberg/common/type_traits.hpp"
+#include "barretenberg/common/zip_view.hpp"
 #include "barretenberg/stdlib/primitives/circuit_builders/circuit_builders_fwd.hpp"
 #include <cstddef>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <type_traits>
 namespace bb {
@@ -84,11 +87,29 @@ template <typename T> concept IsGrumpkinFlavor = IsAnyOf<T, ECCVMFlavor, ECCVMSh
 // Flavors whose Sumcheck round univariates are committed (sent as commitment + evals at 0,1)
 // rather than sent in the clear. The committed data is later verified via Shplemini.
 template <typename T> concept UsesCommittedSumcheck = IsGrumpkinFlavor<T>;
+template <typename T> struct SpanValueType { using type = void; };
+template <typename T, size_t Extent> struct SpanValueType<std::span<T, Extent>> { using type = std::remove_cv_t<T>; };
+
 template <typename Container, typename Element>
 inline std::string flavor_get_label(Container&& container, const Element& element) {
-    for (auto [label, data] : zip_view(container.get_labels(), container.get_all())) {
-        if (&data == &element) {
-            return label;
+    using All = std::remove_cvref_t<decltype(container.get_all())>;
+    if constexpr (std::is_same_v<typename SpanValueType<All>::type, std::remove_cv_t<Element>>) {
+        // Entities held in one span: an element's position is its address offset, an O(1) lookup. The zip_view keeps
+        // the check that there is one label per entity.
+        const auto labels = container.get_labels();
+        const auto all = container.get_all();
+        [[maybe_unused]] const zip_view one_label_per_entity(labels, all);
+        const auto first = reinterpret_cast<uintptr_t>(all.data());
+        const auto address = reinterpret_cast<uintptr_t>(&element);
+        if (address >= first && (address - first) % sizeof(Element) == 0 &&
+            (address - first) / sizeof(Element) < all.size()) {
+            return labels[(address - first) / sizeof(Element)];
+        }
+    } else {
+        for (auto [label, data] : zip_view(container.get_labels(), container.get_all())) {
+            if (&data == &element) {
+                return label;
+            }
         }
     }
     return "(unknown label)";
