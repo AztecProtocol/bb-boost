@@ -336,10 +336,17 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         // decompositions, gadget internals — typically 4-40x); reserve generously so the
         // per-variable bookkeeping vectors do not repeatedly reallocate during construction.
         // 4x keeps the transient over-allocation for large-witness circuits within a few MB.
+        // This witness-count hint is the capacity wherever address space is not reserved.
         constexpr size_t VARIABLES_PER_ACIR_WITNESS_HINT = 4;
         constexpr size_t MIN_VARIABLES_RESERVE = 1 << 16;
-        this->reserve_variables(
-            std::max(witness_values.size() * VARIABLES_PER_ACIR_WITNESS_HINT, MIN_VARIABLES_RESERVE));
+        const size_t hint = std::max(witness_values.size() * VARIABLES_PER_ACIR_WITNESS_HINT, MIN_VARIABLES_RESERVE);
+        // Mega circuits are built many in turn by one process. Hint-sized buffers may reuse warm heap blocks, where a
+        // reservation is a fresh mapping each time and its capacity qualifies all five arrays for the page release.
+        if constexpr (ExecutionTrace::IS_MEGA_ARITHMETIZATION) {
+            this->reserve_variables(hint);
+        } else {
+            this->reserve_variables_address_space(hint);
+        }
         for (const auto value : witness_values) {
             this->add_variable(value);
         }
@@ -365,7 +372,7 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         requires(!ExecutionTrace::IS_MEGA_ARITHMETIZATION)
         : CircuitBuilderBase<FF>(false)
     {
-        this->reserve_variables(seed_values.size() + 1);
+        this->reserve_variables_address_space(seed_values.size() + 1);
         for (const FF& value : seed_values) {
             this->add_variable(value);
         }

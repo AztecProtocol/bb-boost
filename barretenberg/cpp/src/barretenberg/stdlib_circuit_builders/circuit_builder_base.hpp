@@ -5,6 +5,7 @@
 // =====================
 
 #pragma once
+#include "barretenberg/common/address_space_reserve.hpp"
 #include "barretenberg/common/assert.hpp"
 #include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/ecc/curves/bn254/bn254.hpp"
@@ -329,6 +330,43 @@ template <typename FF_> class CircuitBuilderBase {
         real_variable_tags.reserve(capacity);
     }
 
+    // Entries reserved per per-variable vector where address space may be reserved: 2^25 x 48 bytes = 1.5 GiB for the
+    // five with a 32-byte FF. Chosen for address space, not derived from any circuit or input; beyond it the vectors
+    // grow as std::vector does.
+    static constexpr size_t VARIABLES_ADDRESS_SPACE_ENTRIES = size_t{ 1 } << 25;
+
+    /**
+     * @brief Reserve the per-variable vectors for VARIABLES_ADDRESS_SPACE_ENTRIES variables when
+     * address_space_reservation_allowed() and all five reservations succeed, else for `fallback` as reserve_variables.
+     */
+    void reserve_variables_address_space(size_t fallback)
+    {
+        _variables_reservation.value = VariablesReservation::NotAttempted;
+        if (fallback < VARIABLES_ADDRESS_SPACE_ENTRIES && address_space_reservation_allowed()) {
+            if (try_reserve_address_space(VARIABLES_ADDRESS_SPACE_ENTRIES,
+                                          variables,
+                                          real_variable_index,
+                                          next_var_index,
+                                          prev_var_index,
+                                          real_variable_tags)) {
+                _variables_reservation.value = VariablesReservation::Reserved;
+                return;
+            }
+            _variables_reservation.value = VariablesReservation::Refused;
+        }
+        reserve_variables(fallback);
+    }
+
+    /**
+     * @brief What the last reserve_variables_address_space call did, which the Ultra ACIR and seed constructors make
+     * first; not the vectors' current capacity, which free_variables, for one, releases without changing this.
+     * @details NotAttempted: reservation is not allowed, or the fallback already reaches the reservation (also for a
+     * builder that never made the call). Refused: try_reserve_address_space returned false, because the allocator
+     * refused or a vector already had capacity, and the call went on to reserve the fallback. Reserved: otherwise.
+     */
+    enum class VariablesReservation : uint8_t { NotAttempted, Refused, Reserved };
+    VariablesReservation variables_reservation() const { return _variables_reservation.value; }
+
     // Disallow add_variable for non-FF types to prevent implicit conversions (specifically, using indices rather
     // than values)
     template <typename OT> uint32_t add_variable(const OT& in) = delete;
@@ -368,6 +406,13 @@ template <typename FF_> class CircuitBuilderBase {
 
     // True if we are writing a vk; used to disable certain warnings
     bool _is_write_vk_mode = false;
+
+    // Not part of a builder's identity: builders holding the same circuit are equal whatever their reservation did.
+    struct VariablesReservationRecord {
+        VariablesReservation value = VariablesReservation::NotAttempted;
+        bool operator==(const VariablesReservationRecord& /*other*/) const { return true; }
+    };
+    VariablesReservationRecord _variables_reservation;
 
   protected:
     std::unordered_map<uint32_t, std::string> variable_names;
