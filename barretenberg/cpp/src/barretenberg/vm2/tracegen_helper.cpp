@@ -475,6 +475,11 @@ void AvmTraceGenHelper::fill_trace_interactions(TraceContainer& trace)
         for (auto& job : jobs_interactions) {
             job->finish();
         }
+
+        // On a large transaction the jobs and the shared indices hold millions of row lists: free them on the pool,
+        // the jobs first, since they point into the indices.
+        bb::parallel_for(jobs_interactions.size(), [&](size_t i) { jobs_interactions[i].reset(); });
+        index_cache.release_in_parallel();
     }
 }
 
