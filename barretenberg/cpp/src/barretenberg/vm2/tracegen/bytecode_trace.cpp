@@ -1,8 +1,12 @@
 #include "barretenberg/vm2/tracegen/bytecode_trace.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <vector>
 
 #include "barretenberg/aztec/aztec_constants.hpp"
@@ -24,6 +28,117 @@ namespace bb::avm2::tracegen {
 using Poseidon2 = bb::crypto::Poseidon2<bb::crypto::Poseidon2Bn254ScalarFieldParams>;
 using C = Column;
 
+namespace {
+
+// Since next_packed_pc - pc is always in the range [0, 31), the inverses are precomputed.
+std::array<FF, 31> next_packed_pc_min_pc_inverses()
+{
+    std::vector<FF> inverses = { 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+                                 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30 };
+    FF::batch_invert(inverses);
+    std::array<FF, 31> out;
+    std::copy(inverses.begin(), inverses.end(), out.begin());
+    return out;
+}
+
+// The decomposition of byte i of a bytecode: its position, the remaining bytes and the sliding window.
+void set_decomposition_row(
+    TraceContainer& trace, uint32_t row, const std::vector<uint8_t>& bytecode, const BytecodeId& id, uint32_t i)
+{
+    auto bytecode_at = [&bytecode](size_t k) -> uint8_t { return k < bytecode.size() ? bytecode[k] : 0; };
+    const uint32_t bytecode_len = static_cast<uint32_t>(bytecode.size());
+    const uint32_t remaining = bytecode_len - i;
+    const uint32_t bytes_to_read = std::min(remaining, DECOMPOSE_WINDOW_SIZE);
+    const bool is_last = remaining == 1;
+    const bool is_windows_eq_remaining = remaining == DECOMPOSE_WINDOW_SIZE;
+
+    // Check that we still expect the max public bytecode in bytes to fit within 24 bits (i.e. <= 0xffffff).
+    static_assert(MAX_PACKED_PUBLIC_BYTECODE_SIZE_IN_FIELDS * 31 <= 0xffffff);
+
+    // We set the decomposition in bytes, and other values.
+    trace.set(row,
+              { {
+                  { C::bc_decomposition_sel, 1 },
+                  { C::bc_decomposition_id, id },
+                  { C::bc_decomposition_pc, i },
+                  { C::bc_decomposition_start, i == 0 ? 1 : 0 },
+                  { C::bc_decomposition_last_of_contract, is_last ? 1 : 0 },
+                  { C::bc_decomposition_bytes_remaining, remaining },
+                  { C::bc_decomposition_bytes_to_read, bytes_to_read },
+                  { C::bc_decomposition_sel_windows_gt_remaining, DECOMPOSE_WINDOW_SIZE > remaining ? 1 : 0 },
+                  { C::bc_decomposition_sel_windows_eq_remaining, is_windows_eq_remaining ? 1 : 0 },
+                  // Inverses will be calculated in batch later.
+                  { C::bc_decomposition_bytes_rem_inv, remaining },
+                  { C::bc_decomposition_bytes_rem_min_one_inv, is_last ? 0 : FF(remaining - 1) },
+                  { C::bc_decomposition_windows_min_remaining_inv,
+                    is_windows_eq_remaining ? 0 : FF(DECOMPOSE_WINDOW_SIZE) - FF(remaining) },
+                  // Sliding window.
+                  { C::bc_decomposition_bytes, bytecode_at(i) },
+                  { C::bc_decomposition_bytes_pc_plus_1, bytecode_at(i + 1) },
+                  { C::bc_decomposition_bytes_pc_plus_2, bytecode_at(i + 2) },
+                  { C::bc_decomposition_bytes_pc_plus_3, bytecode_at(i + 3) },
+                  { C::bc_decomposition_bytes_pc_plus_4, bytecode_at(i + 4) },
+                  { C::bc_decomposition_bytes_pc_plus_5, bytecode_at(i + 5) },
+                  { C::bc_decomposition_bytes_pc_plus_6, bytecode_at(i + 6) },
+                  { C::bc_decomposition_bytes_pc_plus_7, bytecode_at(i + 7) },
+                  { C::bc_decomposition_bytes_pc_plus_8, bytecode_at(i + 8) },
+                  { C::bc_decomposition_bytes_pc_plus_9, bytecode_at(i + 9) },
+                  { C::bc_decomposition_bytes_pc_plus_10, bytecode_at(i + 10) },
+                  { C::bc_decomposition_bytes_pc_plus_11, bytecode_at(i + 11) },
+                  { C::bc_decomposition_bytes_pc_plus_12, bytecode_at(i + 12) },
+                  { C::bc_decomposition_bytes_pc_plus_13, bytecode_at(i + 13) },
+                  { C::bc_decomposition_bytes_pc_plus_14, bytecode_at(i + 14) },
+                  { C::bc_decomposition_bytes_pc_plus_15, bytecode_at(i + 15) },
+                  { C::bc_decomposition_bytes_pc_plus_16, bytecode_at(i + 16) },
+                  { C::bc_decomposition_bytes_pc_plus_17, bytecode_at(i + 17) },
+                  { C::bc_decomposition_bytes_pc_plus_18, bytecode_at(i + 18) },
+                  { C::bc_decomposition_bytes_pc_plus_19, bytecode_at(i + 19) },
+                  { C::bc_decomposition_bytes_pc_plus_20, bytecode_at(i + 20) },
+                  { C::bc_decomposition_bytes_pc_plus_21, bytecode_at(i + 21) },
+                  { C::bc_decomposition_bytes_pc_plus_22, bytecode_at(i + 22) },
+                  { C::bc_decomposition_bytes_pc_plus_23, bytecode_at(i + 23) },
+                  { C::bc_decomposition_bytes_pc_plus_24, bytecode_at(i + 24) },
+                  { C::bc_decomposition_bytes_pc_plus_25, bytecode_at(i + 25) },
+                  { C::bc_decomposition_bytes_pc_plus_26, bytecode_at(i + 26) },
+                  { C::bc_decomposition_bytes_pc_plus_27, bytecode_at(i + 27) },
+                  { C::bc_decomposition_bytes_pc_plus_28, bytecode_at(i + 28) },
+                  { C::bc_decomposition_bytes_pc_plus_29, bytecode_at(i + 29) },
+                  { C::bc_decomposition_bytes_pc_plus_30, bytecode_at(i + 30) },
+                  { C::bc_decomposition_bytes_pc_plus_31, bytecode_at(i + 31) },
+                  { C::bc_decomposition_bytes_pc_plus_32, bytecode_at(i + 32) },
+                  { C::bc_decomposition_bytes_pc_plus_33, bytecode_at(i + 33) },
+                  { C::bc_decomposition_bytes_pc_plus_34, bytecode_at(i + 34) },
+                  { C::bc_decomposition_bytes_pc_plus_35, bytecode_at(i + 35) },
+                  { C::bc_decomposition_bytes_pc_plus_36, bytecode_at(i + 36) },
+              } });
+}
+
+// The 31 bytes of a bytecode from byte i, as a field.
+FF packed_field_at(const std::vector<uint8_t>& bytecode, size_t i)
+{
+    const uint32_t bytecode_len = static_cast<uint32_t>(bytecode.size());
+    // We need to read uint256_ts because reading FFs messes up the order of the bytes.
+    uint256_t as_int = 0;
+    if (bytecode_len - i >= 32) {
+        // If we have more than 31 bytes remaining, we read 32 bytes directly from the bytecode
+        // vector starting at byte i:
+        as_int = from_buffer<uint256_t>(bytecode, i);
+    } else {
+        // Otherwise, we pad the final bytes with zeros to 32:
+        std::vector<uint8_t> tail(bytecode.begin() + static_cast<ssize_t>(i), bytecode.end());
+        tail.resize(32, 0);
+        as_int = from_buffer<uint256_t>(tail, 0);
+    }
+    // We shift to form a 31 byte int:
+    return as_int >> 8;
+}
+
+constexpr std::array<Column, 3> DECOMPOSITION_INVERTED_COLUMNS = { C::bc_decomposition_bytes_rem_inv,
+                                                                   C::bc_decomposition_bytes_rem_min_one_inv,
+                                                                   C::bc_decomposition_windows_min_remaining_inv };
+
+} // namespace
+
 /**
  * @brief Process bytecode decomposition events and populate the relevant columns in the trace.
  *  Corresponds to bc_decomposition.pil.
@@ -41,10 +156,7 @@ void BytecodeTraceBuilder::process_decomposition(
     const simulation::EventEmitterInterface<simulation::BytecodeDecompositionEvent>::Container& events,
     TraceContainer& trace)
 {
-    // Since next_packed_pc - pc is always in the range [0, 31), we can precompute the inverses:
-    std::vector<FF> next_packed_pc_min_pc_inverses = { 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
-                                                       16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30 };
-    FF::batch_invert(next_packed_pc_min_pc_inverses);
+    const std::array<FF, 31> next_packed_pc_min_pc_inverses_table = next_packed_pc_min_pc_inverses();
 
     // We start from row 1 because we need a row of zeroes for the shifts.
     uint32_t row = 1;
@@ -52,112 +164,31 @@ void BytecodeTraceBuilder::process_decomposition(
     for (const auto& event : events) {
         const auto& bytecode = *event.bytecode;
         const auto id = event.bytecode_id;
-        auto bytecode_at = [&bytecode](size_t i) -> uint8_t { return i < bytecode.size() ? bytecode[i] : 0; };
         const uint32_t bytecode_len = static_cast<uint32_t>(bytecode.size());
 
         for (uint32_t i = 0; i < bytecode_len; i++) {
-            const uint32_t remaining = bytecode_len - i;
-            const uint32_t bytes_to_read = std::min(remaining, DECOMPOSE_WINDOW_SIZE);
-            const bool is_last = remaining == 1;
-            const bool is_windows_eq_remaining = remaining == DECOMPOSE_WINDOW_SIZE;
-
-            // Check that we still expect the max public bytecode in bytes to fit within 24 bits (i.e. <= 0xffffff).
-            static_assert(MAX_PACKED_PUBLIC_BYTECODE_SIZE_IN_FIELDS * 31 <= 0xffffff);
-
-            // We set the decomposition in bytes, and other values.
-            trace.set(row + i,
-                      { {
-                          { C::bc_decomposition_sel, 1 },
-                          { C::bc_decomposition_id, id },
-                          { C::bc_decomposition_pc, i },
-                          { C::bc_decomposition_start, i == 0 ? 1 : 0 },
-                          { C::bc_decomposition_last_of_contract, is_last ? 1 : 0 },
-                          { C::bc_decomposition_bytes_remaining, remaining },
-                          { C::bc_decomposition_bytes_to_read, bytes_to_read },
-                          { C::bc_decomposition_sel_windows_gt_remaining, DECOMPOSE_WINDOW_SIZE > remaining ? 1 : 0 },
-                          { C::bc_decomposition_sel_windows_eq_remaining, is_windows_eq_remaining ? 1 : 0 },
-                          // Inverses will be calculated in batch later.
-                          { C::bc_decomposition_bytes_rem_inv, remaining },
-                          { C::bc_decomposition_bytes_rem_min_one_inv, is_last ? 0 : FF(remaining - 1) },
-                          { C::bc_decomposition_windows_min_remaining_inv,
-                            is_windows_eq_remaining ? 0 : FF(DECOMPOSE_WINDOW_SIZE) - FF(remaining) },
-                          // Sliding window.
-                          { C::bc_decomposition_bytes, bytecode_at(i) },
-                          { C::bc_decomposition_bytes_pc_plus_1, bytecode_at(i + 1) },
-                          { C::bc_decomposition_bytes_pc_plus_2, bytecode_at(i + 2) },
-                          { C::bc_decomposition_bytes_pc_plus_3, bytecode_at(i + 3) },
-                          { C::bc_decomposition_bytes_pc_plus_4, bytecode_at(i + 4) },
-                          { C::bc_decomposition_bytes_pc_plus_5, bytecode_at(i + 5) },
-                          { C::bc_decomposition_bytes_pc_plus_6, bytecode_at(i + 6) },
-                          { C::bc_decomposition_bytes_pc_plus_7, bytecode_at(i + 7) },
-                          { C::bc_decomposition_bytes_pc_plus_8, bytecode_at(i + 8) },
-                          { C::bc_decomposition_bytes_pc_plus_9, bytecode_at(i + 9) },
-                          { C::bc_decomposition_bytes_pc_plus_10, bytecode_at(i + 10) },
-                          { C::bc_decomposition_bytes_pc_plus_11, bytecode_at(i + 11) },
-                          { C::bc_decomposition_bytes_pc_plus_12, bytecode_at(i + 12) },
-                          { C::bc_decomposition_bytes_pc_plus_13, bytecode_at(i + 13) },
-                          { C::bc_decomposition_bytes_pc_plus_14, bytecode_at(i + 14) },
-                          { C::bc_decomposition_bytes_pc_plus_15, bytecode_at(i + 15) },
-                          { C::bc_decomposition_bytes_pc_plus_16, bytecode_at(i + 16) },
-                          { C::bc_decomposition_bytes_pc_plus_17, bytecode_at(i + 17) },
-                          { C::bc_decomposition_bytes_pc_plus_18, bytecode_at(i + 18) },
-                          { C::bc_decomposition_bytes_pc_plus_19, bytecode_at(i + 19) },
-                          { C::bc_decomposition_bytes_pc_plus_20, bytecode_at(i + 20) },
-                          { C::bc_decomposition_bytes_pc_plus_21, bytecode_at(i + 21) },
-                          { C::bc_decomposition_bytes_pc_plus_22, bytecode_at(i + 22) },
-                          { C::bc_decomposition_bytes_pc_plus_23, bytecode_at(i + 23) },
-                          { C::bc_decomposition_bytes_pc_plus_24, bytecode_at(i + 24) },
-                          { C::bc_decomposition_bytes_pc_plus_25, bytecode_at(i + 25) },
-                          { C::bc_decomposition_bytes_pc_plus_26, bytecode_at(i + 26) },
-                          { C::bc_decomposition_bytes_pc_plus_27, bytecode_at(i + 27) },
-                          { C::bc_decomposition_bytes_pc_plus_28, bytecode_at(i + 28) },
-                          { C::bc_decomposition_bytes_pc_plus_29, bytecode_at(i + 29) },
-                          { C::bc_decomposition_bytes_pc_plus_30, bytecode_at(i + 30) },
-                          { C::bc_decomposition_bytes_pc_plus_31, bytecode_at(i + 31) },
-                          { C::bc_decomposition_bytes_pc_plus_32, bytecode_at(i + 32) },
-                          { C::bc_decomposition_bytes_pc_plus_33, bytecode_at(i + 33) },
-                          { C::bc_decomposition_bytes_pc_plus_34, bytecode_at(i + 34) },
-                          { C::bc_decomposition_bytes_pc_plus_35, bytecode_at(i + 35) },
-                          { C::bc_decomposition_bytes_pc_plus_36, bytecode_at(i + 36) },
-                      } });
+            set_decomposition_row(trace, row + i, bytecode, id, i);
         }
 
-        // We set the packed field every 31 bytes.
-        auto bytecode_field_at = [&](size_t i) -> FF {
-            // We need to read uint256_ts because reading FFs messes up the order of the bytes.
-            uint256_t as_int = 0;
-            if (bytecode_len - i >= 32) {
-                // If we have more than 31 bytes remaining, we read 32 bytes directly from the bytecode
-                // vector starting at byte i:
-                as_int = from_buffer<uint256_t>(bytecode, i);
-            } else {
-                // Otherwise, we pad the final bytes with zeros to 32:
-                std::vector<uint8_t> tail(bytecode.begin() + static_cast<ssize_t>(i), bytecode.end());
-                tail.resize(32, 0);
-                as_int = from_buffer<uint256_t>(tail, 0);
-            }
-            // We shift to form a 31 byte int:
-            return as_int >> 8;
-        };
         for (uint32_t i = 0; i < bytecode_len; i += 31) {
             // Set the packed field and related columns. Note that the multipermutation columns (sel_packed_read)
             // are set separately by the MultiPermutationBuilder.
             trace.set(row + i,
                       { {
                           { C::bc_decomposition_sel_packed, 1 },
-                          { C::bc_decomposition_packed_field, bytecode_field_at(i) },
+                          { C::bc_decomposition_packed_field, packed_field_at(bytecode, i) },
                           { C::bc_decomposition_next_packed_pc, i },
                           { C::bc_decomposition_next_packed_pc_min_pc_inv, 0 },
                       } });
             // At each row until the next packed field, set the next pc and inverse required for the zero check
             // (#[PC_IS_PACKED]):
             for (uint32_t j = i + 1; j < std::min(bytecode_len, i + 31); j++) {
-                trace.set(
-                    row + j,
-                    { {
-                        { C::bc_decomposition_next_packed_pc, i + 31 },
-                        { C::bc_decomposition_next_packed_pc_min_pc_inv, next_packed_pc_min_pc_inverses[i + 31 - j] },
-                    } });
+                trace.set(row + j,
+                          { {
+                              { C::bc_decomposition_next_packed_pc, i + 31 },
+                              { C::bc_decomposition_next_packed_pc_min_pc_inv,
+                                next_packed_pc_min_pc_inverses_table[i + 31 - j] },
+                          } });
             }
         }
 
@@ -166,9 +197,103 @@ void BytecodeTraceBuilder::process_decomposition(
     }
 
     // Batch invert the columns.
-    trace.invert_columns({ { C::bc_decomposition_bytes_rem_inv,
-                             C::bc_decomposition_bytes_rem_min_one_inv,
-                             C::bc_decomposition_windows_min_remaining_inv } });
+    trace.invert_columns(DECOMPOSITION_INVERTED_COLUMNS);
+}
+
+size_t BytecodeTraceBuilder::decomposition_parts(uint64_t num_rows)
+{
+    return static_cast<size_t>(std::clamp<uint64_t>(
+        (num_rows + DECOMPOSITION_ROWS_PER_PART - 1) / DECOMPOSITION_ROWS_PER_PART, 1, MAX_DECOMPOSITION_PARTS));
+}
+
+std::vector<std::function<void()>> BytecodeTraceBuilder::decomposition_jobs(
+    const simulation::EventEmitterInterface<simulation::BytecodeDecompositionEvent>::Container& events,
+    TraceContainer& trace,
+    std::function<void()> after_last,
+    size_t parts)
+{
+    // Row 0 is the row of zeroes for the shifts; bytecode k starts at row 1 + the lengths of the bytecodes before it.
+    std::vector<uint32_t> first_rows;
+    first_rows.reserve(events.size());
+    uint32_t end_row = 1;
+    for (const auto& event : events) {
+        first_rows.push_back(end_row);
+        end_row += static_cast<uint32_t>(event.bytecode->size());
+    }
+    if (parts == 0) {
+        parts = decomposition_parts(end_row - 1);
+    }
+    if (parts <= 1) {
+        return { [&events, &trace, after_last = std::move(after_last)]() {
+            BytecodeTraceBuilder().process_decomposition(events, trace);
+            after_last();
+        } };
+    }
+
+    // Each part writes every cell of its rows, and no cell outside them. Parts are whole shards of the trace
+    // container, so no two parts write to the same shard.
+    constexpr uint32_t SHARD_ROWS = TraceContainer::INTERVAL_SIZE;
+    const auto rows_per_part =
+        static_cast<uint32_t>(((((end_row + parts - 1) / parts) + SHARD_ROWS - 1) / SHARD_ROWS) * SHARD_ROWS);
+    struct Shared {
+        std::vector<uint32_t> first_rows;
+        std::array<FF, 31> inverses;
+        std::atomic<size_t> unfinished;
+        std::function<void()> after_last;
+    };
+    const size_t num_jobs = (end_row + rows_per_part - 1) / rows_per_part;
+    auto shared = std::make_shared<Shared>();
+    shared->first_rows = std::move(first_rows);
+    shared->inverses = next_packed_pc_min_pc_inverses();
+    shared->unfinished.store(num_jobs, std::memory_order_relaxed);
+    shared->after_last = std::move(after_last);
+
+    std::vector<std::function<void()>> jobs;
+    jobs.reserve(num_jobs);
+    for (size_t job = 0; job < num_jobs; ++job) {
+        const uint32_t begin = std::max<uint32_t>(1, static_cast<uint32_t>(job) * rows_per_part);
+        const uint32_t end = std::min<uint32_t>(end_row, static_cast<uint32_t>(job + 1) * rows_per_part);
+        jobs.push_back([&events, &trace, shared, begin, end]() {
+            const std::vector<uint32_t>& first = shared->first_rows;
+            // The last bytecode that starts at or before `begin` holds it (empty bytecodes hold no row).
+            size_t k = static_cast<size_t>(std::upper_bound(first.begin(), first.end(), begin) - first.begin()) - 1;
+            for (uint32_t row = begin; row < end; ++k) {
+                const auto& bytecode = *events[k].bytecode;
+                const auto id = events[k].bytecode_id;
+                const uint32_t bytecode_end = std::min(end, first[k] + static_cast<uint32_t>(bytecode.size()));
+                for (; row < bytecode_end; ++row) {
+                    const uint32_t i = row - first[k];
+                    set_decomposition_row(trace, row, bytecode, id, i);
+                    if (i % 31 == 0) {
+                        // Set the packed field and related columns. Note that the multipermutation columns
+                        // (sel_packed_read) are set separately by the MultiPermutationBuilder.
+                        trace.set(row,
+                                  { {
+                                      { C::bc_decomposition_sel_packed, 1 },
+                                      { C::bc_decomposition_packed_field, packed_field_at(bytecode, i) },
+                                      { C::bc_decomposition_next_packed_pc, i },
+                                      { C::bc_decomposition_next_packed_pc_min_pc_inv, 0 },
+                                  } });
+                    } else {
+                        // The next pc and inverse required for the zero check (#[PC_IS_PACKED]).
+                        const uint32_t next_packed_pc = ((i / 31) * 31) + 31;
+                        trace.set(
+                            row,
+                            { {
+                                { C::bc_decomposition_next_packed_pc, next_packed_pc },
+                                { C::bc_decomposition_next_packed_pc_min_pc_inv, shared->inverses[next_packed_pc - i] },
+                            } });
+                    }
+                }
+            }
+            // The batch inversion reads every part's rows, so the part that finishes last runs it, once.
+            if (shared->unfinished.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                trace.invert_columns(DECOMPOSITION_INVERTED_COLUMNS);
+                shared->after_last();
+            }
+        });
+    }
+    return jobs;
 }
 
 /**

@@ -194,9 +194,16 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
     {
         // The longest builder: its sort is a job below, its rows are written once the jobs are done.
         MemoryTraceBuilder memory_trace_builder;
+        // The decomposition of every bytecode is the longest builder on some transactions: it runs as parts.
+        auto bytecode_decomposition_jobs = BytecodeTraceBuilder::decomposition_jobs(
+            events.bytecode_decomposition, trace, [&]() { clear_events(events.bytecode_decomposition); });
+        for (auto& job : bytecode_decomposition_jobs) {
+            job = [part = std::move(job)]() { AVM_TRACK_TIME("tracegen/bytecode_decomposition", part()); };
+        }
         auto jobs = concatenate(
             // Precomputed column jobs.
             build_precomputed_columns_jobs(trace),
+            bytecode_decomposition_jobs,
             // Public inputs column jobs.
             build_public_inputs_columns_jobs(trace, public_inputs),
             // Subtrace jobs.
@@ -216,12 +223,6 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
                     AluTraceBuilder alu_builder;
                     AVM_TRACK_TIME("tracegen/alu", alu_builder.process(events.alu, trace));
                     clear_events(events.alu);
-                },
-                [&]() {
-                    BytecodeTraceBuilder bytecode_builder;
-                    AVM_TRACK_TIME("tracegen/bytecode_decomposition",
-                                   bytecode_builder.process_decomposition(events.bytecode_decomposition, trace));
-                    clear_events(events.bytecode_decomposition);
                 },
                 [&]() {
                     BytecodeTraceBuilder bytecode_builder;
