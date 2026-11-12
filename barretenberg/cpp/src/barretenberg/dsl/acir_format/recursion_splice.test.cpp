@@ -17,6 +17,9 @@
 #include "barretenberg/ultra_honk/ultra_prover.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -32,9 +35,9 @@
 
 /**
  * A circuit whose Honk recursion constraints are built on scratch builders and spliced must equal the serial build of
- * the same program in every builder member, and a refused splice must leave the serial result. With the seeded engine
- * the variable values and the engine position must match too; with the default engine the two builds draw different
- * offset generators, so values are not compared.
+ * the same program in every builder member, and a refused splice or a first constraint built in place must leave the
+ * serial result. With the seeded engine the variable values and the engine position must match too; with the default
+ * engine the two builds draw different offset generators, so values are not compared.
  */
 
 using namespace acir_format;
@@ -113,7 +116,7 @@ std::vector<uint32_t> inputs_of(const RecursionConstraint& constraint)
     return inputs;
 }
 
-// Clears every hook when a test ends, whatever its outcome.
+// Clears every hook and restores the first-take policy when a test ends, whatever its outcome.
 struct HookReset {
     HookReset() = default;
     HookReset(const HookReset&) = delete;
@@ -126,8 +129,13 @@ struct HookReset {
         RecursionSpliceTestHooks::before_constraint = nullptr;
         RecursionSpliceTestHooks::after_constraint = nullptr;
         RecursionSpliceTestHooks::after_scratch_build = nullptr;
+        RecursionSpliceTestHooks::scratch_recording = nullptr;
+        RecursionSpliceTestHooks::discarded = nullptr;
         RecursionSpliceTestHooks::stats = nullptr;
+        RecursionSpliceTestHooks::first_take = first_take;
     }
+
+    const FirstTake first_take = RecursionSpliceTestHooks::first_take;
 };
 
 struct Build {
@@ -137,16 +145,28 @@ struct Build {
     std::vector<numeric::RNG::Position> positions;
 };
 
+// The hooks of one build. Unless a test says otherwise the first constraint waits for its scratch build, so that a
+// spliced first constraint is covered whatever the timing.
+struct Hooks {
+    // Runs in serial and spliced builds.
+    RecursionSpliceTestHooks::ConstraintHook before_constraint;
+    // Run in spliced builds only.
+    RecursionSpliceTestHooks::ConstraintHook spliced_before_constraint;
+    RecursionSpliceTestHooks::ConstraintHook spliced_after_constraint;
+    std::function<void(size_t)> after_scratch_build;
+    std::function<void(size_t, size_t)> scratch_recording;
+    std::function<void(size_t)> discarded;
+    FirstTake first_take = FirstTake::Wait;
+};
+
 /**
  * @brief Build `program` with or without splicing, from the engine position `start` when the engine has positions.
- * @details `before_constraint` runs in both modes; `after_scratch_build` only matters when splicing.
  */
 Build build(const AcirProgram& program,
             const ProgramMetadata& metadata,
             const bool splice,
             const numeric::RNG::Position& start,
-            const RecursionSpliceTestHooks::ConstraintHook& before_constraint = {},
-            const std::function<void(size_t)>& after_scratch_build = {})
+            const Hooks& hooks = {})
 {
     numeric::RNG& engine = numeric::get_randomness();
     if (!start.empty()) {
@@ -154,17 +174,73 @@ Build build(const AcirProgram& program,
     }
     Build result;
     RecursionSpliceTestHooks::disabled = !splice;
-    RecursionSpliceTestHooks::before_constraint = before_constraint;
-    RecursionSpliceTestHooks::after_constraint = [&](Builder& /*builder*/, const RecursionConstraint&, size_t) {
-        result.positions.push_back(engine.position());
-    };
-    RecursionSpliceTestHooks::after_scratch_build = after_scratch_build;
+    RecursionSpliceTestHooks::before_constraint =
+        [&](Builder& builder, const RecursionConstraint& constraint, const size_t index) {
+            if (hooks.before_constraint) {
+                hooks.before_constraint(builder, constraint, index);
+            }
+            if (splice && hooks.spliced_before_constraint) {
+                hooks.spliced_before_constraint(builder, constraint, index);
+            }
+        };
+    RecursionSpliceTestHooks::after_constraint =
+        [&](Builder& builder, const RecursionConstraint& constraint, const size_t index) {
+            result.positions.push_back(engine.position());
+            if (splice && hooks.spliced_after_constraint) {
+                hooks.spliced_after_constraint(builder, constraint, index);
+            }
+        };
+    RecursionSpliceTestHooks::after_scratch_build = hooks.after_scratch_build;
+    RecursionSpliceTestHooks::scratch_recording = hooks.scratch_recording;
+    RecursionSpliceTestHooks::discarded = hooks.discarded;
+    RecursionSpliceTestHooks::first_take = hooks.first_take;
     RecursionSpliceTestHooks::stats = &result.stats;
     AcirProgram copy = program;
     result.builder = create_circuit<Builder>(copy, metadata);
     result.positions.push_back(engine.position());
     return result;
 }
+
+// Lets one thread wait, for a bounded time, until another sets it.
+class Signal {
+  public:
+    void set()
+    {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            set_ = true;
+        }
+        condition_.notify_all();
+    }
+
+    [[nodiscard]] bool wait()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::minutes(2), [this] { return set_; });
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool set_ = false;
+};
+
+// Owned by a thread through a thread_local, so its destructor runs when that thread exits.
+struct ExitMarker {
+    ExitMarker() = default;
+    ExitMarker(const ExitMarker&) = delete;
+    ExitMarker(ExitMarker&&) = delete;
+    ExitMarker& operator=(const ExitMarker&) = delete;
+    ExitMarker& operator=(ExitMarker&&) = delete;
+    ~ExitMarker()
+    {
+        if (exited != nullptr) {
+            exited->store(true);
+        }
+    }
+
+    std::atomic<bool>* exited = nullptr;
+};
 
 class RecursionSpliceTest : public ::testing::Test {
   protected:
@@ -191,18 +267,23 @@ class RecursionSpliceTest : public ::testing::Test {
     bool seeded() const { return !start.empty(); }
     CompareValues compare_values() const { return seeded() ? CompareValues::Yes : CompareValues::No; }
 
-    // Builds `program` serially and spliced from the same engine position and checks they agree.
-    std::pair<Build, Build> build_both(const AcirProgram& program,
-                                       const ProgramMetadata& metadata = {},
-                                       const RecursionSpliceTestHooks::ConstraintHook& before_constraint = {},
-                                       const std::function<void(size_t)>& after_scratch_build = {})
+    // The builder, and with the seeded engine the engine position after each constraint, match the serial build.
+    void expect_same_build(const Build& spliced, const Build& serial) const
     {
-        const HookReset reset;
-        Build serial = build(program, metadata, /*splice=*/false, start, before_constraint);
-        Build spliced = build(program, metadata, /*splice=*/true, start, before_constraint, after_scratch_build);
         expect_same_builder(spliced.builder, serial.builder, compare_values());
         EXPECT_TRUE(spliced.positions == serial.positions);
         EXPECT_EQ(serial.stats.launched, 0);
+    }
+
+    // Builds `program` serially and spliced from the same engine position and checks they agree.
+    std::pair<Build, Build> build_both(const AcirProgram& program,
+                                       const ProgramMetadata& metadata = {},
+                                       const Hooks& hooks = {})
+    {
+        const HookReset reset;
+        Build serial = build(program, metadata, /*splice=*/false, start, hooks);
+        Build spliced = build(program, metadata, /*splice=*/true, start, hooks);
+        expect_same_build(spliced, serial);
         return { std::move(serial), std::move(spliced) };
     }
 
@@ -212,6 +293,18 @@ class RecursionSpliceTest : public ::testing::Test {
     {
         const auto [serial, spliced] = build_both(make_program(proofs), metadata);
         EXPECT_EQ(spliced.stats.spliced, expected_splices);
+        EXPECT_EQ(spliced.stats.refused, 0) << spliced.stats.first_refusal;
+        EXPECT_EQ(spliced.stats.built_in_place, 0);
+    }
+
+    // The first constraint is built in place and every later one spliced: the cancelled build moved neither the real
+    // builder nor the engine, so each later scratch build still starts where the engine stands.
+    void expect_first_in_place(const std::vector<const InnerProof*>& proofs)
+    {
+        const auto [serial, spliced] = build_both(make_program(proofs), {}, Hooks{ .first_take = FirstTake::InPlace });
+        EXPECT_EQ(spliced.stats.launched, proofs.size());
+        EXPECT_EQ(spliced.stats.built_in_place, 1);
+        EXPECT_EQ(spliced.stats.spliced, proofs.size() - 1);
         EXPECT_EQ(spliced.stats.refused, 0) << spliced.stats.first_refusal;
     }
 
@@ -251,16 +344,133 @@ TEST_F(RecursionSpliceTest, EligibleAfterIneligibleIsBuiltSerially)
     expect_spliced({ &*zk_proof, &honk_proofs[0] }, 0);
 }
 
+TEST_F(RecursionSpliceTest, LoneConstraintBuiltInPlace)
+{
+    expect_first_in_place({ &honk_proofs[0] });
+}
+
+TEST_F(RecursionSpliceTest, TwoConstraintsFirstBuiltInPlace)
+{
+    expect_first_in_place({ &honk_proofs[0], &honk_proofs[1] });
+}
+
+TEST_F(RecursionSpliceTest, ThreeConstraintsFirstBuiltInPlace)
+{
+    expect_first_in_place(three_honk_proofs());
+}
+
+// The production policy: whichever way timing decides the first constraint, the builder is the serial one.
+TEST_F(RecursionSpliceTest, FirstTakeByTiming)
+{
+    const auto [serial, spliced] =
+        build_both(make_program(three_honk_proofs()), {}, Hooks{ .first_take = FirstTake::Auto });
+    EXPECT_EQ(spliced.stats.spliced + spliced.stats.built_in_place, 3);
+    EXPECT_LE(spliced.stats.built_in_place, 1);
+    EXPECT_EQ(spliced.stats.refused, 0) << spliced.stats.first_refusal;
+}
+
+/**
+ * The first scratch build is held at a chosen recording while the building thread cancels it and builds the
+ * constraint in place, then released: it stops at that very recording, its thread has exited by the time its builder
+ * is discarded, and the real builder and engine end as in the serial build.
+ */
+TEST_F(RecursionSpliceTest, CancelsTheFirstScratchBuildAtAnyPoint)
+{
+    const HookReset reset;
+    const AcirProgram program = make_program({ &honk_proofs[0] });
+    std::atomic<size_t> num_recordings = 0;
+    {
+        const Build counted =
+            build(program, {}, /*splice=*/true, start, Hooks{ .scratch_recording = [&](size_t index, size_t count) {
+                      if (index == 0) {
+                          num_recordings.store(count);
+                      }
+                  } });
+        ASSERT_EQ(counted.stats.spliced, 1);
+    }
+    const size_t total = num_recordings.load();
+    ASSERT_GT(total, 2);
+    const Build serial = build(program, {}, /*splice=*/false, start);
+
+    // The first, a middle and the last recording, then past the end: the build has finished when cancelled.
+    for (const size_t cancel_at : { size_t{ 1 }, total / 2, total, total + 1 }) {
+        SCOPED_TRACE(cancel_at);
+        const bool after_finish = cancel_at > total;
+        Signal held;
+        Signal released;
+        std::atomic<size_t> last_recording = 0;
+        std::atomic<bool> finished = false;
+        std::atomic<bool> exited = false;
+        std::vector<size_t> discarded;
+        bool exited_before_discard = false;
+        const Hooks hooks{
+            .spliced_before_constraint =
+                [&](Builder&, const RecursionConstraint&, size_t index) {
+                    if (index == 0) {
+                        EXPECT_TRUE(held.wait());
+                    }
+                },
+            .spliced_after_constraint =
+                [&](Builder&, const RecursionConstraint&, size_t index) {
+                    if (index == 0) {
+                        released.set();
+                    }
+                },
+            .after_scratch_build =
+                [&](size_t index) {
+                    if (index == 0) {
+                        finished.store(true);
+                        if (after_finish) {
+                            held.set();
+                        }
+                    }
+                },
+            .scratch_recording =
+                [&](size_t index, size_t count) {
+                    if (index != 0) {
+                        return;
+                    }
+                    thread_local ExitMarker marker;
+                    marker.exited = &exited;
+                    last_recording.store(count);
+                    if (count == cancel_at) {
+                        held.set();
+                        EXPECT_TRUE(released.wait());
+                    }
+                },
+            .discarded =
+                [&](size_t index) {
+                    discarded.push_back(index);
+                    if (index == 0) {
+                        exited_before_discard = exited.load();
+                    }
+                },
+            .first_take = FirstTake::InPlace,
+        };
+        const Build spliced = build(program, {}, /*splice=*/true, start, hooks);
+        expect_same_build(spliced, serial);
+        EXPECT_EQ(spliced.stats.built_in_place, 1);
+        EXPECT_EQ(spliced.stats.spliced, 0);
+        EXPECT_EQ(spliced.stats.refused, 0) << spliced.stats.first_refusal;
+        EXPECT_EQ(last_recording.load(), std::min(cancel_at, total));
+        EXPECT_EQ(finished.load(), after_finish);
+        EXPECT_EQ(discarded, std::vector<size_t>{ 0 });
+        EXPECT_TRUE(exited_before_discard);
+    }
+}
+
 // The forced refusals hit the middle of three constraints; the first is spliced either way.
 
 TEST_F(RecursionSpliceTest, RefusesWhenTheEngineMoved)
 {
     const auto [serial, spliced] =
-        build_both(make_program(three_honk_proofs()), {}, [](Builder&, const RecursionConstraint&, size_t index) {
-            if (index == 1) {
-                [[maybe_unused]] const uint64_t extra_draw = numeric::get_randomness().get_random_uint64();
-            }
-        });
+        build_both(make_program(three_honk_proofs()),
+                   {},
+                   Hooks{ .before_constraint = [](Builder&, const RecursionConstraint&, size_t index) {
+                       if (index == 1) {
+                           [[maybe_unused]] const uint64_t extra_draw = numeric::get_randomness().get_random_uint64();
+                       }
+                   } });
     if (seeded()) {
         // Every later start position was predicted without the extra draw.
         EXPECT_EQ(spliced.stats.spliced, 1);
@@ -275,20 +485,19 @@ TEST_F(RecursionSpliceTest, RefusesWhenTheEngineMoved)
 
 TEST_F(RecursionSpliceTest, RefusesATaggedInput)
 {
-    const auto [serial, spliced] =
-        build_both(make_program(three_honk_proofs()),
-                   {},
-                   [](Builder& builder, const RecursionConstraint& constraint, size_t index) {
-                       if (index != 1) {
-                           return;
-                       }
-                       const std::vector<uint32_t> inputs = inputs_of(constraint);
-                       const auto small = std::ranges::find_if(inputs, [&](uint32_t input) {
-                           return uint256_t(builder.get_variable(input)) <= MAX_SMALL_RANGE;
-                       });
-                       ASSERT_NE(small, inputs.end());
-                       builder.create_small_range_constraint(*small, MAX_SMALL_RANGE);
-                   });
+    const auto [serial, spliced] = build_both(
+        make_program(three_honk_proofs()),
+        {},
+        Hooks{ .before_constraint = [](Builder& builder, const RecursionConstraint& constraint, size_t index) {
+            if (index != 1) {
+                return;
+            }
+            const std::vector<uint32_t> inputs = inputs_of(constraint);
+            const auto small = std::ranges::find_if(
+                inputs, [&](uint32_t input) { return uint256_t(builder.get_variable(input)) <= MAX_SMALL_RANGE; });
+            ASSERT_NE(small, inputs.end());
+            builder.create_small_range_constraint(*small, MAX_SMALL_RANGE);
+        } });
     EXPECT_EQ(spliced.stats.spliced, 2);
     EXPECT_EQ(spliced.stats.refused, 1);
     EXPECT_EQ(spliced.stats.first_refusal, "an input carries a range tag");
@@ -296,23 +505,23 @@ TEST_F(RecursionSpliceTest, RefusesATaggedInput)
 
 TEST_F(RecursionSpliceTest, RefusesInputsSharingACycle)
 {
-    const auto [serial, spliced] =
-        build_both(make_program(three_honk_proofs()),
-                   {},
-                   [](Builder& builder, const RecursionConstraint& constraint, size_t index) {
-                       if (index != 1) {
-                           return;
-                       }
-                       std::unordered_map<fr, uint32_t> first_with_value;
-                       for (const uint32_t input : inputs_of(constraint)) {
-                           const auto [it, inserted] = first_with_value.try_emplace(builder.get_variable(input), input);
-                           if (!inserted && it->second != input) {
-                               builder.assert_equal(it->second, input);
-                               return;
-                           }
-                       }
-                       FAIL() << "no two inputs share a value";
-                   });
+    const auto [serial, spliced] = build_both(
+        make_program(three_honk_proofs()),
+        {},
+        Hooks{ .before_constraint = [](Builder& builder, const RecursionConstraint& constraint, size_t index) {
+            if (index != 1) {
+                return;
+            }
+            std::unordered_map<fr, uint32_t> first_with_value;
+            for (const uint32_t input : inputs_of(constraint)) {
+                const auto [it, inserted] = first_with_value.try_emplace(builder.get_variable(input), input);
+                if (!inserted && it->second != input) {
+                    builder.assert_equal(it->second, input);
+                    return;
+                }
+            }
+            FAIL() << "no two inputs share a value";
+        } });
     EXPECT_EQ(spliced.stats.spliced, 2);
     EXPECT_EQ(spliced.stats.refused, 1);
     EXPECT_EQ(spliced.stats.first_refusal, "inputs share a copy cycle");
@@ -320,11 +529,12 @@ TEST_F(RecursionSpliceTest, RefusesInputsSharingACycle)
 
 TEST_F(RecursionSpliceTest, RefusesAScratchBuildThatThrew)
 {
-    const auto [serial, spliced] = build_both(make_program(three_honk_proofs()), {}, {}, [](size_t index) {
-        if (index == 1) {
-            throw_or_abort("forced scratch build failure");
-        }
-    });
+    const auto [serial, spliced] =
+        build_both(make_program(three_honk_proofs()), {}, Hooks{ .after_scratch_build = [](size_t index) {
+                       if (index == 1) {
+                           throw_or_abort("forced scratch build failure");
+                       }
+                   } });
     EXPECT_EQ(spliced.stats.spliced, 2);
     EXPECT_EQ(spliced.stats.refused, 1);
     EXPECT_EQ(spliced.stats.first_refusal, "the scratch build threw");
@@ -377,24 +587,56 @@ TEST_F(RecursionSpliceTest, ScratchThreadsDrawOnlyFromTheirOwnBuffers)
         GTEST_SKIP() << "the entropy buffer belongs to the default engine";
     }
     const HookReset reset;
+    // The first build is cancelled at its first recording, which follows its draws, while held there.
+    constexpr size_t CANCELLED = 0;
     constexpr size_t REFUSED = 1;
     std::mutex mutex;
     std::map<size_t, std::thread::id> scratch_threads;
+    Signal held;
+    Signal released;
     BufferLog log;
     numeric::set_entropy_buffer_observer(&log);
-    const Build spliced = build(make_program(three_honk_proofs()), {}, /*splice=*/true, start, {}, [&](size_t index) {
-        {
-            const std::lock_guard<std::mutex> lock(mutex);
-            scratch_threads.emplace(index, std::this_thread::get_id());
-        }
-        if (index == REFUSED) {
-            throw_or_abort("forced scratch build failure");
-        }
-    });
+    const Hooks hooks{
+        .spliced_before_constraint =
+            [&](Builder&, const RecursionConstraint&, size_t index) {
+                if (index == CANCELLED) {
+                    EXPECT_TRUE(held.wait());
+                }
+            },
+        .spliced_after_constraint =
+            [&](Builder&, const RecursionConstraint&, size_t index) {
+                if (index == CANCELLED) {
+                    released.set();
+                }
+            },
+        .after_scratch_build =
+            [](size_t index) {
+                if (index == REFUSED) {
+                    throw_or_abort("forced scratch build failure");
+                }
+            },
+        .scratch_recording =
+            [&](size_t index, size_t count) {
+                if (count != 1) {
+                    return;
+                }
+                {
+                    const std::lock_guard<std::mutex> lock(mutex);
+                    scratch_threads.emplace(index, std::this_thread::get_id());
+                }
+                if (index == CANCELLED) {
+                    held.set();
+                    EXPECT_TRUE(released.wait());
+                }
+            },
+        .first_take = FirstTake::InPlace,
+    };
+    const Build spliced = build(make_program(three_honk_proofs()), {}, /*splice=*/true, start, hooks);
     numeric::set_entropy_buffer_observer(nullptr);
 
-    EXPECT_EQ(spliced.stats.spliced, 2);
+    EXPECT_EQ(spliced.stats.spliced, 1);
     EXPECT_EQ(spliced.stats.refused, 1);
+    EXPECT_EQ(spliced.stats.built_in_place, 1);
     ASSERT_EQ(scratch_threads.size(), 3);
     std::unordered_set<std::thread::id> scratch_ids;
     for (const auto& [index, thread] : scratch_threads) {
@@ -403,6 +645,7 @@ TEST_F(RecursionSpliceTest, ScratchThreadsDrawOnlyFromTheirOwnBuffers)
 
     // A scratch thread starts after the observer, so each of its fills is seen and belongs to it.
     size_t refused_consumes = 0;
+    size_t cancelled_consumes = 0;
     for (const BufferLog::Consume& consume : log.consumes) {
         if (consume.fill == 0) {
             EXPECT_FALSE(scratch_ids.contains(consume.thread));
@@ -415,9 +658,14 @@ TEST_F(RecursionSpliceTest, ScratchThreadsDrawOnlyFromTheirOwnBuffers)
         if (fill->second.thread == scratch_threads.at(REFUSED)) {
             ++refused_consumes;
         }
+        if (fill->second.thread == scratch_threads.at(CANCELLED)) {
+            ++cancelled_consumes;
+        }
     }
-    // The refused build drew: its draws are consumed by nothing else, because no other thread reads its fills.
+    // The refused and the cancelled build drew: their draws are consumed by nothing else, because no other thread
+    // reads their fills.
     EXPECT_GT(refused_consumes, 0);
+    EXPECT_GT(cancelled_consumes, 0);
 
     // No two consumed ranges of one buffer overlap; an unobserved fill is told apart by its thread.
     std::map<std::pair<uint64_t, std::thread::id>, std::vector<std::pair<size_t, size_t>>> ranges;
