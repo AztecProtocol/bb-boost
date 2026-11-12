@@ -703,7 +703,7 @@ TEST_F(RecursionSpliceTest, RefusesAScratchBuildThatThrew)
                    } });
     EXPECT_EQ(spliced.stats.spliced, 2);
     EXPECT_EQ(spliced.stats.refused, 1);
-    EXPECT_EQ(spliced.stats.first_refusal, "the scratch build threw");
+    EXPECT_EQ(spliced.stats.first_refusal, "the scratch build threw: forced scratch build failure");
 }
 
 /**

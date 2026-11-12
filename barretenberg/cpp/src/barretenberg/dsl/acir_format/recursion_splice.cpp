@@ -143,6 +143,18 @@ class ScratchCancellation final : public SpliceCancellation {
     std::atomic<bool> requested_ = false;
 };
 
+// What `error` says, or a fixed text when it holds something other than a std::exception.
+std::string message_of(const std::exception_ptr& error)
+{
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& exception) {
+        return exception.what();
+    } catch (...) {
+        return "an exception that is not a std::exception";
+    }
+}
+
 int64_t milliseconds_between(const std::chrono::steady_clock::time_point from,
                              const std::chrono::steady_clock::time_point to)
 {
@@ -379,7 +391,9 @@ std::optional<HonkRecursionConstraintOutput<UltraCircuitBuilder>> RecursionSplic
         first_finished_at_ = scratch.finished_at;
     }
     if (scratch.error) {
-        refuse(scratch, "the scratch build threw");
+        const std::string message = message_of(scratch.error);
+        vinfo("recursion splice: the scratch build of Honk recursion constraint ", index, " threw: ", message);
+        refuse(scratch, "the scratch build threw: " + message);
         return std::nullopt;
     }
     // Before the splice: the scratch build drew what the serial build would draw only from the position it started at.
