@@ -70,7 +70,8 @@ class RecursionSplicer {
     RecursionSplicer& operator=(RecursionSplicer&&) = delete;
 
     /**
-     * @brief Join every scratch thread and destroy every scratch builder.
+     * @brief Join every scratch thread and destroy every scratch builder; on glibc, when any scratch build started,
+     * then return the memory freed into malloc arenas to the operating system.
      */
     ~RecursionSplicer();
 

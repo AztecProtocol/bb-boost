@@ -18,6 +18,9 @@
 #if !defined(NO_MULTITHREADING) && !defined(__wasm__) && defined(__cpp_exceptions) && !defined(BB_NO_EXCEPTIONS)
 #define BB_RECURSION_SPLICE_AVAILABLE 1
 #include <thread>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #else
 #define BB_RECURSION_SPLICE_AVAILABLE 0
 #endif
@@ -82,6 +85,19 @@ std::string refusal_reason(const SpliceRefusal refusal)
     return "unknown";
 }
 
+/**
+ * @brief Returns to the system the memory that scratch threads have freed.
+ * @details It stays resident in each thread's malloc arena, which no other thread allocates from. While a scratch
+ * builder lives, that memory lies in free blocks below the builder's own, which glibc can return; once the builder is
+ * destroyed its arena is a single top block, which glibc trims only in the main arena.
+ */
+void return_freed_memory()
+{
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
+
 } // namespace
 
 struct RecursionSplicer::Scratch {
@@ -143,9 +159,12 @@ struct RecursionSplicer::Scratch {
         }
     }
 
-    // Called once the scratch thread is joined.
+    // Called once the scratch thread is joined. Freed memory is returned first, while the builder still lives.
     void discard()
     {
+        if (builder) {
+            return_freed_memory();
+        }
         output.reset();
         builder.reset();
     }
