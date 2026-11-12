@@ -12,6 +12,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -93,6 +94,8 @@ class ThreadPool {
 
     ThreadPool& operator=(const ThreadPool& other) = delete;
     ThreadPool& operator=(ThreadPool&& other) = delete;
+
+    size_t num_workers() const { return workers.size(); }
 
     void start_tasks(size_t num_iterations, const std::function<void(size_t)>& func)
     {
@@ -221,6 +224,25 @@ void ThreadPool::worker_loop([[maybe_unused]] size_t thread_index)
 } // namespace
 
 namespace bb {
+namespace {
+// The calling thread's workers (on wasm, the process's), created by its first parallel_for.
+#ifdef __wasm__
+std::optional<ThreadPool> calling_thread_workers;
+#else
+thread_local std::optional<ThreadPool> calling_thread_workers;
+#endif
+} // namespace
+
+size_t parallel_for_num_workers()
+{
+    return calling_thread_workers ? calling_thread_workers->num_workers() : 0;
+}
+
+void parallel_for_stop_workers()
+{
+    calling_thread_workers.reset();
+}
+
 /**
  * A thread pooled strategy with lock-free iteration claiming. Each worker claims the next iteration and processes it.
  * The main thread acts as a worker also, and when it completes, it spins (then sleeps) until thread workers are done.
@@ -233,7 +255,10 @@ void parallel_for_mutex_pool(size_t num_iterations, const std::function<void(siz
 #define THREAD_LOCAL_MAYBE thread_local
 #endif
 
-    static THREAD_LOCAL_MAYBE ThreadPool pool(get_num_cpus() - 1);
+    if (!calling_thread_workers) {
+        calling_thread_workers.emplace(get_num_cpus() - 1);
+    }
+    ThreadPool& pool = *calling_thread_workers;
     static THREAD_LOCAL_MAYBE bool nested = false;
 
     // If nested, fall back to serial execution
