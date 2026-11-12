@@ -103,13 +103,28 @@ template <size_t size_in_unsigned_ints> std::array<unsigned int, size_in_unsigne
             ssize_t read_bytes =
                 getentropy(current_offset, BYTES_PER_GETENTROPY_READ) == -1 ? -1 : BYTES_PER_GETENTROPY_READ;
 #elif defined(__ANDROID__)
-            // Android API 24 doesn't have getrandom/getentropy, read from /dev/urandom
-            static thread_local int urandom_fd = -1;
-            if (urandom_fd == -1) {
+            // Android API 24 doesn't have getrandom/getentropy, read from /dev/urandom. The descriptor is closed when
+            // the thread exits, so short-lived threads do not each leave one open.
+            struct UrandomDescriptor {
+                int fd = -1;
+                UrandomDescriptor() = default;
+                UrandomDescriptor(const UrandomDescriptor&) = delete;
+                UrandomDescriptor(UrandomDescriptor&&) = delete;
+                UrandomDescriptor& operator=(const UrandomDescriptor&) = delete;
+                UrandomDescriptor& operator=(UrandomDescriptor&&) = delete;
+                ~UrandomDescriptor()
+                {
+                    if (fd != -1) {
+                        ::close(fd);
+                    }
+                }
+            };
+            static thread_local UrandomDescriptor urandom;
+            if (urandom.fd == -1) {
                 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-                urandom_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+                urandom.fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
             }
-            ssize_t read_bytes = ::read(urandom_fd, current_offset, BYTES_PER_GETENTROPY_READ);
+            ssize_t read_bytes = ::read(urandom.fd, current_offset, BYTES_PER_GETENTROPY_READ);
 #elif defined(_WIN32)
             // Use BCryptGenRandom on Windows
             NTSTATUS status =
