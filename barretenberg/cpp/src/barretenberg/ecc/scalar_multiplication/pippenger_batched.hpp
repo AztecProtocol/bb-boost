@@ -404,9 +404,7 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
     if (large_members_concurrent) {
         // Workers pull work off an atomic cursor and run it single-threaded (max_threads=1). This skips the
         // member's cross-thread reduction. It also keeps the member off the pool, so there is no nested
-        // parallel_for. The gate above guarantees at least pool_width members, so every worker starts busy. Each
-        // call self-allocates its arena (empty span), because a shared num_workers × max-member arena would
-        // exceed BATCH_MEM_BUDGET and cap num_workers below pool_width.
+        // parallel_for. The gate above guarantees at least pool_width chunks, so every worker starts busy.
         //
         // A member's cost tracks its non-zero scalars, not its span, so the span-based gate admits batches in
         // which a few dense members each take longer on one thread than the rest of the batch takes on all of
@@ -435,10 +433,37 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
             }
             return a.member != b.member ? a.member < b.member : a.offset < b.offset;
         });
+        // Each worker reuses one slice, sized for the largest chunk, of a single block allocated here, rather than
+        // allocating an arena per chunk, and releases the slice's pages when it runs out of chunks. CHUNK_ARENA_BUDGET
+        // bounds the block, so a pool needing more slices than fit runs fewer workers: a slice for a 2^16-point chunk
+        // is about 32 MiB, or 33 MiB with a dedup hint, so 61 to 64 workers fit.
+        constexpr size_t CHUNK_ARENA_BUDGET = size_t{ 2 } << 30;
+        size_t chunk_arena_bytes = 0;
+        for (const Chunk& chunk : chunks) {
+            const size_t n = n_input[chunk.member];
+            const size_t info =
+                info_for(chunk.member) >= 2 ? std::max<size_t>(2, (info_for(chunk.member) * chunk.length) / n)
+                                            : info_for(chunk.member);
+            const bool ext_glv = !external_glv_for(chunk.member, n).empty();
+            chunk_arena_bytes = std::max(
+                chunk_arena_bytes, compute_arena_bytes_for_msm<Curve>(chunk.length, ext_glv, info, /*max_threads=*/1));
+        }
+        const size_t workers_by_budget = chunk_arena_bytes > 0
+                                             ? std::max<size_t>(1, CHUNK_ARENA_BUDGET / chunk_arena_bytes)
+                                             : std::numeric_limits<size_t>::max();
         std::vector<typename Curve::Element> partials(chunks.size());
-        const size_t num_workers = std::min(pool_width, chunks.size());
+        const size_t num_workers = std::min({ pool_width, chunks.size(), workers_by_budget });
+        std::unique_ptr<std::byte[]> chunk_arena_owner; // NOLINT(cppcoreguidelines-avoid-c-arrays)
+        if (chunk_arena_bytes > 0) {
+            chunk_arena_owner = std::make_unique_for_overwrite<std::byte[]>(
+                num_workers * chunk_arena_bytes); // NOLINT(cppcoreguidelines-avoid-c-arrays)
+        }
         std::atomic<size_t> next_chunk{ 0 };
-        bb::parallel_for(num_workers, [&](size_t) {
+        bb::parallel_for(num_workers, [&](size_t tid) {
+            std::span<std::byte> worker_arena;
+            if (chunk_arena_bytes > 0) {
+                worker_arena = { chunk_arena_owner.get() + (tid * chunk_arena_bytes), chunk_arena_bytes };
+            }
             while (true) {
                 const size_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
                 if (c >= chunks.size()) {
@@ -455,8 +480,9 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
                 PolynomialSpan<const ScalarField> sp(
                     0, std::span<const ScalarField>(scalar_arrays[m].data() + offset, length));
                 partials[c] = pippenger_round_parallel<Curve>(
-                    sp, point_arrays[m].subspan(offset), info, glv, {}, /*max_threads=*/1);
+                    sp, point_arrays[m].subspan(offset), info, glv, worker_arena, /*max_threads=*/1);
             }
+            round_parallel_detail::release_arena_slice(worker_arena);
         });
         // out_results starts at infinity; summing in chunk order keeps the result deterministic.
         for (size_t c = 0; c < chunks.size(); ++c) {
