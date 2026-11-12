@@ -198,6 +198,21 @@ Outputs mixed_circuit(Builder& builder, const std::vector<uint32_t>& in)
              .pairing_tags = { first_tag, second_tag, result_tag } };
 }
 
+// Meets the constant 11 and the range 1023 again, and tags the cached constant 11. Expects two inputs.
+Outputs follow_up_circuit(Builder& builder, const std::vector<uint32_t>& in)
+{
+    const uint32_t eleven = builder.put_constant_variable(fr(11));
+    const uint32_t thirteen = builder.put_constant_variable(fr(13));
+    builder.create_small_range_constraint(eleven, 1023);
+    const uint32_t sum = add_witness(builder, builder.get_variable(in[0]) + builder.get_variable(in[1]));
+    builder.create_add_gate(
+        { .a = in[0], .b = in[1], .c = sum, .a_scaling = 1, .b_scaling = 1, .c_scaling = -1, .const_scaling = 0 });
+    builder.create_small_range_constraint(add_witness(builder, fr(1000)), 1023);
+    builder.create_dyadic_range_constraint(add_witness(builder, fr(100)), 7, "follow up");
+    builder.assert_equal(sum, add_witness(builder, builder.get_variable(sum)));
+    return { .variables = { eleven, thirteen, sum }, .pairing_tags = {} };
+}
+
 // The seeds of `inputs`, one per distinct index in order of first appearance, and each input's seed position.
 struct Seeds {
     std::vector<uint32_t> indices;
@@ -250,6 +265,143 @@ TEST(UltraCircuitBuilderSplice, MatchesSerialBuild)
     const SpliceResult result = build_both_ways(serial, target.builder, inputs, mixed_circuit);
     ASSERT_EQ(result.refusal, SpliceRefusal::None);
     expect_same_builder(target.builder, serial);
+}
+
+TEST(UltraCircuitBuilderSplice, TwoSplicesInARow)
+{
+    Target target;
+    Builder serial = target.builder;
+    const std::vector<uint32_t> first_inputs{
+        target.inputs[0], target.inputs[1], target.inputs[2], target.inputs[3], target.inputs[1], target.inputs[5],
+    };
+    ASSERT_EQ(build_both_ways(serial, target.builder, first_inputs, mixed_circuit).refusal, SpliceRefusal::None);
+    const std::vector<uint32_t> second_inputs{ target.inputs[4], target.inputs[5] };
+    ASSERT_EQ(build_both_ways(serial, target.builder, second_inputs, follow_up_circuit).refusal, SpliceRefusal::None);
+    expect_same_builder(target.builder, serial);
+}
+
+// Records `circuit` on the seeds of `inputs` with the given seed values, applies `before_splice` to a fresh target and
+// the recording, then checks that the splice is refused for `expected` and changes nothing. Every Target has the same
+// variable indices, so `inputs` may come from any of them.
+void expect_refusal(const std::vector<uint32_t>& inputs,
+                    const Circuit& circuit,
+                    const std::function<void(Builder& target, Builder& recording)>& before_splice,
+                    const SpliceRefusal expected,
+                    const std::vector<fr>& seed_values = {})
+{
+    Target target;
+    const Seeds seeds(target.builder, inputs);
+    Builder recording(SpliceRecording{}, seed_values.empty() ? seeds.values : seed_values);
+    circuit(recording, seeds.positions);
+    before_splice(target.builder, recording);
+    const Builder before = target.builder;
+    const SpliceResult result = target.builder.splice(recording, seeds.indices);
+    EXPECT_EQ(result.refusal, expected);
+    EXPECT_TRUE(result.index_map.empty());
+    expect_same_builder_state(target.builder, before);
+}
+
+const auto no_change = [](Builder& /*target*/, Builder& /*recording*/) {};
+
+TEST(UltraCircuitBuilderSplice, RefusesTaggedSeed)
+{
+    Target target;
+    const std::vector<uint32_t> inputs{ target.inputs[4], target.inputs[5] };
+    expect_refusal(
+        inputs,
+        follow_up_circuit,
+        [seed = target.inputs[5]](Builder& builder, Builder& /*recording*/) {
+            builder.create_small_range_constraint(seed, 15);
+        },
+        SpliceRefusal::InputTag);
+}
+
+TEST(UltraCircuitBuilderSplice, RefusesSeedsSharingACycle)
+{
+    Target target;
+    const std::vector<uint32_t> inputs{ target.inputs[0], target.inputs[3] };
+    expect_refusal(
+        inputs,
+        follow_up_circuit,
+        [&](Builder& builder, Builder& /*recording*/) { builder.assert_equal(target.inputs[0], target.inputs[3]); },
+        SpliceRefusal::InputCycle);
+}
+
+TEST(UltraCircuitBuilderSplice, RefusesChangedSeedValue)
+{
+    Target target;
+    const std::vector<uint32_t> inputs{ target.inputs[4], target.inputs[5] };
+    expect_refusal(inputs, follow_up_circuit, no_change, SpliceRefusal::InputValue, { fr(123456), fr(10) });
+}
+
+TEST(UltraCircuitBuilderSplice, RefusesFailedBuilder)
+{
+    Target target;
+    const std::vector<uint32_t> inputs{ target.inputs[4], target.inputs[5] };
+    expect_refusal(
+        inputs,
+        follow_up_circuit,
+        [](Builder& builder, Builder& /*recording*/) { builder.failure("target failed"); },
+        SpliceRefusal::Failed);
+    expect_refusal(
+        inputs,
+        follow_up_circuit,
+        [](Builder& /*target*/, Builder& recording) {
+            recording.create_small_range_constraint(add_witness(recording, fr(300)), 255);
+        },
+        SpliceRefusal::Failed);
+}
+
+TEST(UltraCircuitBuilderSplice, RefusesAddedPublicInput)
+{
+    Target target;
+    const std::vector<uint32_t> inputs{ target.inputs[4], target.inputs[5] };
+    expect_refusal(
+        inputs,
+        follow_up_circuit,
+        [](Builder& /*target*/, Builder& recording) { recording.add_public_variable(fr(42)); },
+        SpliceRefusal::PublicInput);
+}
+
+TEST(UltraCircuitBuilderSplice, RefusesFinalizedPublicInputs)
+{
+    Target target;
+    const std::vector<uint32_t> inputs{ target.inputs[4], target.inputs[5] };
+    expect_refusal(
+        inputs,
+        follow_up_circuit,
+        [](Builder& /*target*/, Builder& recording) { recording.finalize_public_inputs(); },
+        SpliceRefusal::PublicInput);
+}
+
+TEST(UltraCircuitBuilderSplice, RefusesUnrecordedTagPermutationEntry)
+{
+    Target target;
+    const std::vector<uint32_t> inputs{ target.inputs[4], target.inputs[5] };
+    expect_refusal(
+        inputs,
+        follow_up_circuit,
+        [](Builder& /*target*/, Builder& recording) {
+            // A tag past the current one, so no other count changes.
+            const uint32_t tag = recording.get_current_tag() + 1;
+            recording.set_tau_at_index(tag, tag);
+        },
+        SpliceRefusal::UnknownForm);
+}
+
+TEST(UltraCircuitBuilderSplice, RefusesEllipticRow)
+{
+    Target target;
+    const std::vector<uint32_t> inputs{ target.inputs[4], target.inputs[5] };
+    expect_refusal(
+        inputs,
+        follow_up_circuit,
+        [](Builder& /*target*/, Builder& recording) {
+            const uint32_t x3 = recording.add_variable(fr(1));
+            const uint32_t y3 = recording.add_variable(fr(2));
+            recording.create_ecc_dbl_gate({ .x1 = 0, .y1 = 1, .x3 = x3, .y3 = y3 });
+        },
+        SpliceRefusal::RowForm);
 }
 
 } // namespace
