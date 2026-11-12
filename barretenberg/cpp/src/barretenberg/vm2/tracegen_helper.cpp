@@ -416,7 +416,9 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
             // other job group so it can use the existing top-level thread pool.
             ExecutionTraceBuilder exec_builder;
             AVM_TRACK_TIME("tracegen/execution", exec_builder.process(events.execution, trace));
-            clear_events(events.execution);
+            // Freeing the execution events takes tens of ms on a large transaction, and no job of the group reads
+            // them: free them as one of its jobs, so the pool is not idle meanwhile.
+            jobs.emplace_back([&]() { clear_events(events.execution); });
             execute_jobs(jobs);
             AVM_TRACK_TIME("tracegen/memory", memory_trace_builder.write_rows(trace));
             clear_events(events.memory);
