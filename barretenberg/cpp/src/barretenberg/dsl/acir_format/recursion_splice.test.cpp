@@ -32,6 +32,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#if defined(__GLIBC__)
+#include <pthread.h>
+#endif
 
 /**
  * A circuit whose Honk recursion constraints are built on scratch builders and spliced must equal the serial build of
@@ -48,6 +51,15 @@ namespace {
 using Builder = UltraCircuitBuilder;
 using bb::test_utils::CompareValues;
 using bb::test_utils::expect_same_builder;
+using bb::test_utils::expect_same_builder_state;
+
+// Mirrors the condition under which production starts scratch builds.
+#if !defined(NO_MULTITHREADING) && !defined(__wasm__) && !defined(_WIN32) && !defined(OMP_MULTITHREADING) &&           \
+    defined(__cpp_exceptions) && !defined(BB_NO_EXCEPTIONS)
+constexpr bool SCRATCH_BUILDS_AVAILABLE = true;
+#else
+constexpr bool SCRATCH_BUILDS_AVAILABLE = false;
+#endif
 
 constexpr size_t NUM_INNER_PUBLIC_INPUTS = 2;
 // The largest range a small range constraint accepts.
@@ -257,6 +269,9 @@ class RecursionSpliceTest : public ::testing::Test {
 
     void SetUp() override
     {
+        if (!SCRATCH_BUILDS_AVAILABLE) {
+            GTEST_SKIP() << "this build starts no scratch builds";
+        }
         // Three Honk constraints need three scratch threads beside the building thread.
         if (bb::get_num_cpus() < 4) {
             GTEST_SKIP() << "needs at least four threads";
@@ -342,6 +357,93 @@ TEST_F(RecursionSpliceTest, RollupConstraint)
 TEST_F(RecursionSpliceTest, EligibleAfterIneligibleIsBuiltSerially)
 {
     expect_spliced({ &*zk_proof, &honk_proofs[0] }, 0);
+}
+
+TEST_F(RecursionSpliceTest, ScratchThreadsGetAMainThreadSizedStack)
+{
+#if !defined(__GLIBC__)
+    GTEST_SKIP() << "reads the stack size with pthread_getattr_np";
+#else
+    std::atomic<size_t> stack_bytes = 0;
+    const auto [serial, spliced] =
+        build_both(make_program({ &honk_proofs[0] }), {}, Hooks{ .after_scratch_build = [&](size_t /*index*/) {
+                       pthread_attr_t attributes;
+                       size_t size = 0;
+                       if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
+                           pthread_attr_getstacksize(&attributes, &size);
+                           pthread_attr_destroy(&attributes);
+                       }
+                       stack_bytes.store(size);
+                   } });
+    EXPECT_EQ(spliced.stats.spliced, 1);
+    EXPECT_GE(stack_bytes.load(), size_t{ 8 } << 20);
+#endif
+}
+
+// A scratch build reads its inputs when it starts, so a constraint naming a variable the builder lacks gets none.
+TEST_F(RecursionSpliceTest, ConstraintWithAnInputOutOfRangeIsNotLaunched)
+{
+    const HookReset reset;
+    const InnerProof& inner = honk_proofs[0];
+    const Builder builder(inner.witness, {}, /*is_write_vk_mode=*/false);
+    const auto out_of_range = static_cast<uint32_t>(builder.get_num_variables());
+    EXPECT_NE(RecursionSplicer::launch(builder, { inner.constraint }), nullptr);
+    const std::vector<std::function<void(RecursionConstraint&)>> breaks{
+        [&](RecursionConstraint& constraint) { constraint.proof.back() = out_of_range; },
+        [&](RecursionConstraint& constraint) { constraint.key.back() = out_of_range; },
+        [&](RecursionConstraint& constraint) { constraint.public_inputs.back() = out_of_range; },
+        [&](RecursionConstraint& constraint) { constraint.key_hash = out_of_range; },
+    };
+    for (size_t i = 0; i < breaks.size(); ++i) {
+        RecursionConstraint constraint = inner.constraint;
+        breaks[i](constraint);
+        EXPECT_EQ(RecursionSplicer::launch(builder, { constraint }), nullptr) << i;
+    }
+}
+
+TEST_F(RecursionSpliceTest, RefusesAConstraintOtherThanTheLaunchedOne)
+{
+    const HookReset reset;
+    RecursionSpliceTestHooks::first_take = FirstTake::Wait;
+    RecursionSpliceStats stats;
+    RecursionSpliceTestHooks::stats = &stats;
+    const InnerProof& inner = honk_proofs[0];
+    Builder builder(inner.witness, {}, /*is_write_vk_mode=*/false);
+    const std::unique_ptr<RecursionSplicer> splicer = RecursionSplicer::launch(builder, { inner.constraint });
+    ASSERT_NE(splicer, nullptr);
+    RecursionConstraint other = inner.constraint;
+    std::swap(other.proof[0], other.proof[1]);
+    const Builder before = builder;
+    EXPECT_FALSE(splicer->take(0, other, builder).has_value());
+    expect_same_builder_state(builder, before);
+    splicer->report();
+    EXPECT_EQ(stats.spliced, 0);
+    EXPECT_EQ(stats.refused, 1);
+    EXPECT_EQ(stats.first_refusal, "the constraint changed since the scratch build started");
+}
+
+// A later constraint other than the launched one is refused too, once its scratch build is cancelled and joined.
+TEST_F(RecursionSpliceTest, RefusesALaterConstraintOtherThanTheLaunchedOne)
+{
+    const HookReset reset;
+    RecursionSpliceTestHooks::first_take = FirstTake::Wait;
+    RecursionSpliceStats stats;
+    RecursionSpliceTestHooks::stats = &stats;
+    const AcirProgram program = make_program({ &honk_proofs[0], &honk_proofs[1] });
+    const std::vector<RecursionConstraint>& constraints = program.constraints.honk_recursion_constraints;
+    Builder builder(program.witness, {}, /*is_write_vk_mode=*/false);
+    const std::unique_ptr<RecursionSplicer> splicer = RecursionSplicer::launch(builder, constraints);
+    ASSERT_NE(splicer, nullptr);
+    EXPECT_TRUE(splicer->take(0, constraints[0], builder).has_value());
+    RecursionConstraint other = constraints[1];
+    std::swap(other.proof[0], other.proof[1]);
+    const Builder before = builder;
+    EXPECT_FALSE(splicer->take(1, other, builder).has_value());
+    expect_same_builder_state(builder, before);
+    splicer->finish();
+    EXPECT_EQ(stats.spliced, 1);
+    EXPECT_EQ(stats.refused, 1);
+    EXPECT_EQ(stats.first_refusal, "the constraint changed since the scratch build started");
 }
 
 TEST_F(RecursionSpliceTest, LoneConstraintBuiltInPlace)

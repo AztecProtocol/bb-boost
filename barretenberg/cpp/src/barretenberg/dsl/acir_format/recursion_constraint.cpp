@@ -149,7 +149,7 @@ HonkRecursionConstraintsOutput<UltraCircuitBuilder> create_recursion_constraints
         }
 
         std::optional<HonkRecursionConstraintOutput<UltraCircuitBuilder>> spliced =
-            splicer != nullptr ? splicer->take(index, builder) : std::nullopt;
+            splicer != nullptr ? splicer->take(index, constraint, builder) : std::nullopt;
         HonkRecursionConstraintOutput<UltraCircuitBuilder> honk_recursion_constraint =
             spliced.has_value() ? std::move(*spliced) : create_ultra_honk_recursion_constraint(builder, constraint);
 

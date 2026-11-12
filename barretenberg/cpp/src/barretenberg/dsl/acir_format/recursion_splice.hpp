@@ -84,8 +84,9 @@ class RecursionSplicer {
      * @brief Start one scratch build per leading eligible constraint of `honk_constraints`, at most one fewer than the
      * worker threads; null when none starts.
      * @details Call on the building thread after `builder` holds the witness and before any opcode reaches it. Starts
-     * nothing for a builder without a witness, with fewer than three threads, without native threads and exceptions,
-     * or when starting fails. The engine is get_randomness() and must stay the same object until the last splice.
+     * nothing for a builder without a witness, with fewer than three threads, without native threads, pthreads and
+     * exceptions, under OpenMP, or when starting fails. A constraint naming a witness index the builder does not have
+     * is not eligible. The engine is get_randomness() and must stay the same object until the last splice.
      */
     static std::unique_ptr<RecursionSplicer> launch(const bb::UltraCircuitBuilder& builder,
                                                     const std::vector<RecursionConstraint>& honk_constraints);
@@ -102,14 +103,15 @@ class RecursionSplicer {
     ~RecursionSplicer();
 
     /**
-     * @brief Splice the scratch build of Honk recursion constraint `index` into `builder` and return its output bound
-     * to `builder`; nullopt when the constraint must be built serially.
+     * @brief Splice the scratch build of Honk recursion constraint `index`, which is `constraint`, into `builder` and
+     * return its output bound to `builder`; nullopt when the constraint must be built serially.
      * @details Call on the building thread exactly where the serial build of that constraint would start, once per
-     * index in increasing order. On nullopt, `builder` and the engine are unchanged. Index 0 is spliced only when its
-     * scratch build has already finished; otherwise that build is cancelled and nullopt returned without waiting.
-     * Every later index waits for its scratch build.
+     * index in increasing order. On nullopt, `builder` and the engine are unchanged. A `constraint` other than the one
+     * launched at `index` is refused once its scratch build is cancelled and joined. Otherwise index 0 is spliced only
+     * if its build has finished, and is else cancelled and nullopt returned at once; a later index waits for its build.
      */
     std::optional<HonkRecursionConstraintOutput<bb::UltraCircuitBuilder>> take(size_t index,
+                                                                               const RecursionConstraint& constraint,
                                                                                bb::UltraCircuitBuilder& builder);
 
     /**

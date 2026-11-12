@@ -11,15 +11,18 @@
 #include "barretenberg/stdlib/primitives/builder_binding.hpp"
 #include "barretenberg/stdlib/special_public_inputs/special_public_inputs.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <exception>
 #include <unordered_map>
 #include <utility>
 
-// Scratch builds need native threads (on wasm the parallel_for pool is shared by every thread) and exceptions.
-#if !defined(NO_MULTITHREADING) && !defined(__wasm__) && defined(__cpp_exceptions) && !defined(BB_NO_EXCEPTIONS)
+// Scratch builds need native threads with a parallel_for pool and core count of their own (wasm shares the pool between
+// threads, and OpenMP loops ignore the core count), pthreads to size their stacks, and exceptions.
+#if !defined(NO_MULTITHREADING) && !defined(__wasm__) && !defined(_WIN32) && !defined(OMP_MULTITHREADING) &&           \
+    defined(__cpp_exceptions) && !defined(BB_NO_EXCEPTIONS)
 #define BB_RECURSION_SPLICE_AVAILABLE 1
-#include <thread>
+#include <pthread.h>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -36,10 +39,21 @@ namespace {
 // Scratch builds start only with at least this many threads, and use at most all but the building thread.
 constexpr size_t MIN_THREADS = 3;
 
-bool is_eligible(const RecursionConstraint& constraint)
+// 8 MiB, the usual main-thread default; a scratch build needs more stack than some platforms give other threads.
+constexpr size_t SCRATCH_STACK_BYTES = size_t{ 8 } << 20;
+
+/**
+ * @brief Whether a scratch build may start for `constraint` on a builder of `num_variables` variables.
+ * @details Its inputs are read when it starts, before the serial build would reject a malformed constraint, so each
+ * must be a variable of the builder.
+ */
+bool is_eligible(const RecursionConstraint& constraint, const size_t num_variables)
 {
+    const auto exists = [num_variables](const uint32_t index) { return index < num_variables; };
     return (constraint.proof_type == HONK || constraint.proof_type == ROLLUP_HONK) &&
-           constraint.predicate.is_constant && constraint.predicate.value == bb::fr::one();
+           constraint.predicate.is_constant && constraint.predicate.value == bb::fr::one() &&
+           std::ranges::all_of(constraint.proof, exists) && std::ranges::all_of(constraint.key, exists) &&
+           std::ranges::all_of(constraint.public_inputs, exists) && exists(constraint.key_hash);
 }
 
 /**
@@ -89,9 +103,10 @@ std::string refusal_reason(const SpliceRefusal refusal)
 
 /**
  * @brief Returns to the system the memory that scratch threads have freed.
- * @details It stays resident in each thread's malloc arena, which no other thread allocates from. While a scratch
- * builder lives, that memory lies in free blocks below the builder's own, which glibc can return; once the builder is
- * destroyed its arena is a single top block, which glibc trims only in the main arena.
+ * @details Freed blocks stay resident in the malloc arena of the thread that allocated them, which the building thread
+ * does not allocate from. While a scratch builder lives, that memory lies in free blocks below the builder's own, which
+ * glibc can return; once the builder is destroyed its arena is a single top block, which glibc trims only in the main
+ * arena.
  */
 void return_freed_memory()
 {
@@ -138,6 +153,8 @@ int64_t milliseconds_between(const std::chrono::steady_clock::time_point from,
 
 struct RecursionSplicer::Scratch {
     size_t index;
+    // The constraint as launched; take() splices only for an equal one.
+    RecursionConstraint original;
     // seed_indices[i] is the real index of scratch input variable i; `constraint` names scratch inputs instead.
     std::vector<uint32_t> seed_indices;
     std::vector<bb::fr> seed_values;
@@ -153,13 +170,17 @@ struct RecursionSplicer::Scratch {
     Clock::time_point finished_at;
     std::atomic<bool> finished = false;
 
-    std::thread thread;
+    bb::numeric::RNG* engine = nullptr;
+    pthread_t thread{};
+    // Started and not yet joined.
+    bool running = false;
 
     // Inputs are numbered by distinct real index at first appearance in the order proof, key, public inputs, key
     // hash, so two inputs share a scratch variable exactly when they share a real one.
-    Scratch(const UltraCircuitBuilder& real, const RecursionConstraint& original, const size_t scratch_index)
+    Scratch(const UltraCircuitBuilder& real, const RecursionConstraint& launched, const size_t scratch_index)
         : index(scratch_index)
-        , constraint(original)
+        , original(launched)
+        , constraint(launched)
         , cancellation(scratch_index)
     {
         std::unordered_map<uint32_t, uint32_t> seed_of;
@@ -183,13 +204,50 @@ struct RecursionSplicer::Scratch {
         seed(constraint.key_hash);
     }
 
-    void build(bb::numeric::RNG& engine)
+    /**
+     * @brief Runs build() on a thread of its own with a stack of SCRATCH_STACK_BYTES; throws when it cannot start.
+     */
+    void start_thread(bb::numeric::RNG& draw_engine)
     {
-        // The core count and the parallel_for pool are per thread, so at one core this thread's loops run inline
-        // instead of starting a worker pool of its own.
-        bb::set_parallel_for_concurrency(1);
+        engine = &draw_engine;
+        pthread_attr_t attributes;
+        if (pthread_attr_init(&attributes) != 0) {
+            throw_or_abort("RecursionSplicer: could not start a scratch thread");
+        }
+        int status = pthread_attr_setstacksize(&attributes, SCRATCH_STACK_BYTES);
+        if (status == 0) {
+            status = pthread_create(
+                &thread,
+                &attributes,
+                [](void* scratch) -> void* {
+                    static_cast<Scratch*>(scratch)->build();
+                    return nullptr;
+                },
+                this);
+        }
+        pthread_attr_destroy(&attributes);
+        if (status != 0) {
+            throw_or_abort("RecursionSplicer: could not start a scratch thread");
+        }
+        running = true;
+    }
+
+    void join()
+    {
+        if (running) {
+            pthread_join(thread, nullptr);
+            running = false;
+        }
+    }
+
+    // Throws nothing: whatever the build throws is kept in `error`.
+    void build() noexcept
+    {
         try {
-            const std::unique_ptr<bb::numeric::RNG::DrawScope> scope = engine.draw_from(start);
+            // parallel_for's core count and pool are per thread, so at one core this thread's loops run inline
+            // instead of starting a worker pool of its own.
+            bb::set_parallel_for_concurrency(1);
+            const std::unique_ptr<bb::numeric::RNG::DrawScope> scope = engine->draw_from(start);
             builder =
                 std::make_unique<UltraCircuitBuilder>(SpliceRecording{ .cancellation = &cancellation }, seed_values);
             output = create_ultra_honk_recursion_constraint(*builder, constraint);
@@ -226,9 +284,7 @@ RecursionSplicer::RecursionSplicer(bb::numeric::RNG& engine)
 RecursionSplicer::~RecursionSplicer()
 {
     for (const auto& scratch : scratches_) {
-        if (scratch->thread.joinable()) {
-            scratch->thread.join();
-        }
+        scratch->join();
         scratch->discard();
     }
 }
@@ -236,8 +292,9 @@ RecursionSplicer::~RecursionSplicer()
 std::unique_ptr<RecursionSplicer> RecursionSplicer::launch(const UltraCircuitBuilder& builder,
                                                            const std::vector<RecursionConstraint>& honk_constraints)
 {
+    const size_t num_variables = builder.get_num_variables();
     if (RecursionSpliceTestHooks::disabled || builder.is_write_vk_mode() || honk_constraints.empty() ||
-        !is_eligible(honk_constraints.front())) {
+        !is_eligible(honk_constraints.front(), num_variables)) {
         return nullptr;
     }
     const size_t num_threads = bb::get_num_cpus();
@@ -251,7 +308,7 @@ std::unique_ptr<RecursionSplicer> RecursionSplicer::launch(const UltraCircuitBui
         // list. Each start position is the previous one moved by the previous constraint's predicted draws.
         bb::numeric::RNG::Position position = engine.position();
         for (const RecursionConstraint& constraint : honk_constraints) {
-            if (splicer->scratches_.size() == num_threads - 1 || !is_eligible(constraint)) {
+            if (splicer->scratches_.size() == num_threads - 1 || !is_eligible(constraint, num_variables)) {
                 break;
             }
             auto scratch = std::make_unique<Scratch>(builder, constraint, splicer->scratches_.size());
@@ -262,7 +319,7 @@ std::unique_ptr<RecursionSplicer> RecursionSplicer::launch(const UltraCircuitBui
         }
         splicer->launched_at_ = Clock::now();
         for (const auto& scratch : splicer->scratches_) {
-            scratch->thread = std::thread([&target = *scratch, &engine] { target.build(engine); });
+            scratch->start_thread(engine);
             ++splicer->stats_.launched;
         }
     } catch (...) {
@@ -284,17 +341,22 @@ void RecursionSplicer::refuse(Scratch& scratch, std::string reason)
     scratch.discard();
 }
 
-std::optional<HonkRecursionConstraintOutput<UltraCircuitBuilder>> RecursionSplicer::take(const size_t index,
-                                                                                         UltraCircuitBuilder& builder)
+std::optional<HonkRecursionConstraintOutput<UltraCircuitBuilder>> RecursionSplicer::take(
+    const size_t index, const RecursionConstraint& constraint, UltraCircuitBuilder& builder)
 {
     if (index >= scratches_.size()) {
         return std::nullopt;
     }
     Scratch& scratch = *scratches_[index];
+    if (!(constraint == scratch.original)) {
+        scratch.join();
+        refuse(scratch, "the constraint changed since the scratch build started");
+        return std::nullopt;
+    }
     if (index == 0 && !wait_for_first(scratch)) {
         return std::nullopt;
     }
-    scratch.thread.join();
+    scratch.join();
     if (index == 0) {
         first_finished_at_ = scratch.finished_at;
     }
@@ -394,7 +456,7 @@ std::unique_ptr<RecursionSplicer> RecursionSplicer::launch(const UltraCircuitBui
 void RecursionSplicer::refuse(Scratch& /*scratch*/, std::string /*reason*/) {}
 
 std::optional<HonkRecursionConstraintOutput<UltraCircuitBuilder>> RecursionSplicer::take(
-    const size_t /*index*/, UltraCircuitBuilder& /*builder*/)
+    const size_t /*index*/, const RecursionConstraint& /*constraint*/, UltraCircuitBuilder& /*builder*/)
 {
     return std::nullopt;
 }
