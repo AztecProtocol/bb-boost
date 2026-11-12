@@ -12,10 +12,12 @@
 #include "barretenberg/stdlib_circuit_builders/plookup_tables/types.hpp"
 
 #include "circuit_builder_base.hpp"
+#include "circuit_splice.hpp"
 #include "rom_ram_logic.hpp"
 #include <atomic>
 #include <deque>
 #include <optional>
+#include <span>
 #include <unordered_set>
 
 #include "barretenberg/serialize/msgpack.hpp"
@@ -236,6 +238,9 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     // The set of lookup tables used by the circuit, plus the gate data for the lookups from each table
     std::deque<plookup::BasicTable> lookup_tables;
 
+    // Set only on a builder constructed with SpliceRecording.
+    std::optional<SpliceLog> splice_log_;
+
   public:
     // Storage for wires and selectors for all gate types
     ExecutionTrace blocks;
@@ -340,6 +345,33 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
                                DEFAULT_TAG); // tau fixes the `DEFAULT_TAG`, as we assume that `DEFAULT_TAG` is not
                                              // involved in any non-trivial multiset-equality checks.
     };
+
+    /**
+     * @brief A builder that records what splice must replay of the circuit then built on it.
+     * @details Its variables start with one per value of `seed_values`, in order, followed by the zero constant; the
+     * circuit is built on these seeds and later appended to another builder by that builder's splice.
+     */
+    UltraCircuitBuilder_(SpliceRecording /*unused*/, std::span<const FF> seed_values)
+        requires(!ExecutionTrace::IS_MEGA_ARITHMETIZATION)
+        : CircuitBuilderBase<FF>(false)
+    {
+        this->reserve_variables(seed_values.size() + 1);
+        for (const FF& value : seed_values) {
+            this->add_variable(value);
+        }
+        this->set_zero_idx(put_constant_variable(FF::zero()));
+        this->set_tau_at_index(DEFAULT_TAG, DEFAULT_TAG);
+        // splice treats every row after the zero constant's fixing row as recorded.
+        BB_ASSERT_EQ(blocks.get_total_content_size(), blocks.arithmetic.size());
+        SpliceLog log;
+        log.num_seeds = static_cast<uint32_t>(seed_values.size());
+        log.num_prefix_variables = static_cast<uint32_t>(this->get_num_variables());
+        log.num_prefix_arithmetic_rows = blocks.arithmetic.size();
+        log.num_prefix_gates = this->num_gates();
+        log.num_prefix_used_witnesses = used_witnesses.size();
+        splice_log_.emplace(std::move(log));
+    }
+
     UltraCircuitBuilder_(const UltraCircuitBuilder_& other) = default;
     UltraCircuitBuilder_(UltraCircuitBuilder_&& other) = default;
     UltraCircuitBuilder_& operator=(const UltraCircuitBuilder_& other) = default;
@@ -347,6 +379,8 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     ~UltraCircuitBuilder_() override { release_storage_pages(); }
 
     void finalize_circuit();
+
+    bool is_recording() const { return splice_log_.has_value(); }
 
     void create_add_gate(const add_triple_<FF>& in);
     void create_big_mul_add_gate(const mul_quad_<FF>& in, const bool use_next_gate_w_4 = false);
@@ -470,6 +504,14 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         return std::max(get_tables_size(), num_filled_gates);
     }
 
+    void assert_equal(const uint32_t a_idx, const uint32_t b_idx, std::string const& msg = "assert_equal") override
+    {
+        if (splice_log_.has_value()) [[unlikely]] {
+            splice_log_->events.push_back({ SpliceLog::Event::Kind::AssertEqual, a_idx, b_idx });
+        }
+        CircuitBuilderBase<FF>::assert_equal(a_idx, b_idx, msg);
+    }
+
     void assert_equal_constant(const uint32_t a_idx, const FF& b, std::string const& msg = "assert equal constant")
     {
         if (this->get_variable(a_idx) != b && !this->failed()) {
@@ -587,6 +629,9 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         }
 
         BB_ASSERT_EQ(this->real_variable_tags[this->real_variable_index[variable_index]], DEFAULT_TAG);
+        if (splice_log_.has_value()) [[unlikely]] {
+            splice_log_->events.push_back({ SpliceLog::Event::Kind::Tag, variable_index, tag });
+        }
         this->real_variable_tags[this->real_variable_index[variable_index]] = tag;
     }
     /**

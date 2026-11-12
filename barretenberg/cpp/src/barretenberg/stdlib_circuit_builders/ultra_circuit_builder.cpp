@@ -404,6 +404,11 @@ uint32_t UltraCircuitBuilder_<ExecutionTrace>::put_constant_variable(const FF& v
         return constant_variable_indices.at(variable);
     } else {
         uint32_t variable_index = this->add_variable(variable);
+        if (splice_log_.has_value()) [[unlikely]] {
+            splice_log_->constants.push_back({ .variable = variable_index,
+                                               .arithmetic_row = blocks.arithmetic.size(),
+                                               .used_witness = used_witnesses.size() });
+        }
         fix_witness(variable_index, variable);
         constant_variable_indices.insert({ variable, variable_index });
         return variable_index;
@@ -614,6 +619,12 @@ typename UltraCircuitBuilder_<ExecutionTrace>::RangeList UltraCircuitBuilder_<Ex
         const uint32_t index = this->add_variable(fr(target_range));
         result.variable_indices.emplace_back(index);
         assign_tag(index, result.range_tag);
+    }
+    if (splice_log_.has_value()) [[unlikely]] {
+        splice_log_->range_lists.push_back({ .target_range = target_range,
+                                             .range_tag = range_tag,
+                                             .staircase_size = static_cast<uint32_t>(result.variable_indices.size()),
+                                             .arithmetic_row = blocks.arithmetic.size() });
     }
     // Need this because these variables will not appear in the witness otherwise
     create_unconstrained_gates(result.variable_indices);
@@ -869,6 +880,9 @@ void UltraCircuitBuilder_<ExecutionTrace>::register_new_variable_range_constrain
     }
     BB_ASSERT_DEBUG(this->real_variable_index[variable_index] == variable_index);
     BB_ASSERT_DEBUG(this->real_variable_tags[variable_index] == DEFAULT_TAG);
+    if (splice_log_.has_value()) [[unlikely]] {
+        splice_log_->events.push_back({ SpliceLog::Event::Kind::Tag, variable_index, list->range_tag });
+    }
     this->real_variable_tags[variable_index] = list->range_tag;
     list->variable_indices.emplace_back(variable_index);
 }
