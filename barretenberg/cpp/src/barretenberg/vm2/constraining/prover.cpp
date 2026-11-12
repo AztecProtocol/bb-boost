@@ -210,7 +210,9 @@ void AvmProver::execute_log_derivative_inverse_round()
         size_t end;
     };
     std::vector<InverseChunk> chunks;
-    constexpr size_t MAX_ROWS_PER_CHUNK = 1 << 16;
+    // A row of the costliest lookups takes several times a typical row, so a larger chunk of one of them is left
+    // running alone at the end of the round.
+    constexpr size_t MAX_ROWS_PER_CHUNK = 1 << 12;
     const bool split_rows = bb::get_num_cpus() > 1;
     for (size_t i = 0; i < jobs.size(); ++i) {
         const size_t end = jobs[i].end_index;
