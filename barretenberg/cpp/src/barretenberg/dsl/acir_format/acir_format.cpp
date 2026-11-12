@@ -11,6 +11,7 @@
 #include "barretenberg/common/bb_bench.hpp"
 #include "barretenberg/common/log.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
+#include "barretenberg/dsl/acir_format/recursion_splice.hpp"
 #include "barretenberg/flavor/flavor.hpp"
 #include "barretenberg/honk/prover_instance_inspector.hpp"
 #include "barretenberg/stdlib/eccvm_verifier/verifier_commitment_key.hpp"
@@ -26,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <type_traits>
 #include <utility>
 
 namespace acir_format {
@@ -124,6 +126,13 @@ void translate_opcodes(Translation_& translation,
 template <typename Builder>
 void build_constraints(Builder& builder, AcirFormat& constraints, const ProgramMetadata& metadata)
 {
+    // Scratch builds of the leading Honk recursion constraints start before any opcode reaches the builder, so they
+    // overlap with everything built before those constraints.
+    std::unique_ptr<RecursionSplicer> splicer;
+    if constexpr (std::is_same_v<Builder, UltraCircuitBuilder>) {
+        splicer = RecursionSplicer::launch(builder, constraints.honk_recursion_constraints);
+    }
+
     bool collect_gates_per_opcode = metadata.collect_gates_per_opcode;
 
     if (collect_gates_per_opcode) {
@@ -322,7 +331,9 @@ void build_constraints(Builder& builder, AcirFormat& constraints, const ProgramM
         /*hn_recursion_data=*/
         { constraints.hn_recursion_constraints, constraints.original_opcode_indices.hn_recursion_constraints },
         /*chonk_recursion_data=*/
-        { constraints.chonk_recursion_constraints, constraints.original_opcode_indices.chonk_recursion_constraints });
+        { constraints.chonk_recursion_constraints, constraints.original_opcode_indices.chonk_recursion_constraints },
+        splicer.get());
+    splicer.reset();
 
     // Process the result of adding recursion constraints and propagate the public inputs as needed
     output.finalize(builder, is_hn_recursion_constraints, metadata.has_ipa_claim);

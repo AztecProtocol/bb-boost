@@ -1,0 +1,103 @@
+#pragma once
+
+#include "barretenberg/dsl/acir_format/recursion_constraint.hpp"
+#include "barretenberg/dsl/acir_format/recursion_constraint_output.hpp"
+#include "barretenberg/numeric/random/engine.hpp"
+#include "barretenberg/stdlib_circuit_builders/ultra_circuit_builder.hpp"
+
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace acir_format {
+
+/**
+ * @brief What one circuit build did with its scratch builds.
+ */
+struct RecursionSpliceStats {
+    size_t launched = 0;
+    size_t spliced = 0;
+    size_t refused = 0;
+    // Why the first refused constraint was built serially; empty when none was refused.
+    std::string first_refusal;
+};
+
+/**
+ * @brief Test-only switches of the recursion splice, all off by default.
+ * @details Set them only while no circuit is being built.
+ */
+struct RecursionSpliceTestHooks {
+    using ConstraintHook =
+        std::function<void(bb::UltraCircuitBuilder& builder, const RecursionConstraint& constraint, size_t index)>;
+
+    // Builds every recursion constraint serially.
+    static inline bool disabled = false;
+    // Runs on the building thread just before Honk recursion constraint `index` is spliced or built serially.
+    static inline ConstraintHook before_constraint;
+    // Runs on the building thread just after Honk recursion constraint `index` was spliced or built serially.
+    static inline ConstraintHook after_constraint;
+    // Runs on a scratch thread when its build of constraint `index` has finished; a throw refuses that build.
+    static inline std::function<void(size_t index)> after_scratch_build;
+    // Receives the counts of each build that started scratch builds.
+    static inline RecursionSpliceStats* stats = nullptr;
+};
+
+/**
+ * @brief Builds the leading eligible Honk recursion constraints of an Ultra circuit on scratch builders on their own
+ * threads, and splices each into the real builder when the serial order reaches it.
+ * @details A constraint is eligible when it verifies a plain or rollup Honk proof under a constant-true predicate.
+ * Whether a constraint is spliced or built serially never changes the circuit: a refused constraint is built serially
+ * on the unchanged builder and engine. Every scratch thread is joined before the object is destroyed.
+ */
+class RecursionSplicer {
+  public:
+    /**
+     * @brief Start one scratch build per leading eligible constraint of `honk_constraints`, at most one fewer than the
+     * worker threads; null when none starts.
+     * @details Call on the building thread after `builder` holds the witness and before any opcode reaches it. Starts
+     * nothing for a builder without a witness, with fewer than three threads, without native threads and exceptions,
+     * or when starting fails. The engine is get_randomness() and must stay the same object until the last splice.
+     */
+    static std::unique_ptr<RecursionSplicer> launch(const bb::UltraCircuitBuilder& builder,
+                                                    const std::vector<RecursionConstraint>& honk_constraints);
+
+    RecursionSplicer(const RecursionSplicer&) = delete;
+    RecursionSplicer(RecursionSplicer&&) = delete;
+    RecursionSplicer& operator=(const RecursionSplicer&) = delete;
+    RecursionSplicer& operator=(RecursionSplicer&&) = delete;
+
+    /**
+     * @brief Join every scratch thread and destroy every scratch builder.
+     */
+    ~RecursionSplicer();
+
+    /**
+     * @brief Splice the scratch build of Honk recursion constraint `index` into `builder` and return its output bound
+     * to `builder`; nullopt when the constraint must be built serially.
+     * @details Call on the building thread exactly where the serial build of that constraint would start, once per
+     * index in increasing order. On nullopt, `builder` and the engine are unchanged.
+     */
+    std::optional<HonkRecursionConstraintOutput<bb::UltraCircuitBuilder>> take(size_t index,
+                                                                               bb::UltraCircuitBuilder& builder);
+
+    /**
+     * @brief Log how many constraints were spliced and refused, and why the first refusal happened.
+     */
+    void report() const;
+
+  private:
+    struct Scratch;
+
+    explicit RecursionSplicer(bb::numeric::RNG& engine);
+    void refuse(Scratch& scratch, std::string reason);
+
+    // Unread in builds without native threads, where nothing is ever launched.
+    [[maybe_unused]] bb::numeric::RNG& engine_;
+    std::vector<std::unique_ptr<Scratch>> scratches_;
+    RecursionSpliceStats stats_;
+};
+
+} // namespace acir_format

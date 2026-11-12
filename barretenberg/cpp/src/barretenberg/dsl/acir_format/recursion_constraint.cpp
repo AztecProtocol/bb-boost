@@ -10,6 +10,7 @@
 #include "barretenberg/dsl/acir_format/chonk_recursion_constraints.hpp"
 #include "barretenberg/dsl/acir_format/honk_recursion_constraint.hpp"
 #include "barretenberg/dsl/acir_format/hypernova_recursion_constraint.hpp"
+#include "barretenberg/dsl/acir_format/recursion_splice.hpp"
 #include "barretenberg/dsl/acir_format/utils.hpp"
 
 namespace acir_format {
@@ -25,7 +26,8 @@ HonkRecursionConstraintsOutput<Builder> create_recursion_constraints(
     const RecursionConstraintData& honk_recursion_data,
     const RecursionConstraintData& avm_recursion_data,
     const RecursionConstraintData& hn_recursion_data,
-    const RecursionConstraintData& chonk_recursion_data)
+    const RecursionConstraintData& chonk_recursion_data,
+    [[maybe_unused]] RecursionSplicer* splicer)
 {
     static_assert(IsMegaBuilder<Builder>, "the Ultra arithmetization has its own specialization");
     bool has_honk_recursion_constraints = !honk_recursion_data.first.empty();
@@ -87,6 +89,28 @@ HonkRecursionConstraintsOutput<Builder> create_recursion_constraints(
     return output;
 }
 
+HonkRecursionConstraintOutput<UltraCircuitBuilder> create_ultra_honk_recursion_constraint(
+    UltraCircuitBuilder& builder, const RecursionConstraint& constraint)
+{
+    if (constraint.proof_type == HONK_ZK) {
+        return create_honk_recursion_constraints<UltraZKRecursiveFlavor_<UltraCircuitBuilder>,
+                                                 stdlib::recursion::honk::DefaultIO<UltraCircuitBuilder>>(builder,
+                                                                                                          constraint);
+    }
+    if (constraint.proof_type == HONK) {
+        return create_honk_recursion_constraints<UltraRecursiveFlavor_<UltraCircuitBuilder>,
+                                                 stdlib::recursion::honk::DefaultIO<UltraCircuitBuilder>>(builder,
+                                                                                                          constraint);
+    }
+    if (constraint.proof_type == ROLLUP_HONK || constraint.proof_type == ROOT_ROLLUP_HONK) {
+        // Use UltraRecursiveFlavor with RollupIO for rollup proofs (IO determines IPA handling)
+        return create_honk_recursion_constraints<UltraRecursiveFlavor_<UltraCircuitBuilder>,
+                                                 stdlib::recursion::honk::RollupIO>(builder, constraint);
+    }
+    bb::assert_failure("Invalid Honk proof type");
+    return {};
+}
+
 template <>
 HonkRecursionConstraintsOutput<UltraCircuitBuilder> create_recursion_constraints(
     UltraCircuitBuilder& builder,
@@ -96,7 +120,8 @@ HonkRecursionConstraintsOutput<UltraCircuitBuilder> create_recursion_constraints
     const RecursionConstraintData& honk_recursion_data,
     const RecursionConstraintData& avm_recursion_data,
     const RecursionConstraintData& hn_recursion_data,
-    const RecursionConstraintData& chonk_recursion_data)
+    const RecursionConstraintData& chonk_recursion_data,
+    RecursionSplicer* splicer)
 {
     bool has_honk_recursion_constraints = !honk_recursion_data.first.empty();
     bool has_avm_recursion_constraints = !avm_recursion_data.first.empty();
@@ -116,26 +141,20 @@ HonkRecursionConstraintsOutput<UltraCircuitBuilder> create_recursion_constraints
 
     HonkRecursionConstraintsOutput<UltraCircuitBuilder> output;
 
-    for (const auto& [constraint, opcode_idx] : zip_view(honk_recursion_data.first, honk_recursion_data.second)) {
-        HonkRecursionConstraintOutput<UltraCircuitBuilder> honk_recursion_constraint;
+    for (size_t index = 0; index < honk_recursion_data.first.size(); ++index) {
+        const RecursionConstraint& constraint = honk_recursion_data.first[index];
+        const size_t opcode_idx = honk_recursion_data.second.at(index);
+        if (RecursionSpliceTestHooks::before_constraint) {
+            RecursionSpliceTestHooks::before_constraint(builder, constraint, index);
+        }
 
-        if (constraint.proof_type == HONK_ZK) {
-            honk_recursion_constraint =
-                create_honk_recursion_constraints<UltraZKRecursiveFlavor_<UltraCircuitBuilder>,
-                                                  stdlib::recursion::honk::DefaultIO<UltraCircuitBuilder>>(builder,
-                                                                                                           constraint);
-        } else if (constraint.proof_type == HONK) {
-            honk_recursion_constraint =
-                create_honk_recursion_constraints<UltraRecursiveFlavor_<UltraCircuitBuilder>,
-                                                  stdlib::recursion::honk::DefaultIO<UltraCircuitBuilder>>(builder,
-                                                                                                           constraint);
-        } else if (constraint.proof_type == ROLLUP_HONK || constraint.proof_type == ROOT_ROLLUP_HONK) {
-            // Use UltraRecursiveFlavor with RollupIO for rollup proofs (IO determines IPA handling)
-            honk_recursion_constraint =
-                create_honk_recursion_constraints<UltraRecursiveFlavor_<UltraCircuitBuilder>,
-                                                  stdlib::recursion::honk::RollupIO>(builder, constraint);
-        } else {
-            bb::assert_failure("Invalid Honk proof type");
+        std::optional<HonkRecursionConstraintOutput<UltraCircuitBuilder>> spliced =
+            splicer != nullptr ? splicer->take(index, builder) : std::nullopt;
+        HonkRecursionConstraintOutput<UltraCircuitBuilder> honk_recursion_constraint =
+            spliced.has_value() ? std::move(*spliced) : create_ultra_honk_recursion_constraint(builder, constraint);
+
+        if (RecursionSpliceTestHooks::after_constraint) {
+            RecursionSpliceTestHooks::after_constraint(builder, constraint, index);
         }
 
         // Update output
@@ -164,6 +183,10 @@ HonkRecursionConstraintsOutput<UltraCircuitBuilder> create_recursion_constraints
         output.update_triple_ipa_opening(avm_output.points_accumulator, std::move(avm_output.triple_ipa_opening));
 
         gate_counter.track_diff(gates_per_opcode, opcode_idx);
+    }
+
+    if (splicer != nullptr) {
+        splicer->report();
     }
 
     return output;
@@ -297,7 +320,8 @@ template HonkRecursionConstraintsOutput<MegaCircuitBuilder> create_recursion_con
     const RecursionConstraintData&,
     const RecursionConstraintData&,
     const RecursionConstraintData&,
-    const RecursionConstraintData&);
+    const RecursionConstraintData&,
+    RecursionSplicer*);
 template HonkRecursionConstraintsOutput<MegaAppCircuitBuilder> create_recursion_constraints(
     MegaAppCircuitBuilder&,
     GateCounter<MegaAppCircuitBuilder>&,
@@ -306,7 +330,8 @@ template HonkRecursionConstraintsOutput<MegaAppCircuitBuilder> create_recursion_
     const RecursionConstraintData&,
     const RecursionConstraintData&,
     const RecursionConstraintData&,
-    const RecursionConstraintData&);
+    const RecursionConstraintData&,
+    RecursionSplicer*);
 template HonkRecursionConstraintsOutput<MegaKernelCircuitBuilder> create_recursion_constraints(
     MegaKernelCircuitBuilder&,
     GateCounter<MegaKernelCircuitBuilder>&,
@@ -315,7 +340,8 @@ template HonkRecursionConstraintsOutput<MegaKernelCircuitBuilder> create_recursi
     const RecursionConstraintData&,
     const RecursionConstraintData&,
     const RecursionConstraintData&,
-    const RecursionConstraintData&);
+    const RecursionConstraintData&,
+    RecursionSplicer*);
 template HonkRecursionConstraintsOutput<MegaHidingKernelCircuitBuilder> create_recursion_constraints(
     MegaHidingKernelCircuitBuilder&,
     GateCounter<MegaHidingKernelCircuitBuilder>&,
@@ -324,6 +350,7 @@ template HonkRecursionConstraintsOutput<MegaHidingKernelCircuitBuilder> create_r
     const RecursionConstraintData&,
     const RecursionConstraintData&,
     const RecursionConstraintData&,
-    const RecursionConstraintData&);
+    const RecursionConstraintData&,
+    RecursionSplicer*);
 
 } // namespace acir_format
