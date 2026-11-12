@@ -941,6 +941,7 @@ template <typename FF> class ExecutionTraceBlockStorage {
     // Accessor indices follow NON_GATE_SELECTORS table order.
     SelectorColumn<FF, NUM_WIRES>& q_m() { return columns_[0]; };
     SelectorColumn<FF, NUM_WIRES>& q_c() { return columns_[1]; };
+    const SelectorColumn<FF, NUM_WIRES>& q_c() const { return columns_[1]; };
     SelectorColumn<FF, NUM_WIRES>& q_1() { return columns_[2]; };
     SelectorColumn<FF, NUM_WIRES>& q_2() { return columns_[3]; };
     SelectorColumn<FF, NUM_WIRES>& q_3() { return columns_[4]; };

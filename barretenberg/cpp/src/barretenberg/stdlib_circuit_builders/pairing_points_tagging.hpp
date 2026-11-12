@@ -121,6 +121,31 @@ class PairingPointsTagging {
      */
     uint32_t get_tag(uint32_t tag_index) const { return pairing_points_tags_.at(tag_index); }
 
+    size_t num_tags() const { return pairing_points_tags_.size(); }
+
+    /**
+     * @brief Append the tags of `other` as if its tag operations had run here after this object's own, each tag shifted
+     * by the number of tags here before the call.
+     * @return The shift, which maps a tag index of `other` to its index here.
+     */
+    uint32_t append_shifted(const PairingPointsTagging& other)
+    {
+        BB_ASSERT(!other.has_public_pairing_points_, "Cannot append pairing points that have been set to public.");
+        BB_ASSERT(!has_public_pairing_points_ || other.pairing_points_tags_.empty(),
+                  "Cannot create pairing points after pairing points have been set to public.");
+        // A tag is the index of its class representative, and every tag ever created holds one entry.
+        BB_ASSERT_EQ(static_cast<size_t>(next_pairing_point_tag_), pairing_points_tags_.size());
+        BB_ASSERT_EQ(static_cast<size_t>(other.next_pairing_point_tag_), other.pairing_points_tags_.size());
+        const uint32_t shift = next_pairing_point_tag_;
+        pairing_points_tags_.reserve(pairing_points_tags_.size() + other.pairing_points_tags_.size());
+        for (const uint32_t tag : other.pairing_points_tags_) {
+            pairing_points_tags_.push_back(tag + shift);
+        }
+        next_pairing_point_tag_ += other.next_pairing_point_tag_;
+        has_pairing_points_ = has_pairing_points_ || other.has_pairing_points_;
+        return shift;
+    }
+
     /**
      * @brief Require publication of the final accumulator, or defaults when there are no obligations.
      */

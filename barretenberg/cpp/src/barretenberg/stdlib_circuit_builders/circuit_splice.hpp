@@ -51,4 +51,34 @@ struct SpliceLog {
     std::vector<RangeList> range_lists;
 };
 
+/**
+ * @brief Why UltraCircuitBuilder_::splice left the target builder unchanged.
+ */
+enum class SpliceRefusal : uint8_t {
+    None,
+    BuilderState, // source not recording or seed count mismatch, target recording, a builder finalized or in write-VK
+                  // mode
+    Failed,       // a builder has failed
+    PublicInput,  // the source added a public input or finalized its public inputs
+    InputValue,   // a seed's value differs from the value of its target variable
+    InputCycle,   // two input variables share a copy cycle, or an input index is the index of another shared variable
+    InputTag,     // an input variable, or a shared constant a source tag reaches, carries a tag in the target
+    RowForm,      // a row the splice cannot copy: elliptic (creation may edit an earlier row) or lookup
+    UnknownForm,  // state the splice does not translate (lookup tables, IPA proof, names, unrecorded tags, tag
+                  // permutation entries or constants)
+};
+
+/**
+ * @brief The outcome of UltraCircuitBuilder_::splice.
+ */
+struct SpliceResult {
+    SpliceRefusal refusal = SpliceRefusal::None;
+    // When spliced: the index in the target of every source variable, indexed by source index.
+    std::vector<uint32_t> index_map;
+    // When spliced: added to a source pairing-point tag index, gives its index in the target.
+    uint32_t pairing_tag_offset = 0;
+
+    bool spliced() const { return refusal == SpliceRefusal::None; }
+};
+
 } // namespace bb

@@ -265,6 +265,8 @@ template <typename FF_> class CircuitBuilderBase {
 
     const std::vector<uint32_t>& public_inputs() const { return _public_inputs; };
 
+    bool public_inputs_finalized() const { return _public_inputs_finalized; }
+
     /**
      * @brief Set the _public_inputs_finalized to true to prevent any new public inputs from being added
      * @details This is used, for example, for special internal public inputs (like pairing inputs) which we want to

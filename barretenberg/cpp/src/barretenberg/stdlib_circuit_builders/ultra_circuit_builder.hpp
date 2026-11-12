@@ -382,6 +382,22 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
 
     bool is_recording() const { return splice_log_.has_value(); }
 
+    /**
+     * @brief Append the circuit built on `source` after its seeds, leaving this builder exactly as building that
+     * circuit here, on the variables `seed_indices`, would have left it.
+     * @details `source` was constructed with SpliceRecording on the values of the variables `seed_indices` of this
+     * builder, in that order, and the circuit was then built on it. Every precondition is checked before anything
+     * changes: neither builder has failed, is finalized or is in write-VK mode, and this one is not recording; each
+     * seed still has its source value; no two inputs share a copy cycle and none carries a tag, the inputs being the
+     * seeds and the zero and cached constants that a source tag reaches; the source added no public input, lookup
+     * table, elliptic or lookup row, IPA proof or variable name, did not finalize its public inputs, and its tag
+     * permutation holds only DEFAULT_TAG's entry and its range lists'. When one fails this builder is unchanged.
+     * @return The refusal, or, when spliced, the index here of every source variable and the shift of the source's
+     * pairing-point tags, with which values built on `source` are rebound to this builder.
+     */
+    SpliceResult splice(const UltraCircuitBuilder_& source, std::span<const uint32_t> seed_indices)
+        requires(!ExecutionTrace::IS_MEGA_ARITHMETIZATION);
+
     void create_add_gate(const add_triple_<FF>& in);
     void create_big_mul_add_gate(const mul_quad_<FF>& in, const bool use_next_gate_w_4 = false);
     void create_big_add_gate(const add_quad_<FF>& in, const bool use_next_gate_w_4 = false);
