@@ -238,6 +238,11 @@ AggregateData GlobalBenchStatsContainer::aggregate() const
 
 GlobalBenchStatsContainer::~GlobalBenchStatsContainer()
 {
+    print_exit_report_if_requested();
+}
+
+void GlobalBenchStatsContainer::print_exit_report_if_requested() const
+{
     if (std::getenv("BB_BENCH") != nullptr) {
         print_aggregate_counts_hierarchical(std::cerr);
     }

@@ -35,6 +35,10 @@ inline size_t get_num_cpus_pow2()
  * The size will be chosen based on the hardware concurrency (i.e., env or cpus).
  */
 void parallel_for(size_t num_iterations, const std::function<void(size_t)>& func);
+/** The calling thread's parallel_for pool workers now: 0 before its first parallel_for, and always 0 under OpenMP. */
+size_t parallel_for_num_workers();
+/** Stops and joins the calling thread's parallel_for workers; its next parallel_for starts new ones. */
+void parallel_for_stop_workers();
 void parallel_for_range(size_t num_points,
                         const std::function<void(size_t, size_t)>& func,
                         size_t no_multhreading_if_less_or_equal = 0);
