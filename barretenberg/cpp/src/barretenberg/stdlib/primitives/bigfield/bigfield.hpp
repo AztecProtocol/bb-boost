@@ -1065,6 +1065,7 @@ template <typename Builder, typename T> class bigfield {
 
     // For testing purposes only
     friend class bigfield_test_access;
+    template <typename> friend struct BuilderBindingWalk;
 
   private:
     /**
