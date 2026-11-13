@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <stdexcept>
 
@@ -20,13 +21,45 @@
 
 namespace bb::avm2 {
 
+namespace {
+// Without multithreading the CRS factory has no mutex, so the CRS is loaded where it is first needed.
+#ifdef NO_MULTITHREADING
+constexpr auto CRS_LOAD_POLICY = std::launch::deferred;
+#else
+constexpr auto CRS_LOAD_POLICY = std::launch::async;
+#endif
+} // namespace
+
 AvmProvingHelper::Proof AvmProvingHelper::prove(tracegen::TraceContainer&& trace)
 {
     // Declared first so that it ends after every polynomial below is destroyed.
     PolynomialMemoryRelease release_polynomials_on_return;
+
+    // The longest column bounds every commitment of the proof, so the CRS points it needs are known before the trace
+    // becomes polynomials (which frees its columns), and they load while the polynomials are built. The parallel_for
+    // thread count is per thread, so the loading thread takes the caller's.
+    const size_t num_rows = trace.get_num_rows();
+    const size_t crs_points = constraining::commitment_key_size(num_rows);
+    auto commitment_key_loaded = std::async(CRS_LOAD_POLICY, [crs_points, num_cpus = get_num_cpus()] {
+        if (get_num_cpus() != num_cpus) {
+            set_parallel_for_concurrency(num_cpus);
+        }
+        return AvmFlavor::CommitmentKey(crs_points);
+    });
+
     auto polynomials = AVM_TRACK_TIME_V("proving/prove:compute_polynomials", constraining::compute_polynomials(trace));
+    // A loading error is rethrown here, before any proving work starts.
+    auto commitment_key = AVM_TRACK_TIME_V("proving/prove:crs_wait", commitment_key_loaded.get());
     auto proving_key =
-        AVM_TRACK_TIME_V("proving/prove:proving_key", constraining::proving_key_from_polynomials(polynomials));
+        AVM_TRACK_TIME_V("proving/prove:proving_key",
+                         constraining::proving_key_from_polynomials(polynomials, std::move(commitment_key)));
+    vinfo("CRS: largest column ",
+          num_rows,
+          " rows, proof needs ",
+          crs_points,
+          " points, ",
+          proving_key->commitment_key.get_monomial_size(),
+          " loaded");
 
     auto verification_key = std::make_shared<AvmVerifier::VerificationKey>();
 

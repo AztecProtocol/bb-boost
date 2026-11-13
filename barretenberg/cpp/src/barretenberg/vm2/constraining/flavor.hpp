@@ -201,7 +201,7 @@ class AvmFlavor {
         static constexpr size_t circuit_size = MAX_AVM_TRACE_SIZE; // Fixed size
         static constexpr size_t log_circuit_size = MAX_AVM_TRACE_LOG_SIZE;
 
-        ProvingKey();
+        explicit ProvingKey(CommitmentKey key);
 
         std::span<Polynomial> get_all() { return AllEntities<Polynomial>::get_unshifted(); }
         std::span<const Polynomial> get_all() const { return AllEntities<Polynomial>::get_unshifted(); }
