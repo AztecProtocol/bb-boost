@@ -77,6 +77,10 @@ template <typename Fr> Polynomial<Fr>::Polynomial(size_t size, size_t virtual_si
 {
     BB_BENCH_NAME("Polynomial::Polynomial(size_t, size_t, size_t)");
     allocate_backing_memory(size, virtual_size, start_index);
+    // Nothing to zero, and the dispatch below would still wake every pool thread.
+    if (size == 0) {
+        return;
+    }
 
     parallel_for([&](const ThreadChunk& chunk) {
         auto range = chunk.range(size);
