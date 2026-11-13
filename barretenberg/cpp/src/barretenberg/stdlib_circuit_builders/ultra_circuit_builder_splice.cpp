@@ -414,7 +414,6 @@ SpliceResult UltraCircuitBuilder_<ExecutionTrace>::splice(const UltraCircuitBuil
         if (target_lists[l] != nullptr) {
             std::vector<uint32_t>& to = target_lists[l]->variable_indices;
             const size_t staircase_size = log.range_lists[l].staircase_size;
-            to.reserve(to.size() + from.size() - staircase_size);
             for (size_t q = staircase_size; q < from.size(); ++q) {
                 to.push_back(index_map[from[q]]);
             }
