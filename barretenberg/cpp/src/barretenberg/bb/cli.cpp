@@ -28,6 +28,7 @@
 #include "barretenberg/bbapi/c_bind.hpp"
 #include "barretenberg/common/bb_bench.hpp"
 #include "barretenberg/common/get_bytecode.hpp"
+#include "barretenberg/common/malloc_policy.hpp"
 #include "barretenberg/common/memory_profile.hpp"
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/common/version.hpp"
@@ -860,6 +861,16 @@ int parse_and_run_cli_command(int argc, char* argv[])
         bb_log_level = LogLevel::VERBOSE;
     }
     slow_low_memory = flags.slow_low_memory;
+    // AVM and UltraHonk proving keep freed heap memory for reuse instead of trimming it on one thread mid-proof (see
+    // command_keeps_heap()); every other command, Chonk included, and --slow_low_memory leave the settings in force
+    // untouched. This runs before any worker the command creates (mallopt is not thread-safe).
+    std::string_view command;
+    for (const CLI::App* subcommand : app.get_subcommands()) {
+        if (subcommand->parsed()) {
+            command = subcommand->get_name();
+        }
+    }
+    configure_process_malloc_and_log(command_keeps_heap(command, flags.scheme, flags.slow_low_memory));
 #if !defined(__wasm__) || defined(ENABLE_WASM_BENCH)
     if (!flags.storage_budget.empty()) {
         storage_budget = parse_size_string(flags.storage_budget);
