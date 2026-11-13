@@ -1,4 +1,5 @@
 #include "barretenberg/bbapi/bbapi_ultra_honk.hpp"
+#include "barretenberg/bbapi/bbapi_prove_instance.hpp"
 #include "barretenberg/bbapi/bbapi_shared.hpp"
 #include "barretenberg/common/serialize.hpp"
 #include "barretenberg/dsl/acir_format/acir_to_constraint_buf.hpp"
@@ -35,12 +36,15 @@ Circuit _compute_circuit(std::vector<uint8_t>&& bytecode, std::vector<uint8_t>&&
 
 template <typename Flavor, typename IO>
 std::shared_ptr<ProverInstance_<Flavor>> _compute_prover_instance(std::vector<uint8_t>&& bytecode,
-                                                                  std::vector<uint8_t>&& witness)
+                                                                  std::vector<uint8_t>&& witness,
+                                                                  const bool for_proof = false)
 {
     // Measure function time and debug print
     auto initial_time = std::chrono::high_resolution_clock::now();
     typename Flavor::CircuitBuilder builder = _compute_circuit<Flavor, IO>(std::move(bytecode), std::move(witness));
-    auto prover_instance = std::make_shared<ProverInstance_<Flavor>>(builder);
+    // The VK path keeps the circuit as it was; a proof's instance frees it while copying it.
+    auto prover_instance =
+        for_proof ? circuit_prove_instance<Flavor>(builder) : std::make_shared<ProverInstance_<Flavor>>(builder);
     auto final_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(final_time - initial_time);
     info("CircuitProve: Proving key computed in ", duration.count(), " ms");
@@ -110,7 +114,8 @@ CircuitProve::Response _prove(std::vector<uint8_t>&& bytecode,
     using Proof = typename Flavor::Transcript::Proof;
     using VerificationKey = typename Flavor::VerificationKey;
 
-    auto prover_instance = _compute_prover_instance<Flavor, IO>(std::move(bytecode), std::move(witness));
+    auto prover_instance =
+        _compute_prover_instance<Flavor, IO>(std::move(bytecode), std::move(witness), /*for_proof=*/true);
 
     // Create or deserialize VK
     std::shared_ptr<VerificationKey> vk;
