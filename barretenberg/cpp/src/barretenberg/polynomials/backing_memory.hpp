@@ -137,10 +137,10 @@ template <typename Fr> struct BackingMemory {
         for (size_t i = 0; i < num_unique; ++i) {
             AlignedDeleter* deleter = deleters[i];
             if (deleter == nullptr || deleter->pages_released.load(std::memory_order_relaxed) ||
-                std::find(deleters.begin(), deleters.begin() + i, deleter) != deleters.begin() + i) {
+                std::find(deleters.data(), deleters.data() + i, deleter) != deleters.data() + i) {
                 continue;
             }
-            const auto num_listed = std::count(deleters.begin() + i, deleters.begin() + num_unique, deleter);
+            const auto num_listed = std::count(deleters.data() + i, deleters.data() + num_unique, deleter);
             if (num_listed == unique[i]->aligned_memory.use_count() &&
                 blocks.add(deleter->allocation, deleter->bytes)) {
                 added[num_added++] = deleter;
