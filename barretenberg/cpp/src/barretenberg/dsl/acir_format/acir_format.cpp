@@ -12,6 +12,7 @@
 #include "barretenberg/common/log.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include "barretenberg/dsl/acir_format/recursion_splice.hpp"
+#include "barretenberg/dsl/acir_format/sha256_splice.hpp"
 #include "barretenberg/flavor/flavor.hpp"
 #include "barretenberg/honk/prover_instance_inspector.hpp"
 #include "barretenberg/stdlib/eccvm_verifier/verifier_commitment_key.hpp"
@@ -126,11 +127,16 @@ void translate_opcodes(Translation_& translation,
 template <typename Builder>
 void build_constraints(Builder& builder, AcirFormat& constraints, const ProgramMetadata& metadata)
 {
-    // Scratch builds of the leading Honk recursion constraints start before any opcode reaches the builder, so they
-    // overlap with everything built before those constraints.
+    // Scratch builds of the leading Honk recursion constraints and of the SHA-256 compression chunks start before any
+    // opcode reaches the builder, so they overlap with everything built before those constraints. Per-opcode gate
+    // counts need every compression built in place.
     std::unique_ptr<RecursionSplicer> splicer;
+    std::unique_ptr<Sha256RunSplicer> sha256_splicer;
     if constexpr (std::is_same_v<Builder, UltraCircuitBuilder>) {
         splicer = RecursionSplicer::launch(builder, constraints.honk_recursion_constraints);
+        if (!metadata.collect_gates_per_opcode) {
+            sha256_splicer = Sha256RunSplicer::launch(builder, constraints.sha256_compression, metadata.sha256_run);
+        }
     }
 
     bool collect_gates_per_opcode = metadata.collect_gates_per_opcode;
@@ -233,11 +239,23 @@ void build_constraints(Builder& builder, AcirFormat& constraints, const ProgramM
         [](auto& target, auto& constraint) { create_aes128_constraints(target, constraint); });
 
     // Add sha256 constraints
-    translate_opcodes<"acir::sha256_compression", GateKind::Lookup>(
-        translation,
-        constraints.sha256_compression,
-        opcode_indices.sha256_compression,
-        [](auto& target, auto& constraint) { create_sha256_compression_constraints(target, constraint); });
+    if constexpr (std::is_same_v<Builder, UltraCircuitBuilder>) {
+        BB_ASSERT_EQ(constraints.sha256_compression.size(),
+                     opcode_indices.sha256_compression.size(),
+                     "Each ACIR constraint must carry the index of the opcode it came from.");
+        BB_BENCH_ONLY_NAME("acir::sha256_compression");
+        build_sha256_compressions(
+            builder, constraints.sha256_compression, sha256_splicer.get(), metadata.sha256_run, [&](const size_t i) {
+                gate_counter.track_diff(constraints.gates_per_opcode, opcode_indices.sha256_compression[i]);
+            });
+        sha256_splicer.reset();
+    } else {
+        translate_opcodes<"acir::sha256_compression", GateKind::Lookup>(
+            translation,
+            constraints.sha256_compression,
+            opcode_indices.sha256_compression,
+            [](auto& target, auto& constraint) { create_sha256_compression_constraints(target, constraint); });
+    }
 
     // Add ECDSA k1 constraints
     translate_opcodes<"acir::ecdsa_k1_constraints", GateKind::Nnf>(

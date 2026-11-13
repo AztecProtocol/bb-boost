@@ -26,6 +26,7 @@
 #include "range_constraint.hpp"
 #include "recursion_constraint.hpp"
 #include "sha256_constraint.hpp"
+#include "sha256_splice.hpp"
 #include <array>
 #include <cstdint>
 #include <utility>
@@ -138,6 +139,7 @@ struct AcirProgram {
  * 2. When we add constraints to rollup circuits, we need to know whether the circuit should propagate an IPA claim or
  *    recursively verify it. The boolean has_ipa_claim specifies what the circuit should do with an IPA claim.
  * 3. If we wish to collect the number of gates added by each opcode, we set collect_gates_per_opcode to true.
+ * 4. sha256_run decides how an Ultra circuit's SHA-256 compressions are cut into chunks built on scratch threads.
  */
 struct ProgramMetadata {
     // An IVC instance; needed to construct a circuit from IVC recursion constraints
@@ -148,6 +150,7 @@ struct ProgramMetadata {
                // should propagate an IPA claim. In our codebase, circuits that propagate IPA claims are the ones whose
                // proof is constructed/verified using Rollup flavors.
     bool collect_gates_per_opcode = false;
+    Sha256RunOptions sha256_run;
 };
 
 /**
