@@ -389,6 +389,11 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
             small_arena_owner = std::make_unique_for_overwrite<std::byte[]>(
                 num_workers * small_arena_bytes); // NOLINT(cppcoreguidelines-avoid-c-arrays)
         }
+        // A block this large is normally mapped on its own, so its free unmaps every resident page on this thread. The
+        // workers discard their slices' interior pages first, which leaves that free little to unmap. glibc still
+        // serves the block from the heap when free heap space holds it; the next allocation there then faults the
+        // discarded pages back in. The floor is release_pages_in_parallel's.
+        const bool release_slices = num_workers * small_arena_bytes >= (size_t{ 64 } << 20);
         std::atomic<size_t> next_member{ 0 };
         bb::parallel_for(num_workers, [&](size_t tid) {
             std::span<std::byte> worker_arena;
@@ -405,6 +410,9 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
                 PolynomialSpan<const ScalarField> sp(0, std::span<const ScalarField>(scalar_arrays[m].data(), n));
                 out_results[m] = pippenger_round_parallel<Curve>(
                     sp, point_arrays[m], info_for(m), external_glv_for(m, n), worker_arena, /*max_threads=*/1);
+            }
+            if (release_slices) {
+                round_parallel_detail::release_arena_slice(worker_arena);
             }
         });
     }

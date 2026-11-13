@@ -26,6 +26,10 @@
 #include <system_error>
 #include <thread>
 #endif
+#if !defined(__wasm__) && !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #ifdef __wasm_simd128__
 #include <wasm_simd128.h>
@@ -50,6 +54,23 @@ size_t window_bits_tuning_oversub_factor(size_t n_input)
 }
 
 namespace round_parallel_detail {
+
+// Returns the whole pages inside one worker's slice of a shared arena block to the OS, from that worker, so the slices
+// are released concurrently and the block's later free has fewer resident pages to unmap. Pages that straddle a slice
+// boundary stay resident, as does the whole slice if the advice fails (failures are ignored). The slice's contents are
+// lost.
+inline void release_arena_slice([[maybe_unused]] std::span<std::byte> slice)
+{
+#if !defined(__wasm__) && !defined(_WIN32) && defined(MADV_DONTNEED)
+    const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto begin = reinterpret_cast<uintptr_t>(slice.data());
+    const uintptr_t lo = (begin + page - 1) & ~(page - 1);
+    const uintptr_t hi = (begin + slice.size()) & ~(page - 1);
+    if (hi > lo) {
+        static_cast<void>(madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED));
+    }
+#endif
+}
 
 // Anonymous namespace gives all TU-private helpers in `round_parallel_detail` internal
 // linkage (clang-tidy `misc-use-anonymous-namespace`). It is briefly closed and reopened
