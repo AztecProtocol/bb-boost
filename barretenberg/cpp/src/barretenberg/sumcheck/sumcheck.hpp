@@ -405,7 +405,26 @@ template <typename Flavor> class SumcheckProver {
         // Given gate challenges β = (β₀, ..., β_{d−1}) and d = `multivariate_d`, compute the evaluations of
         // GateSeparator_β (X₀, ..., X_{d−1}) = ∏ₖ₌₀^{d−1} (1 − Xₖ + Xₖ · βₖ)
         // on the boolean hypercube.
-        GateSeparatorPolynomial<FF> gate_separators(gate_challenges, multivariate_d);
+        // AVM rounds read the table only below 2^k, k = ceil(log2) of round 0's effective round size, and its first
+        // 2^k entries are the products of β₀, ..., β_{k−1} alone, so AVM computes only those. All d betas are kept for
+        // the partial evaluations.
+        size_t gate_separator_log_size = multivariate_d;
+        if constexpr (isAvmFlavor<Flavor>) {
+            const size_t active_rows = round.compute_effective_round_size(full_polynomials);
+            gate_separator_log_size =
+                active_rows <= 1 ? 0 : std::min(multivariate_d, numeric::get_msb(active_rows - 1) + 1);
+            vinfo("sumcheck: gate separator table of 2^", gate_separator_log_size, " entries");
+        }
+        GateSeparatorPolynomial<FF> gate_separators(gate_challenges, gate_separator_log_size);
+        // The largest index a round reads is (E/2 - 1) * periodicity, E being its effective round size.
+        const auto check_gate_separator_table = [&]([[maybe_unused]] const auto& polynomials) {
+            if constexpr (isAvmFlavor<Flavor>) {
+                const size_t active_rows = round.compute_effective_round_size(polynomials);
+                BB_ASSERT(active_rows == 0 || ((active_rows / 2) - 1) * gate_separators.periodicity <
+                                                  gate_separators.beta_products.size(),
+                          "Sumcheck: the gate separator table does not cover this round's active rows");
+            }
+        };
 
         multivariate_challenge.reserve(virtual_log_n);
         // In the first round, we compute the first univariate polynomial and populate the book-keeping table of
@@ -415,6 +434,7 @@ template <typename Flavor> class SumcheckProver {
         size_t first_table_round = 1;
         PartiallyEvaluatedMultivariates partially_evaluated_polynomials = [&] {
             BB_BENCH_NAME("sumcheck loop 0");
+            check_gate_separator_table(full_polynomials);
             auto round_univariate =
                 round.compute_univariate(full_polynomials, relation_parameters, gate_separators, alphas);
 
@@ -433,6 +453,7 @@ template <typename Flavor> class SumcheckProver {
                                                 ProverPolynomials,
                                                 FF>;
                     const FoldedMultivariates folded_polynomials(full_polynomials, round_challenge);
+                    check_gate_separator_table(folded_polynomials);
                     round_univariate =
                         round.compute_univariate(folded_polynomials, relation_parameters, gate_separators, alphas);
                     transcript->send_to_verifier("Sumcheck:univariate_1", round_univariate);
@@ -458,6 +479,7 @@ template <typename Flavor> class SumcheckProver {
         for (size_t round_idx = first_table_round; round_idx < multivariate_d; round_idx++) {
             BB_BENCH_NAME("sumcheck loop");
 
+            check_gate_separator_table(partially_evaluated_polynomials);
             // Write the round univariate to the transcript
             auto round_univariate =
                 round.compute_univariate(partially_evaluated_polynomials, relation_parameters, gate_separators, alphas);
