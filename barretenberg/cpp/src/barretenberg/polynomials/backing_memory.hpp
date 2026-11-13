@@ -63,8 +63,8 @@ class PolynomialMemoryRelease {
         void (*free_block)(void*);
     };
     std::vector<Block> blocks_;
-    PolynomialMemoryRelease* previous_ = nullptr;
-    bool active_ = false;
+    [[maybe_unused]] PolynomialMemoryRelease* previous_ = nullptr;
+    [[maybe_unused]] bool active_ = false;
 };
 } // namespace bb
 
