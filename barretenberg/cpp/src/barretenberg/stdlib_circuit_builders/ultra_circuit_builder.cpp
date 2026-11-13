@@ -441,6 +441,9 @@ plookup::BasicTable& UltraCircuitBuilder_<ExecutionTrace>::get_table(const plook
 template <typename ExecutionTrace>
 plookup::BasicTable* UltraCircuitBuilder_<ExecutionTrace>::register_basic_lookup_table(plookup::BasicTable&& table)
 {
+    if (splice_log_.has_value()) [[unlikely]] {
+        recording_log().registered_table = true;
+    }
     // Indices start at 1; see get_table() for the reason.
     table.table_index = lookup_tables.size() + 1;
     BB_ASSERT_GT(table.table_index, 0U, "Table index must be greater than 0");

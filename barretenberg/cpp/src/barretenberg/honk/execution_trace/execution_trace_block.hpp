@@ -946,6 +946,7 @@ template <typename FF> class ExecutionTraceBlockStorage {
     SelectorColumn<FF, NUM_WIRES>& q_1() { return columns_[2]; };
     SelectorColumn<FF, NUM_WIRES>& q_2() { return columns_[3]; };
     SelectorColumn<FF, NUM_WIRES>& q_3() { return columns_[4]; };
+    const SelectorColumn<FF, NUM_WIRES>& q_3() const { return columns_[4]; };
     SelectorColumn<FF, NUM_WIRES>& q_4() { return columns_[5]; };
     SelectorColumn<FF, NUM_WIRES>& q_5() { return columns_[6]; };
 

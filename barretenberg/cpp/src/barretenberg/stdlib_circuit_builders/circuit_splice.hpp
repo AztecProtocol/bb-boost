@@ -71,6 +71,9 @@ struct SpliceLog {
     std::vector<Event> events;
     std::vector<Constant> constants;
     std::vector<RangeList> range_lists;
+    // A table was registered with register_basic_lookup_table: splice recreates a table from its id, which only fixes
+    // the contents of a table get_table created.
+    bool registered_table = false;
 
     SpliceCancellation* cancellation = nullptr;
 };
@@ -87,9 +90,9 @@ enum class SpliceRefusal : uint8_t {
     InputValue,   // a seed's value differs from the value of its target variable
     InputCycle,   // two input variables share a copy cycle, or an input index is the index of another shared variable
     InputTag,     // an input variable, or a shared constant a source tag reaches, carries a tag in the target
-    RowForm,      // a row the splice cannot copy: elliptic (creation may edit an earlier row) or lookup
-    UnknownForm,  // state the splice does not translate (lookup tables, IPA proof, names, unrecorded tags, tag
-                  // permutation entries or constants)
+    RowForm,      // a row the splice cannot copy: elliptic (creation may edit an earlier row)
+    UnknownForm,  // state the splice does not translate (a registered lookup table, a table numbered other than by its
+                  // position, IPA proof, names, unrecorded tags, tag permutation entries or constants)
 };
 
 /**

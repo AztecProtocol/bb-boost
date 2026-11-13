@@ -6,6 +6,7 @@
 #include "bounded_range_sort.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <numeric>
 #include <string>
 #include <unordered_map>
@@ -95,14 +96,46 @@ SpliceResult UltraCircuitBuilder_<ExecutionTrace>::splice(const UltraCircuitBuil
     if (!source.public_inputs().empty() || source.blocks.pub_inputs.size() != 0 || source.public_inputs_finalized()) {
         return refuse(SpliceRefusal::PublicInput);
     }
-    if (source.blocks.elliptic.size() != 0 || source.blocks.lookup.size() != 0) {
+    if (source.blocks.elliptic.size() != 0) {
         return refuse(SpliceRefusal::RowForm);
     }
     const PairingPointsTagging& source_tagging = source.pairing_points_tagging;
-    if (!source.lookup_tables.empty() || !source.ipa_proof.empty() || source.pending_ipa_proof.valid() ||
+    if (log.registered_table || !source.ipa_proof.empty() || source.pending_ipa_proof.valid() ||
         !source.variable_names.empty() || source_tagging.has_public_pairing_points() ||
         (source_tagging.num_tags() != 0 && this->pairing_points_tagging.has_public_pairing_points())) {
         return refuse(SpliceRefusal::UnknownForm);
+    }
+    // Each source table, which get_table created, becomes the table get_table gives for its id here: the first table
+    // of that id, or a new one, created in the order the source first read its tables and so numbered as building the
+    // source's rows here would number it. The source numbered each table by its position, which a row's q_3 holds.
+    const std::deque<plookup::BasicTable>& source_tables = source.lookup_tables;
+    std::vector<plookup::BasicTable*> table_targets(source_tables.size(), nullptr);
+    std::vector<FF> table_numbers(source_tables.size());
+    size_t num_new_tables = 0;
+    for (size_t p = 0; p < source_tables.size(); ++p) {
+        if (source_tables[p].table_index != p + 1) {
+            return refuse(SpliceRefusal::UnknownForm);
+        }
+        const auto it = std::ranges::find(lookup_tables, source_tables[p].id, &plookup::BasicTable::id);
+        if (it != lookup_tables.end()) {
+            table_targets[p] = &*it;
+            table_numbers[p] = FF(it->table_index);
+        } else {
+            table_numbers[p] = FF(lookup_tables.size() + ++num_new_tables);
+        }
+    }
+    const auto source_table_position = [](const FF& q_3) { return static_cast<size_t>(uint256_t(q_3).data[0] - 1); };
+    const ExecutionTraceBlockStorage<FF>& source_lookup = source.blocks.lookup;
+    FF last_table_number = FF::zero();
+    for (size_t row = 0; row < source_lookup.size(); ++row) {
+        const FF q_3 = source_lookup.q_3()[row];
+        if (q_3 != last_table_number) {
+            const uint256_t number(q_3);
+            if (number == 0 || number > source_tables.size()) {
+                return refuse(SpliceRefusal::UnknownForm);
+            }
+            last_table_number = q_3;
+        }
     }
     // Every source tag belongs to a recorded range list, and every source constant but zero was recorded. The tag
     // permutation fixes DEFAULT_TAG and swaps the two tags of each recorded range list, and holds nothing else.
@@ -286,6 +319,7 @@ SpliceResult UltraCircuitBuilder_<ExecutionTrace>::splice(const UltraCircuitBuil
         typename ExecutionTraceBlockStorage<FF>::ValueIdMaps value_ids;
     };
     const size_t memory_offset = blocks.memory.size();
+    const size_t lookup_offset = blocks.lookup.size();
     const size_t rom_offset = rom_ram_logic.rom_arrays.size();
     auto target_blocks = blocks.get();
     auto source_blocks = source.blocks.get();
@@ -345,6 +379,33 @@ SpliceResult UltraCircuitBuilder_<ExecutionTrace>::splice(const UltraCircuitBuil
         for (const uint32_t gate : source.rom_logup_records) {
             const uint64_t rom_id = uint256_t(source.blocks.memory.q_c()[gate]).data[0];
             blocks.memory.q_c().set(memory_offset + gate, FF(rom_id + rom_offset));
+        }
+    }
+
+    // A source table's read records follow those of its table here; a new table is the source's, renumbered.
+    for (size_t p = 0; p < source_tables.size(); ++p) {
+        const plookup::BasicTable& from = source_tables[p];
+        if (table_targets[p] == nullptr) {
+            lookup_tables.push_back(from);
+            lookup_tables.back().table_index = lookup_tables.size();
+        } else {
+            // Tables of one id have the same rows, so the source's rows are rows of the target table too.
+            std::vector<uint32_t>& records = table_targets[p]->lookup_gate_rows;
+            records.insert(records.end(), from.lookup_gate_rows.begin(), from.lookup_gate_rows.end());
+        }
+    }
+    // A lookup row carries its table's number in q_3; consecutive rows mostly read one table.
+    if (!source_tables.empty()) {
+        FF last_source = FF::zero();
+        FF last_target = FF::zero();
+        for (size_t row = lookup_offset; row < blocks.lookup.size(); ++row) {
+            // A copy: a selector reference is only valid until the next set on the block.
+            const FF q_3 = blocks.lookup.q_3()[row];
+            if (q_3 != last_source) {
+                last_source = q_3;
+                last_target = table_numbers[source_table_position(q_3)];
+            }
+            blocks.lookup.q_3().set(row, last_target);
         }
     }
 
