@@ -6,6 +6,7 @@
 #include "barretenberg/common/throw_or_abort.hpp"
 #include "barretenberg/dsl/acir_format/honk_recursion_constraint.hpp"
 #include "barretenberg/dsl/acir_format/mock_verifier_inputs.hpp"
+#include "barretenberg/dsl/acir_format/scratch_build.hpp"
 #include "barretenberg/ecc/curves/bn254/g1.hpp"
 #include "barretenberg/flavor/ultra_flavor.hpp"
 #include "barretenberg/stdlib/primitives/builder_binding.hpp"
@@ -17,30 +18,19 @@
 #include <unordered_map>
 #include <utility>
 
-// Scratch builds need native threads with a parallel_for pool and core count of their own (wasm shares the pool between
-// threads, and OpenMP loops ignore the core count), pthreads to size their stacks, and exceptions.
-#if !defined(NO_MULTITHREADING) && !defined(__wasm__) && !defined(_WIN32) && !defined(OMP_MULTITHREADING) &&           \
-    defined(__cpp_exceptions) && !defined(BB_NO_EXCEPTIONS)
-#define BB_RECURSION_SPLICE_AVAILABLE 1
-#include <pthread.h>
-#if defined(__GLIBC__)
-#include <malloc.h>
-#endif
-#else
-#define BB_RECURSION_SPLICE_AVAILABLE 0
-#endif
-
 namespace acir_format {
 
-#if BB_RECURSION_SPLICE_AVAILABLE
+#if BB_SCRATCH_BUILDS_AVAILABLE
 
 namespace {
 
-// Scratch builds start only with at least this many threads, and use at most all but the building thread.
-constexpr size_t MIN_THREADS = 3;
-
-// 8 MiB, the usual main-thread default; a scratch build needs more stack than some platforms give other threads.
-constexpr size_t SCRATCH_STACK_BYTES = size_t{ 8 } << 20;
+using scratch_build::message_of;
+using scratch_build::milliseconds_between;
+using scratch_build::MIN_THREADS;
+using scratch_build::refusal_reason;
+using scratch_build::return_freed_memory;
+using scratch_build::ScratchCancellation;
+using scratch_build::ScratchThread;
 
 /**
  * @brief Whether a scratch build may start for `constraint` on a builder of `num_variables` variables.
@@ -76,91 +66,6 @@ void predicted_draws(const RecursionConstraint& constraint)
     [[maybe_unused]] const bb::g1::element offset_generator = bb::g1::element::random_element();
 }
 
-std::string refusal_reason(const SpliceRefusal refusal)
-{
-    switch (refusal) {
-    case SpliceRefusal::None:
-        return "none";
-    case SpliceRefusal::BuilderState:
-        return "builder state";
-    case SpliceRefusal::Failed:
-        return "a builder has failed";
-    case SpliceRefusal::PublicInput:
-        return "the scratch build added a public input";
-    case SpliceRefusal::InputValue:
-        return "an input value changed";
-    case SpliceRefusal::InputCycle:
-        return "inputs share a copy cycle";
-    case SpliceRefusal::InputTag:
-        return "an input carries a range tag";
-    case SpliceRefusal::RowForm:
-        return "a row of a form the splice cannot copy";
-    case SpliceRefusal::UnknownForm:
-        return "state of a form the splice does not translate";
-    }
-    return "unknown";
-}
-
-/**
- * @brief Returns to the system the memory that scratch threads have freed.
- * @details Freed blocks stay resident in the malloc arena of the thread that allocated them, which the building thread
- * does not allocate from. While a scratch builder lives, that memory lies in free blocks below the builder's own, which
- * glibc can return; once the builder is destroyed its arena is a single top block, which glibc trims only in the main
- * arena.
- */
-void return_freed_memory()
-{
-#if defined(__GLIBC__)
-    malloc_trim(0);
-#endif
-}
-
-/**
- * @brief Stops a scratch build at its next recording once requested from another thread.
- */
-class ScratchCancellation final : public SpliceCancellation {
-  public:
-    explicit ScratchCancellation(const size_t index)
-        : index_(index)
-    {}
-
-    void request() noexcept { requested_.store(true, std::memory_order_relaxed); }
-
-    void check() override
-    {
-        if (RecursionSpliceTestHooks::scratch_recording) {
-            RecursionSpliceTestHooks::scratch_recording(index_, ++num_checks_);
-        }
-        if (requested_.load(std::memory_order_relaxed)) {
-            throw_or_abort("RecursionSplicer: the scratch build was cancelled");
-        }
-    }
-
-  private:
-    size_t index_;
-    // Only the scratch thread counts.
-    size_t num_checks_ = 0;
-    std::atomic<bool> requested_ = false;
-};
-
-// What `error` says, or a fixed text when it holds something other than a std::exception.
-std::string message_of(const std::exception_ptr& error)
-{
-    try {
-        std::rethrow_exception(error);
-    } catch (const std::exception& exception) {
-        return exception.what();
-    } catch (...) {
-        return "an exception that is not a std::exception";
-    }
-}
-
-int64_t milliseconds_between(const std::chrono::steady_clock::time_point from,
-                             const std::chrono::steady_clock::time_point to)
-{
-    return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count());
-}
-
 } // namespace
 
 struct RecursionSplicer::Scratch {
@@ -183,9 +88,7 @@ struct RecursionSplicer::Scratch {
     std::atomic<bool> finished = false;
 
     bb::numeric::RNG* engine = nullptr;
-    pthread_t thread{};
-    // Started and not yet joined.
-    bool running = false;
+    ScratchThread thread;
 
     // Inputs are numbered by distinct real index at first appearance in the order proof, key, public inputs, key
     // hash, so two inputs share a scratch variable exactly when they share a real one.
@@ -193,7 +96,12 @@ struct RecursionSplicer::Scratch {
         : index(scratch_index)
         , original(launched)
         , constraint(launched)
-        , cancellation(scratch_index)
+        , cancellation("RecursionSplicer", [scratch_index, num_checks = size_t{ 0 }]() mutable {
+            // Only the scratch thread counts.
+            if (RecursionSpliceTestHooks::scratch_recording) {
+                RecursionSpliceTestHooks::scratch_recording(scratch_index, ++num_checks);
+            }
+        })
     {
         std::unordered_map<uint32_t, uint32_t> seed_of;
         const auto seed = [&](uint32_t& index) {
@@ -217,40 +125,23 @@ struct RecursionSplicer::Scratch {
     }
 
     /**
-     * @brief Runs build() on a thread of its own with a stack of SCRATCH_STACK_BYTES; throws when it cannot start.
+     * @brief Runs build() on a scratch thread of its own; throws when it cannot start.
      */
     void start_thread(bb::numeric::RNG& draw_engine)
     {
         engine = &draw_engine;
-        pthread_attr_t attributes;
-        if (pthread_attr_init(&attributes) != 0) {
+        const bool started = thread.start(
+            [](void* scratch) -> void* {
+                static_cast<Scratch*>(scratch)->build();
+                return nullptr;
+            },
+            this);
+        if (!started) {
             throw_or_abort("RecursionSplicer: could not start a scratch thread");
         }
-        int status = pthread_attr_setstacksize(&attributes, SCRATCH_STACK_BYTES);
-        if (status == 0) {
-            status = pthread_create(
-                &thread,
-                &attributes,
-                [](void* scratch) -> void* {
-                    static_cast<Scratch*>(scratch)->build();
-                    return nullptr;
-                },
-                this);
-        }
-        pthread_attr_destroy(&attributes);
-        if (status != 0) {
-            throw_or_abort("RecursionSplicer: could not start a scratch thread");
-        }
-        running = true;
     }
 
-    void join()
-    {
-        if (running) {
-            pthread_join(thread, nullptr);
-            running = false;
-        }
-    }
+    void join() { thread.join(); }
 
     // Throws nothing: whatever the build throws is kept in `error`.
     void build() noexcept
@@ -302,7 +193,7 @@ void RecursionSplicer::reap()
 {
     // Requested of every running build first, so a join waits only until that build's next recording, or its end.
     for (const auto& scratch : scratches_) {
-        if (scratch->running) {
+        if (scratch->thread.running()) {
             scratch->cancellation.request();
         }
     }
