@@ -1019,15 +1019,27 @@ template <typename Flavor> class SumcheckProverRound {
                                                    const bb::GateSeparatorPolynomial<FF>& gate_separators,
                                                    const RowDisablingPolynomial<FF>* row_disabling_polynomial = nullptr)
     {
-        Utils::scale_univariates(univariate_accumulators, challenge);
-
         auto result = ExtendedUnivariate(0);
-        extend_and_batch_univariates<ExtendedUnivariate>(
-            univariate_accumulators, result, gate_separators, row_disabling_polynomial);
-
-        // Reset all univariate accumulators to 0 before beginning accumulation in the next round
-        Utils::zero_univariates(univariate_accumulators);
+        if constexpr (ParallelizesRelationBatching<Flavor>) {
+            // Each relation's task scales its accumulators before batching them and zeroes them after.
+            extend_and_batch_univariates<ExtendedUnivariate>(
+                univariate_accumulators, result, gate_separators, row_disabling_polynomial, &challenge);
+        } else {
+            Utils::scale_univariates(univariate_accumulators, challenge);
+            extend_and_batch_univariates<ExtendedUnivariate>(
+                univariate_accumulators, result, gate_separators, row_disabling_polynomial);
+            // Reset all univariate accumulators to 0 before beginning accumulation in the next round
+            Utils::zero_univariates(univariate_accumulators);
+        }
         return result;
+    }
+
+    // Position, in flavor order, of relation `relation_idx`'s first subrelation within a tuple of tuples.
+    template <typename TupleOfTuples, size_t relation_idx> static constexpr size_t first_subrelation_index()
+    {
+        return []<size_t... I>(std::index_sequence<I...>) {
+            return (size_t{ 0 } + ... + std::tuple_size_v<std::tuple_element_t<I, TupleOfTuples>>);
+        }(std::make_index_sequence<relation_idx>{});
     }
 
     /**
@@ -1049,12 +1061,16 @@ template <typename Flavor> class SumcheckProverRound {
      * @param gate_separators Round \f$pow_{\beta}\f$-factor \f$ ( (1−X_i) + X_i\cdot \beta_i )\f$.
      * @param row_disabling_polynomial Optional; when non-null, its `eval_at_0/1` supply `L^{(i)}`
      *        for per-relation `L` / `(1 - L)` scaling.
+     * @param scale_then_zero Optional, for a mutable `tuple`: each relation first scales its subrelation accumulators
+     *        as `scale_univariates` does with these separators, and zeroes them once batched, so every coefficient
+     *        goes through the same operations in the same order as with those two passes around the call.
      */
     template <typename ExtendedUnivariate, typename TupleOfTuplesOfUnivariates>
-    static void extend_and_batch_univariates(const TupleOfTuplesOfUnivariates& tuple,
+    static void extend_and_batch_univariates(TupleOfTuplesOfUnivariates& tuple,
                                              ExtendedUnivariate& result,
                                              const bb::GateSeparatorPolynomial<FF>& gate_separators,
-                                             const RowDisablingPolynomial<FF>* row_disabling_polynomial = nullptr)
+                                             const RowDisablingPolynomial<FF>* row_disabling_polynomial = nullptr,
+                                             const SubrelationSeparators* scale_then_zero = nullptr)
     {
         // Pow-Factor  \f$ (1-X) + X\beta_i \f$
         auto random_polynomial = bb::Univariate<FF, 2>({ 1, gate_separators.current_element() });
@@ -1081,7 +1097,20 @@ template <typename Flavor> class SumcheckProverRound {
         // row-disabling factor. Independent across relations, so it can run serially or in parallel.
         auto batch_one_relation = [&]<size_t relation_idx>() -> ExtendedUnivariate {
             using Relation = typename std::tuple_element_t<relation_idx, Relations>;
-            const auto& outer_element = std::get<relation_idx>(tuple);
+            auto& outer_element = std::get<relation_idx>(tuple);
+            constexpr size_t num_subrelations = std::tuple_size_v<std::decay_t<decltype(outer_element)>>;
+            constexpr bool can_scale_and_zero = !std::is_const_v<TupleOfTuplesOfUnivariates>;
+            if constexpr (can_scale_and_zero) {
+                if (scale_then_zero != nullptr) {
+                    constexpr size_t first =
+                        first_subrelation_index<std::remove_const_t<TupleOfTuplesOfUnivariates>, relation_idx>();
+                    constexpr_for<0, num_subrelations, 1>([&]<size_t subrelation_idx>() {
+                        if constexpr (first + subrelation_idx != 0) {
+                            std::get<subrelation_idx>(outer_element) *= (*scale_then_zero)[first + subrelation_idx - 1];
+                        }
+                    });
+                }
+            }
 
             ExtendedUnivariate per_relation(0);
             constexpr_for<0, std::tuple_size_v<std::decay_t<decltype(outer_element)>>, 1>(
@@ -1104,6 +1133,15 @@ template <typename Flavor> class SumcheckProverRound {
                             extended * extended_random_polynomial * gate_separators.partial_evaluation_result;
                     }
                 });
+
+            if constexpr (can_scale_and_zero) {
+                if (scale_then_zero != nullptr) {
+                    constexpr_for<0, num_subrelations, 1>([&]<size_t subrelation_idx>() {
+                        auto& evaluations = std::get<subrelation_idx>(outer_element).evaluations;
+                        std::fill(evaluations.begin(), evaluations.end(), FF(0));
+                    });
+                }
+            }
 
             if constexpr (IsOffsetOnlyRelation<Relation>) {
                 return per_relation * offset_factor;
