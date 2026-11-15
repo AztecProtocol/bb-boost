@@ -729,19 +729,21 @@ template <typename Flavor> class SumcheckProver {
      * @brief Build the book-keeping table after the first two rounds directly from the full polynomials.
      * @details Each entry equals what partially_evaluate_first_round followed by partially_evaluate_in_place would
      * store (see `bb::fold_stride4_backed`), without materializing the table of the first round.
+     * @param outputs_per_chunk Work-item size of `bb::fold_stride4_backed_all`; the result does not depend on it.
      */
-    PartiallyEvaluatedMultivariates partially_evaluate_first_two_rounds(ProverPolynomials& full_polynomials,
-                                                                        const FF& first_challenge,
-                                                                        const FF& second_challenge)
+    PartiallyEvaluatedMultivariates partially_evaluate_first_two_rounds(
+        ProverPolynomials& full_polynomials,
+        const FF& first_challenge,
+        const FF& second_challenge,
+        size_t outputs_per_chunk = FOLD_STRIDE4_OUTPUTS_PER_CHUNK)
     {
         PartiallyEvaluatedMultivariates partially_evaluated_polynomials(
             full_polynomials, multivariate_n, /*num_folds=*/2);
-        auto source_view = full_polynomials.get_all();
-        auto dest_view = partially_evaluated_polynomials.get_all();
-        parallel_for(source_view.size(), [&](size_t j) {
-            BB_BENCH_TRACY_NAME("Sumcheck::partially_evaluate");
-            fold_stride4_backed(source_view[j], dest_view[j], first_challenge, second_challenge);
-        });
+        fold_stride4_backed_all(full_polynomials.get_all(),
+                                partially_evaluated_polynomials.get_all(),
+                                first_challenge,
+                                second_challenge,
+                                outputs_per_chunk);
         return partially_evaluated_polynomials;
     }
 
