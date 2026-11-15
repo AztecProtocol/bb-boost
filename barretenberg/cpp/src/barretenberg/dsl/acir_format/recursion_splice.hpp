@@ -67,9 +67,9 @@ struct RecursionSpliceTestHooks {
 /**
  * @brief Builds the leading eligible Honk recursion constraints of an Ultra circuit on scratch builders on their own
  * threads, and splices each into the real builder when the serial order reaches it.
- * @details A constraint is eligible when it verifies a plain or rollup Honk proof under a constant-true predicate.
- * Whether a constraint is spliced or built serially never changes the circuit: a refused constraint is built serially
- * on the unchanged builder and engine.
+ * @details A constraint is eligible when it verifies a plain, rollup or root rollup Honk proof under a constant-true
+ * predicate. Whether a constraint is spliced or built serially never changes the circuit: a refused constraint is built
+ * serially on the unchanged builder and engine.
  *
  * When the building thread reaches the first constraint before its scratch build has finished, that build is
  * cancelled and the constraint is built in place, so which path builds it depends on timing. A cancelled build only

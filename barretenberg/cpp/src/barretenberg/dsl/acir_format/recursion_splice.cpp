@@ -40,7 +40,8 @@ using scratch_build::ScratchThread;
 bool is_eligible(const RecursionConstraint& constraint, const size_t num_variables)
 {
     const auto exists = [num_variables](const uint32_t index) { return index < num_variables; };
-    return (constraint.proof_type == HONK || constraint.proof_type == ROLLUP_HONK) &&
+    return (constraint.proof_type == HONK || constraint.proof_type == ROLLUP_HONK ||
+            constraint.proof_type == ROOT_ROLLUP_HONK) &&
            constraint.predicate.is_constant && constraint.predicate.value == bb::fr::one() &&
            std::ranges::all_of(constraint.proof, exists) && std::ranges::all_of(constraint.key, exists) &&
            std::ranges::all_of(constraint.public_inputs, exists) && exists(constraint.key_hash);
@@ -55,7 +56,7 @@ bool is_eligible(const RecursionConstraint& constraint, const size_t num_variabl
 void predicted_draws(const RecursionConstraint& constraint)
 {
     const size_t num_public_inputs = constraint.public_inputs.size();
-    if (constraint.proof_type == ROLLUP_HONK) {
+    if (constraint.proof_type == ROLLUP_HONK || constraint.proof_type == ROOT_ROLLUP_HONK) {
         discard_arbitrary_valid_honk_proof_randomness<UltraFlavor, stdlib::recursion::honk::RollupIO>(
             num_public_inputs);
     } else {

@@ -1,7 +1,9 @@
 #include "barretenberg/dsl/acir_format/recursion_splice.hpp"
+#include "barretenberg/common/log.hpp"
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include "barretenberg/dsl/acir_format/acir_format.hpp"
+#include "barretenberg/dsl/acir_format/gate_counter.hpp"
 #include "barretenberg/dsl/acir_format/test_class.hpp"
 #include "barretenberg/dsl/acir_format/utils.hpp"
 #include "barretenberg/dsl/acir_format/witness_constant.hpp"
@@ -127,6 +129,21 @@ std::vector<uint32_t> inputs_of(const RecursionConstraint& constraint)
     inputs.insert(inputs.end(), constraint.public_inputs.begin(), constraint.public_inputs.end());
     inputs.push_back(constraint.key_hash);
     return inputs;
+}
+
+// Puts a range tag on a small input of Honk recursion constraint `target`, which refuses its splice.
+RecursionSpliceTestHooks::ConstraintHook tag_a_small_input(const size_t target)
+{
+    return [target](Builder& builder, const RecursionConstraint& constraint, const size_t index) {
+        if (index != target) {
+            return;
+        }
+        const std::vector<uint32_t> inputs = inputs_of(constraint);
+        const auto small = std::ranges::find_if(
+            inputs, [&](uint32_t input) { return uint256_t(builder.get_variable(input)) <= MAX_SMALL_RANGE; });
+        ASSERT_NE(small, inputs.end());
+        builder.create_small_range_constraint(*small, MAX_SMALL_RANGE);
+    };
 }
 
 // Clears every hook and restores the first-take policy when a test ends, whatever its outcome.
@@ -353,6 +370,50 @@ TEST_F(RecursionSpliceTest, ThreeConstraints)
 TEST_F(RecursionSpliceTest, RollupConstraint)
 {
     expect_spliced({ &*rollup_proof }, 1, ProgramMetadata{ .has_ipa_claim = true });
+}
+
+// A root rollup program verifies the IPA opening its two proofs carry after their Honk recursion constraints, which
+// makes it a circuit of several million gates; those two constraints alone are cheap enough to build per merge, with
+// and without a splicer.
+TEST_F(RecursionSpliceTest, RootRollupConstraintsAlone)
+{
+    const HookReset reset;
+    RecursionSpliceTestHooks::first_take = FirstTake::Wait;
+    InnerProof root = *rollup_proof;
+    root.constraint.proof_type = ROOT_ROLLUP_HONK;
+    const AcirProgram program = make_program({ &root, &root });
+    const AcirFormat& constraints = program.constraints;
+    const auto build_constraints = [&](const bool splice) {
+        if (seeded()) {
+            numeric::get_randomness().adopt(start);
+        }
+        Build result;
+        result.builder = Builder{ program.witness, constraints.public_inputs, /*is_write_vk_mode=*/false };
+        RecursionSpliceTestHooks::stats = &result.stats;
+        RecursionSpliceTestHooks::after_constraint = [&](Builder&, const RecursionConstraint&, size_t) {
+            result.positions.push_back(numeric::get_randomness().position());
+        };
+        const std::unique_ptr<RecursionSplicer> splicer =
+            splice ? RecursionSplicer::launch(result.builder, constraints.honk_recursion_constraints) : nullptr;
+        GateCounter<Builder> gate_counter{ &result.builder, /*collect_gates_per_opcode=*/false };
+        std::vector<size_t> gates_per_opcode;
+        (void)create_recursion_constraints<Builder>(
+            result.builder,
+            gate_counter,
+            gates_per_opcode,
+            /*ivc_base=*/nullptr,
+            { constraints.honk_recursion_constraints, constraints.original_opcode_indices.honk_recursion_constraints },
+            /*avm_recursion_data=*/{},
+            /*hn_recursion_data=*/{},
+            /*chonk_recursion_data=*/{},
+            splicer.get());
+        return result;
+    };
+    const Build serial = build_constraints(/*splice=*/false);
+    const Build spliced = build_constraints(/*splice=*/true);
+    expect_same_build(spliced, serial);
+    EXPECT_EQ(spliced.stats.spliced, 2);
+    EXPECT_EQ(spliced.stats.refused, 0) << spliced.stats.first_refusal;
 }
 
 TEST_F(RecursionSpliceTest, EligibleAfterIneligibleIsBuiltSerially)
@@ -651,19 +712,8 @@ TEST_F(RecursionSpliceTest, RefusesWhenTheEngineMoved)
 
 TEST_F(RecursionSpliceTest, RefusesATaggedInput)
 {
-    const auto [serial, spliced] = build_both(
-        make_program(three_honk_proofs()),
-        {},
-        Hooks{ .before_constraint = [](Builder& builder, const RecursionConstraint& constraint, size_t index) {
-            if (index != 1) {
-                return;
-            }
-            const std::vector<uint32_t> inputs = inputs_of(constraint);
-            const auto small = std::ranges::find_if(
-                inputs, [&](uint32_t input) { return uint256_t(builder.get_variable(input)) <= MAX_SMALL_RANGE; });
-            ASSERT_NE(small, inputs.end());
-            builder.create_small_range_constraint(*small, MAX_SMALL_RANGE);
-        } });
+    const auto [serial, spliced] =
+        build_both(make_program(three_honk_proofs()), {}, Hooks{ .before_constraint = tag_a_small_input(1) });
     EXPECT_EQ(spliced.stats.spliced, 2);
     EXPECT_EQ(spliced.stats.refused, 1);
     EXPECT_EQ(spliced.stats.first_refusal, "an input carries a range tag");
@@ -845,6 +895,108 @@ TEST_F(RecursionSpliceTest, ScratchThreadsDrawOnlyFromTheirOwnBuffers)
             EXPECT_LE(consumed[i - 1].first + consumed[i - 1].second, consumed[i].first);
         }
     }
+}
+
+/**
+ * A root rollup program verifies two rollup proofs, then the IPA opening both carry: a circuit of about 6.35M gates,
+ * too costly to build per merge. The suite name puts these tests among the nightly ones (see
+ * barretenberg/cpp/bootstrap.sh), and each test builds that circuit as few times as it can.
+ */
+class HonkRecursionConstraintTestRootSplice : public RecursionSpliceTest {
+  protected:
+    static void SetUpTestSuite()
+    {
+        bb::srs::init_file_crs_factory(bb::srs::bb_crs_path());
+        root_proof = prove_inner_circuit<UltraFlavor, stdlib::recursion::honk::RollupIO>(ROOT_ROLLUP_HONK);
+    }
+
+    static AcirProgram root_program() { return make_program({ &*root_proof, &*root_proof }); }
+
+    // expect_same_build without its two root-sized copies: `spliced` is finalized in place, and so is `serial` when
+    // `finalize_serial`, else one copy of it.
+    void expect_same_root_build(Build& spliced, Build& serial, const bool finalize_serial) const
+    {
+        expect_same_builder_state(spliced.builder, serial.builder, compare_values());
+        EXPECT_TRUE(spliced.positions == serial.positions);
+        EXPECT_EQ(serial.stats.launched, 0);
+        spliced.builder.finalize_circuit();
+        if (finalize_serial) {
+            serial.builder.finalize_circuit();
+            expect_same_builder_state(spliced.builder, serial.builder, compare_values());
+        } else {
+            Builder serial_finalized = serial.builder;
+            serial_finalized.finalize_circuit();
+            expect_same_builder_state(spliced.builder, serial_finalized, compare_values());
+        }
+    }
+
+    // Proves `builder` from the engine position `from`, freeing the builder once the prover has copied it.
+    static HonkProof prove(Builder& builder, const numeric::RNG::Position& from)
+    {
+        numeric::get_randomness().adopt(from);
+        const auto prover_instance =
+            std::make_shared<ProverInstance_<UltraFlavor>>(builder, CopiedCircuitData::RELEASE);
+        builder = Builder{};
+        const auto verification_key =
+            std::make_shared<UltraFlavor::VerificationKey>(prover_instance->get_precomputed());
+        UltraProver_<UltraFlavor> prover(prover_instance, verification_key);
+        return prover.construct_proof();
+    }
+
+    // The root rollup verifies its IPA accumulator in full and passes no claim on.
+    const ProgramMetadata metadata{ .has_ipa_claim = false };
+    static inline std::optional<InnerProof> root_proof;
+};
+
+// One serial build, which every spliced build equals in every member, before and after finalization. At most three
+// root builders are alive at once: the serial build, the production-policy build and a finalized copy of the former.
+TEST_F(HonkRecursionConstraintTestRootSplice, SplicedBuildsMatchTheSerialBuild)
+{
+    const HookReset reset;
+    const AcirProgram program = root_program();
+    Build serial = build(program, metadata, /*splice=*/false, start);
+    EXPECT_FALSE(serial.builder.failed()) << serial.builder.err();
+    {
+        // The production policy: the first constraint is spliced only if its scratch build has finished when the
+        // building thread reaches it. That depends on timing, so the counts are logged rather than checked.
+        Build by_timing = build(program, metadata, /*splice=*/true, start, Hooks{ .first_take = FirstTake::Auto });
+        expect_same_root_build(by_timing, serial, /*finalize_serial=*/false);
+        EXPECT_EQ(by_timing.stats.refused, 0) << by_timing.stats.first_refusal;
+        info("root rollup, first take by timing: ",
+             by_timing.stats.spliced,
+             " spliced, ",
+             by_timing.stats.built_in_place,
+             " built in place");
+    }
+    // The first constraint waits for its scratch build, so both are spliced whatever the timing. The engine positions
+    // after each constraint, which expect_same_root_build compares too, only bite under the seeded engine: the default
+    // engine has none.
+    Build waited = build(program, metadata, /*splice=*/true, start);
+    expect_same_root_build(waited, serial, /*finalize_serial=*/true);
+    EXPECT_EQ(waited.stats.spliced, 2);
+    EXPECT_EQ(waited.stats.refused, 0) << waited.stats.first_refusal;
+    EXPECT_EQ(waited.stats.built_in_place, 0);
+    // Under the default engine the two builds draw different offset generators, so their proofs differ.
+    if (seeded()) {
+        const HonkProof waited_proof = prove(waited.builder, serial.positions.back());
+        const HonkProof serial_proof = prove(serial.builder, serial.positions.back());
+        EXPECT_TRUE(waited_proof == serial_proof);
+    }
+}
+
+// The second root constraint is refused and built in place, on the builder and engine the first splice left. The tag
+// that refuses it goes into the serial build too, so this test cannot share the serial build above.
+TEST_F(HonkRecursionConstraintTestRootSplice, RefusedConstraintIsBuiltInPlace)
+{
+    const HookReset reset;
+    const AcirProgram program = root_program();
+    const Hooks hooks{ .before_constraint = tag_a_small_input(1) };
+    Build serial = build(program, metadata, /*splice=*/false, start, hooks);
+    Build spliced = build(program, metadata, /*splice=*/true, start, hooks);
+    expect_same_root_build(spliced, serial, /*finalize_serial=*/true);
+    EXPECT_EQ(spliced.stats.spliced, 1);
+    EXPECT_EQ(spliced.stats.refused, 1);
+    EXPECT_EQ(spliced.stats.first_refusal, "an input carries a range tag");
 }
 
 } // namespace
