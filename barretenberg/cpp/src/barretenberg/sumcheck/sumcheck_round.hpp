@@ -126,6 +126,10 @@ template <typename Flavor> class SumcheckProverRound {
                                              : (SupportsSimdSumcheck<Flavor> && simd_available_v<typename FF::Params>)
                                                  ? 50
                                                  : 64;
+    // Rows at the start of each round that are scheduled as one-edge chunks ahead of the `ROWS_PER_CHUNK` chunks. AVM
+    // columns are prefixes of the trace, so the leading edges carry the most live columns, and a single chunk holding
+    // them would set the round's wall time. A constant: chunk boundaries never depend on the thread count.
+    static constexpr size_t DENSE_HEAD_ROWS = isAvmFlavor<Flavor> ? 512 : 0;
     using ZKData = ZKSumcheckData<Flavor>;
 
     // Number of rows excluded from the main sumcheck loop and handled by compute_offset_area_contribution.
@@ -502,24 +506,33 @@ template <typename Flavor> class SumcheckProverRound {
     }
 
     // Work-stealing scheduler over a single contiguous edge range (the dense-flavor case, see
-    // `compute_univariate`). `pop()` computes chunk bounds arithmetically, so it allocates nothing.
+    // `compute_univariate`). The first `head_rows` rows go out as one-edge chunks, then the rest in `rows_per_chunk`
+    // chunks. `pop()` computes chunk bounds arithmetically, so it allocates nothing.
     struct ContiguousEdgeChunks {
         const size_t begin;
         const size_t end;
         const size_t rows_per_chunk;
+        const size_t head_end;
+        const size_t head_chunks;
         const size_t total_chunks;
         std::atomic<size_t> next_chunk{ 0 };
 
-        ContiguousEdgeChunks(const size_t begin, const size_t end, const size_t rows_per_chunk)
+        ContiguousEdgeChunks(const size_t begin,
+                             const size_t end,
+                             const size_t rows_per_chunk,
+                             const size_t head_rows = 0)
             : begin(begin)
             , end(end)
             , rows_per_chunk(rows_per_chunk)
-            , total_chunks(chunk_count(end - begin, rows_per_chunk))
+            , head_end(std::min(begin + head_rows, end))
+            , head_chunks((head_end - begin) / 2)
+            , total_chunks(head_chunks + chunk_count(end - head_end, rows_per_chunk))
         {
             BB_ASSERT(begin % 2 == 0, "edge range begin must be even");
             BB_ASSERT(end % 2 == 0, "edge range end must be even");
             BB_ASSERT(begin <= end, "edge range begin must not exceed end");
             BB_ASSERT(rows_per_chunk >= 2 && rows_per_chunk % 2 == 0, "rows_per_chunk must be at least 2 and even");
+            BB_ASSERT(head_rows % 2 == 0 && head_rows <= DENSE_HEAD_ROWS, "head_rows must be even and enabled");
         }
 
         size_t num_slots() const { return std::min(bb::get_num_cpus(), std::max<size_t>(total_chunks, 1)); }
@@ -530,8 +543,16 @@ template <typename Flavor> class SumcheckProverRound {
             if (id >= total_chunks) {
                 return std::nullopt;
             }
-            const size_t chunk_begin = begin + id * rows_per_chunk;
-            return EdgeRange{ .begin = chunk_begin, .end = std::min(chunk_begin + rows_per_chunk, end) };
+            if constexpr (DENSE_HEAD_ROWS > 0) {
+                if (id < head_chunks) {
+                    return EdgeRange{ .begin = begin + 2 * id, .end = begin + 2 * id + 2 };
+                }
+                const size_t chunk_begin = head_end + (id - head_chunks) * rows_per_chunk;
+                return EdgeRange{ .begin = chunk_begin, .end = std::min(chunk_begin + rows_per_chunk, end) };
+            } else {
+                const size_t chunk_begin = begin + id * rows_per_chunk;
+                return EdgeRange{ .begin = chunk_begin, .end = std::min(chunk_begin + rows_per_chunk, end) };
+            }
         }
     };
 
@@ -591,7 +612,7 @@ template <typename Flavor> class SumcheckProverRound {
         } else {
             // Short traces don't need to iterate over the zero tail of the polynomial.
             const size_t effective_round_size = compute_effective_round_size(polynomials);
-            return ContiguousEdgeChunks{ excluded_head_size, effective_round_size, ROWS_PER_CHUNK };
+            return ContiguousEdgeChunks{ excluded_head_size, effective_round_size, ROWS_PER_CHUNK, DENSE_HEAD_ROWS };
         }
     }
 
