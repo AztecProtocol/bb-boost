@@ -6,6 +6,7 @@
 
 #include "trace_to_polynomials.hpp"
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/common/scratch_array.hpp"
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/constants.hpp"
@@ -190,6 +191,13 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
             }
             if (copied_circuit_data == CopiedCircuitData::RELEASE &&
                 chunks_left[task.block_idx].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                if constexpr (IsUltraHonk<Flavor>) {
+                    // Freeing a large tile chunk unmaps its pages serially on this worker; hand them back from several
+                    // threads first, as the builder's destructor does. A store has far fewer than 64 chunks.
+                    PageBlockList<64> released;
+                    block.tiles.add_chunks_to(released);
+                    released.release();
+                }
                 block.free_data();
             }
         });
