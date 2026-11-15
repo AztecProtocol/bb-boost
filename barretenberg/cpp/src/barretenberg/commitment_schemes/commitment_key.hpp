@@ -131,6 +131,34 @@ template <class Curve> class CommitmentKey {
         return std::vector<Commitment>(results.begin(), results.end());
     };
 
+    /**
+     * @brief batch_commit with an explicit small-member MSM schedule; the commitments equal batch_commit's.
+     */
+    std::vector<Commitment> batch_commit(RefSpan<Polynomial<Fr>> polynomials,
+                                         std::span<const uint32_t> dedup_infos,
+                                         scalar_multiplication::SmallMsmSchedule schedule) const
+    {
+        BB_BENCH_NAME("CommitmentKey::batch_commit");
+
+        std::vector<PolynomialSpan<Fr>> scalar_spans;
+        scalar_spans.reserve(polynomials.size());
+
+        for (auto& polynomial : polynomials) {
+            const size_t consumed_srs = polynomial.start_index() + polynomial.size();
+            if (consumed_srs > get_monomial_size()) {
+                throw_or_abort(format("Attempting to commit to a polynomial that needs ",
+                                      consumed_srs,
+                                      " points with an SRS of size ",
+                                      get_monomial_size()));
+            }
+            scalar_spans.emplace_back(polynomial.start_index(), polynomial.coeffs());
+        }
+
+        auto results = scalar_multiplication::MSM<Curve>::batch_multi_scalar_mul(
+            get_monomial_points(), scalar_spans, dedup_infos, schedule);
+        return std::vector<Commitment>(results.begin(), results.end());
+    };
+
     // helper builder struct for constructing a batch to commit at once
     struct CommitBatch {
         CommitmentKey* key;
@@ -143,6 +171,16 @@ template <class Curve> class CommitmentKey {
         std::vector<Commitment> commit_and_send_to_verifier(auto transcript)
         {
             std::vector<Commitment> commitments = key->batch_commit(wires, dedup_infos);
+            for (size_t i = 0; i < commitments.size(); ++i) {
+                transcript->send_to_verifier(labels[i], commitments[i]);
+            }
+            return commitments;
+        }
+
+        std::vector<Commitment> commit_and_send_to_verifier(auto transcript,
+                                                            scalar_multiplication::SmallMsmSchedule schedule)
+        {
+            std::vector<Commitment> commitments = key->batch_commit(wires, dedup_infos, schedule);
             for (size_t i = 0; i < commitments.size(); ++i) {
                 transcript->send_to_verifier(labels[i], commitments[i]);
             }

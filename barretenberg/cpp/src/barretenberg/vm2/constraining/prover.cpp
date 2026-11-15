@@ -140,7 +140,7 @@ void AvmProver::execute_wire_commitments_round()
     for (const auto& [poly, label] : zip_view(prover_polynomials.get_wires(), prover_polynomials.get_wires_labels())) {
         batch.add_to_batch(poly, label, /*has_duplicates_hint=*/true);
     }
-    batch.commit_and_send_to_verifier(transcript);
+    batch.commit_and_send_to_verifier(transcript, scalar_multiplication::SmallMsmSchedule::SPLIT_BY_COST);
 }
 
 void AvmProver::execute_log_derivative_inverse_round()
@@ -242,7 +242,7 @@ void AvmProver::execute_log_derivative_inverse_commitments_round()
 
         batch.add_to_batch(derived_poly, label);
     }
-    batch.commit_and_send_to_verifier(transcript);
+    batch.commit_and_send_to_verifier(transcript, scalar_multiplication::SmallMsmSchedule::SPLIT_BY_COST);
 }
 
 /**

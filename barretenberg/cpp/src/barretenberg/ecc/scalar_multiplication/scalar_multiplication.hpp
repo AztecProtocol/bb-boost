@@ -470,6 +470,15 @@ template <typename Curve> class MSM {
                                                              std::span<PolynomialSpan<ScalarField>> scalars,
                                                              bool handle_edge_cases = true,
                                                              std::span<const uint32_t> dedup_infos = {});
+
+    /**
+     * @brief The batch MSM without edge-case handling, with an explicit small-member schedule (see SmallMsmSchedule).
+     * @details WHOLE, or the legacy MSM, is exactly `batch_multi_scalar_mul(points, scalars, false, dedup_infos)`.
+     */
+    static std::vector<AffineElement> batch_multi_scalar_mul(std::span<const AffineElement> points,
+                                                             std::span<PolynomialSpan<ScalarField>> scalars,
+                                                             std::span<const uint32_t> dedup_infos,
+                                                             SmallMsmSchedule schedule);
 };
 
 extern template class MSM<curve::BN254>;

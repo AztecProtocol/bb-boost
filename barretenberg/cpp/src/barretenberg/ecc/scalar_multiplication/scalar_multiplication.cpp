@@ -727,6 +727,22 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
     return MSM_fast<Curve>::batch_multi_scalar_mul(points, scalars, handle_edge_cases, dedup_infos);
 }
 
+template <typename Curve>
+std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
+    std::span<const typename Curve::AffineElement> points,
+    std::span<PolynomialSpan<typename Curve::ScalarField>> scalars,
+    std::span<const uint32_t> dedup_infos,
+    SmallMsmSchedule schedule)
+{
+    for (const auto& member : scalars) {
+        check_msm_points_cover_scalars(member.start_index, member.size(), points.size());
+    }
+    if (schedule == SmallMsmSchedule::WHOLE || use_legacy_msm()) {
+        return batch_multi_scalar_mul(points, scalars, /*handle_edge_cases=*/false, dedup_infos);
+    }
+    return MSM_fast<Curve>::batch_multi_scalar_mul(points, scalars, dedup_infos, schedule);
+}
+
 template curve::BN254::Element pippenger<curve::BN254>(PolynomialSpan<const curve::BN254::ScalarField> scalars,
                                                        std::span<const curve::BN254::AffineElement> points,
                                                        bool handle_edge_cases,

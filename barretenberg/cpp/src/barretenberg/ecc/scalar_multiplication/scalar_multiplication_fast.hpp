@@ -6,6 +6,8 @@
 #include "barretenberg/polynomials/polynomial.hpp"
 #include <string>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -130,6 +132,17 @@ extern template curve::Grumpkin::Element pippenger_unsafe_fast<curve::Grumpkin>(
     std::span<const curve::Grumpkin::AffineElement> points,
     size_t dedup_info) noexcept;
 
+/**
+ * @brief How a batch MSM schedules its small members (those run one per worker, single-threaded).
+ * @details WHOLE runs each small member as one task. SPLIT_BY_COST estimates each small member's cost from a sample
+ *          of its scalars and runs any member above the pool's fair share as contiguous parts, whose results are
+ *          summed per member in offset order. Both produce the same group elements.
+ */
+enum class SmallMsmSchedule : uint8_t {
+    WHOLE,
+    SPLIT_BY_COST,
+};
+
 template <typename Curve> class MSM_fast {
   public:
     using Element = typename Curve::Element;
@@ -180,6 +193,15 @@ template <typename Curve> class MSM_fast {
                                                              std::span<PolynomialSpan<ScalarField>> scalars,
                                                              bool handle_edge_cases = true,
                                                              std::span<const uint32_t> dedup_infos = {}) noexcept;
+
+    /**
+     * @brief The batch driver without edge-case handling, with an explicit small-member schedule.
+     * @details WHOLE is exactly `batch_multi_scalar_mul(points, scalars, false, dedup_infos)`.
+     */
+    static std::vector<AffineElement> batch_multi_scalar_mul(std::span<const AffineElement> points,
+                                                             std::span<PolynomialSpan<ScalarField>> scalars,
+                                                             std::span<const uint32_t> dedup_infos,
+                                                             SmallMsmSchedule schedule) noexcept;
 };
 
 extern template class MSM_fast<curve::Grumpkin>;
@@ -224,6 +246,113 @@ inline constexpr size_t GLV_SMALL_N_THRESHOLD = size_t{ 1 } << 16;
 #else
 inline constexpr size_t GLV_SMALL_N_THRESHOLD = size_t{ 1 } << 13;
 #endif
+
+// SmallMsmSchedule::SPLIT_BY_COST samples one scalar per equal segment of a member; a part never ends inside a segment.
+inline constexpr size_t COST_SEGMENTS = 64;
+// Below this many points a part's fixed setup outweighs what splitting saves.
+inline constexpr size_t MIN_SPLIT_PART_POINTS = size_t{ 1 } << 11;
+
+using SegmentBits = std::array<uint8_t, COST_SEGMENTS>;
+
+/// Contiguous points [offset, offset + length) of batch member `member`, with its estimated cost.
+struct MsmPart {
+    size_t member;
+    size_t offset;
+    size_t length;
+    uint64_t cost;
+};
+
+/// First point of segment j of a member of n points.
+inline size_t cost_segment_begin(size_t n, size_t j) noexcept
+{
+    return (n * j) / COST_SEGMENTS;
+}
+
+/**
+ * @brief Bit length of the scalar at the middle of each of a member's COST_SEGMENTS segments (0 for zero).
+ * @details A segment's estimated cost is its sampled bit length times its point count: an MSM's work tracks its
+ *          non-zero scalars times their bits, not its span. Reads only.
+ */
+template <typename ScalarField> SegmentBits sample_segment_bits(std::span<const ScalarField> scalars) noexcept
+{
+    SegmentBits bits{};
+    const size_t n = scalars.size();
+    for (size_t j = 0; j < COST_SEGMENTS && n != 0; ++j) {
+        const ScalarField& s = scalars[(n * ((2 * j) + 1)) / (2 * COST_SEGMENTS)];
+        if (!s.is_zero()) {
+            bits[j] = static_cast<uint8_t>(static_cast<numeric::uint256_t>(s).get_msb() + 1);
+        }
+    }
+    return bits;
+}
+
+/**
+ * @brief Cuts members into parts of roughly equal estimated cost, ordered for costliest-first claiming.
+ * @param members Batch member indices; lengths[k] and bits[k] describe members[k].
+ * @details A member whose cost exceeds the batch's fair share (total / pool_width) becomes up to
+ *          min(ceil(cost / fair), length / MIN_SPLIT_PART_POINTS, pool_width) parts, cut at the first segment boundary
+ *          where the running cost reaches the next quantile (i / parts of the cost). Every part of a split member has
+ *          at least MIN_SPLIT_PART_POINTS points and a non-zero estimated cost, so it holds a non-zero scalar. Other
+ *          members are one part. The parts of a member tile [0, length) exactly. Order: cost descending, then
+ *          member, then offset.
+ */
+inline std::vector<MsmPart> plan_cost_split_parts(std::span<const size_t> members,
+                                                  std::span<const size_t> lengths,
+                                                  std::span<const SegmentBits> bits,
+                                                  size_t pool_width) noexcept
+{
+    auto segment_cost = [&](size_t k, size_t j) noexcept -> uint64_t {
+        const size_t n = lengths[k];
+        return uint64_t{ bits[k][j] } * (cost_segment_begin(n, j + 1) - cost_segment_begin(n, j));
+    };
+    std::vector<uint64_t> member_cost(members.size(), 0);
+    uint64_t total = 0;
+    for (size_t k = 0; k < members.size(); ++k) {
+        for (size_t j = 0; j < COST_SEGMENTS; ++j) {
+            member_cost[k] += segment_cost(k, j);
+        }
+        total += member_cost[k];
+    }
+    const uint64_t fair = std::max<uint64_t>(1, total / std::max<size_t>(1, pool_width));
+
+    std::vector<MsmPart> parts;
+    parts.reserve(members.size());
+    for (size_t k = 0; k < members.size(); ++k) {
+        const size_t n = lengths[k];
+        const uint64_t cost = member_cost[k];
+        const size_t max_parts = std::min({ pool_width, n / MIN_SPLIT_PART_POINTS, COST_SEGMENTS });
+        const size_t wanted = cost > fair ? static_cast<size_t>((cost + fair - 1) / fair) : 1;
+        const size_t num_parts = std::min(wanted, max_parts);
+        if (num_parts <= 1) {
+            parts.push_back({ members[k], 0, n, cost });
+            continue;
+        }
+        size_t begin = 0;
+        size_t made = 0;
+        uint64_t cum = 0;
+        uint64_t cum_at_begin = 0;
+        for (size_t j = 0; j < COST_SEGMENTS && made + 1 < num_parts; ++j) {
+            cum += segment_cost(k, j);
+            const size_t end = cost_segment_begin(n, j + 1);
+            const uint64_t quantile = ((cost * (made + 1)) + num_parts - 1) / num_parts;
+            if (cum >= quantile && cum > cum_at_begin && cum < cost && end - begin >= MIN_SPLIT_PART_POINTS &&
+                n - end >= MIN_SPLIT_PART_POINTS) {
+                parts.push_back({ members[k], begin, end - begin, cum - cum_at_begin });
+                begin = end;
+                cum_at_begin = cum;
+                ++made;
+            }
+        }
+        parts.push_back({ members[k], begin, n - begin, cost - cum_at_begin });
+    }
+    std::sort(parts.begin(), parts.end(), [](const MsmPart& a, const MsmPart& b) {
+        if (a.cost != b.cost) {
+            return a.cost > b.cost;
+        }
+        return a.member != b.member ? a.member < b.member : a.offset < b.offset;
+    });
+    return parts;
+}
 
 /**
  * @brief Single-MSM_fast, no-affine-trick Pippenger over window_bits-wide windows.

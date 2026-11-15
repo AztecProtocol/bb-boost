@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <vector>
 #if !defined(__wasm__) && !defined(NO_MULTITHREADING) && SIZE_MAX > UINT32_MAX
