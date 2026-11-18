@@ -1,0 +1,41 @@
+dest
+node_modules
+.cache
+.pnp.cjs
+.pnp.loader.mjs
+build/
+.idea
+cmake-build-debug
+.terraform*
+terraform.tfstate*
+.bootstrapped
+.tsbuildinfo
+bench-out
+dumped-avm-circuit-inputs
+
+# Local Netlify folder
+.netlify
+
+.graphite*
+.DS_Store
+
+# tmux
+tmux-client-*.log
+.supermavenignore
+
+# parallel
+joblog.txt
+.logged_test_flakes
+
+
+__pycache__
+
+*.local.md
+.claude/settings.local.json
+.codex/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees
+
+# Local opt-in: install nargo from the matching official noir release instead of building from source.
+noir-from-release.flag
+npm-release

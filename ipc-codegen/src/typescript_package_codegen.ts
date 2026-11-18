@@ -1,0 +1,537 @@
+import { toSnakeCase } from "./naming.ts";
+
+export interface TypeScriptPackageOptions {
+  prefix: string;
+  packageName: string;
+  binaryName: string;
+  binaryEnvVar: string;
+  ipcRuntimeDependency: string;
+  ipcPathArgs: string[];
+  transports: string[];
+}
+
+function className(prefix: string): string {
+  return `${prefix}Service`;
+}
+
+function transportType(prefix: string): string {
+  return `${prefix}Transport`;
+}
+
+function optionsType(prefix: string): string {
+  return `${prefix}ServiceOptions`;
+}
+
+function binaryFinderName(prefix: string): string {
+  return `find${prefix}Binary`;
+}
+
+function envName(binaryName: string): string {
+  return `${binaryName.replace(/[^a-zA-Z0-9]+/g, "_").toUpperCase()}_PATH`;
+}
+
+function packageStem(packageName: string): string {
+  return packageName.startsWith("@") ? packageName.split("/")[1]! : packageName;
+}
+
+function archPackageNames(packageName: string): Record<string, string> {
+  return {
+    "linux-x64": `${packageName}-linux-x64`,
+    "darwin-x64": `${packageName}-darwin-x64`,
+    "linux-arm64": `${packageName}-linux-arm64`,
+    "darwin-arm64": `${packageName}-darwin-arm64`,
+  };
+}
+
+const ARCH_PACKAGES = [
+  { buildDir: "amd64-linux", suffix: "linux-x64", os: "linux", cpu: "x64" },
+  { buildDir: "arm64-linux", suffix: "linux-arm64", os: "linux", cpu: "arm64" },
+  { buildDir: "amd64-macos", suffix: "darwin-x64", os: "darwin", cpu: "x64" },
+  {
+    buildDir: "arm64-macos",
+    suffix: "darwin-arm64",
+    os: "darwin",
+    cpu: "arm64",
+  },
+] as const;
+
+export function defaultBinaryEnvVar(binaryName: string): string {
+  return envName(binaryName);
+}
+
+function generatePackageTsconfig(): string {
+  return (
+    JSON.stringify(
+      {
+        compilerOptions: {
+          target: "ES2022",
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          declaration: true,
+          declarationMap: true,
+          composite: true,
+          outDir: "dest",
+          rootDir: "src",
+          tsBuildInfoFile: ".tsbuildinfo",
+          strict: true,
+          esModuleInterop: true,
+          skipLibCheck: true,
+          forceConsistentCasingInFileNames: true,
+        },
+        include: ["src/**/*.ts"],
+      },
+      null,
+      2,
+    ) + "\n"
+  );
+}
+
+export interface TypeScriptServerPackageOptions {
+  prefix: string;
+  packageName: string;
+  /** Basename of the schema file shipped at the package root (the wire contract). */
+  schemaFileName: string;
+}
+
+/**
+ * Package shell for a server-side binding package: pure generated TS (wire
+ * types + Handler/dispatch) plus the schema itself. No binary, no arch
+ * packages — the transport is provided by the consumer (e.g. UdsIpcServer
+ * from @aztec-foundation/ipc-runtime).
+ */
+export class TypeScriptServerPackageCodegen {
+  private opts: TypeScriptServerPackageOptions;
+
+  constructor(opts: TypeScriptServerPackageOptions) {
+    this.opts = opts;
+  }
+
+  generatePackageJson(): string {
+    const pkg = {
+      name: this.opts.packageName,
+      version: "0.1.0",
+      type: "module",
+      exports: {
+        ".": {
+          types: "./dest/index.d.ts",
+          default: "./dest/index.js",
+        },
+        // Expose the schema for consumers that want to regenerate bindings
+        // or inspect the wire contract.
+        [`./${this.opts.schemaFileName}`]: `./${this.opts.schemaFileName}`,
+      },
+      files: ["dest/", this.opts.schemaFileName, "README.md"],
+      scripts: {
+        clean: "rm -rf dest .tsbuildinfo",
+        build: "tsc -p tsconfig.json",
+      },
+      dependencies: {
+        msgpackr: "^1.11.2",
+        tslib: "^2.4.0",
+      },
+      devDependencies: {
+        "@types/node": "^22.15.17",
+        typescript: "^5.3.3",
+      },
+    };
+    return JSON.stringify(pkg, null, 2) + "\n";
+  }
+
+  generateTsconfig(): string {
+    return generatePackageTsconfig();
+  }
+
+  generateIndex(): string {
+    return `export * from './generated/api_types.js';
+export * from './generated/server.js';
+`;
+  }
+
+  generateReadme(): string {
+    return `# ${this.opts.packageName}
+
+Generated TypeScript server bindings for the ${this.opts.prefix} IPC service:
+wire types, the \`Handler\` interface, and \`handleRequest\`/\`dispatch\`. The
+byte transport is provided by the consumer — e.g. \`UdsIpcServer\` from
+\`@aztec-foundation/ipc-runtime\`.
+
+\`\`\`ts
+import { UdsIpcServer } from '@aztec-foundation/ipc-runtime';
+import { type Handler, handleRequest } from '${this.opts.packageName}';
+
+const handler: Handler = /* implement the generated interface */;
+const server = await UdsIpcServer.listen(socketPath, (_clientId, request) =>
+  handleRequest(handler, request),
+);
+\`\`\`
+
+The schema this package was generated from ships at
+\`${this.opts.packageName}/${this.opts.schemaFileName}\`; its hash is exported
+as \`SCHEMA_HASH\`.
+
+## Build
+
+The whole package (shell and \`src/\`) is generated by ipc-codegen; build
+through the owning project's \`./bootstrap.sh\`, which regenerates and then
+runs \`yarn build\`.
+`;
+  }
+}
+
+export class TypeScriptPackageCodegen {
+  private opts: TypeScriptPackageOptions;
+
+  constructor(opts: TypeScriptPackageOptions) {
+    this.opts = opts;
+  }
+
+  generatePackageJson(): string {
+    const archPackages = archPackageNames(this.opts.packageName);
+    const scripts: Record<string, string> = {
+      clean: "rm -rf dest .tsbuildinfo",
+      build: "tsc -p tsconfig.json",
+      prepare_arch_packages: "./scripts/prepare_arch_packages.sh",
+    };
+
+    const pkg = {
+      name: this.opts.packageName,
+      version: "0.1.0",
+      type: "module",
+      // Put the native binary on the consumer's PATH. The bin target is a JS
+      // launcher (dest/bin.js), not the binary itself: the binary ships in the
+      // per-arch optional-dependency packages and is resolved at runtime, and
+      // npm only links the main package's own bin onto PATH.
+      ...(this.opts.binaryName
+        ? { bin: { [this.opts.binaryName]: "./dest/bin.js" } }
+        : {}),
+      exports: {
+        ".": {
+          types: "./dest/index.d.ts",
+          default: "./dest/index.js",
+        },
+      },
+      files: ["dest/", "README.md"],
+      scripts,
+      dependencies: {
+        "@aztec-foundation/ipc-runtime": this.opts.ipcRuntimeDependency,
+        msgpackr: "^1.11.2",
+        tslib: "^2.4.0",
+      },
+      optionalDependencies: Object.fromEntries(
+        Object.values(archPackages).map((packageName) => [
+          packageName,
+          "0.1.0",
+        ]),
+      ),
+      devDependencies: {
+        "@types/node": "^22.15.17",
+        typescript: "^5.3.3",
+      },
+    };
+    return JSON.stringify(pkg, null, 2) + "\n";
+  }
+
+  generateBin(): string {
+    const findBinary = binaryFinderName(this.opts.prefix);
+    return `#!/usr/bin/env node
+import { spawnSync } from 'node:child_process';
+import { ${findBinary} } from './platform.js';
+
+const binaryPath = ${findBinary}();
+if (!binaryPath) {
+  console.error(
+    "${this.opts.binaryName}: native binary not found. Install the matching " +
+      "'${this.opts.packageName}-<platform>' package, set ${this.opts.binaryEnvVar}, or pass its path.",
+  );
+  process.exit(1);
+}
+
+const result = spawnSync(binaryPath, process.argv.slice(2), { stdio: 'inherit' });
+if (result.error) {
+  console.error(result.error.message);
+  process.exit(1);
+}
+process.exit(result.status ?? 1);
+`;
+  }
+
+  generateArchPackageJson(suffix: string, os: string, cpu: string): string {
+    const pkg = {
+      name: `${this.opts.packageName}-${suffix}`,
+      version: "0.1.0",
+      description: `Native binary for ${this.opts.packageName} (${suffix})`,
+      license: "MIT",
+      os: [os],
+      cpu: [cpu],
+      files: [this.opts.binaryName],
+      preferUnplugged: true,
+    };
+    return JSON.stringify(pkg, null, 2) + "\n";
+  }
+
+  generateArchPackageManifests(): Array<{ path: string; content: string }> {
+    const stem = packageStem(this.opts.packageName);
+    return ARCH_PACKAGES.map(({ suffix, os, cpu }) => ({
+      path: `packages/${stem}-${suffix}/package.json`,
+      content: this.generateArchPackageJson(suffix, os, cpu),
+    }));
+  }
+
+  generateTsconfig(): string {
+    return generatePackageTsconfig();
+  }
+
+  generateIndex(): string {
+    const prefix = this.opts.prefix;
+    const serviceClass = className(prefix);
+    const serviceOptions = optionsType(prefix);
+    const serviceTransport = transportType(prefix);
+    const findBinary = binaryFinderName(prefix);
+    const supportsShm = this.opts.transports.includes("shm");
+    const transports = this.opts.transports.map((t) => `'${t}'`).join(" | ");
+    const ipcPathArgs = JSON.stringify(this.opts.ipcPathArgs);
+    const defaultTransport = this.opts.transports.includes("uds")
+      ? "uds"
+      : this.opts.transports[0]!;
+
+    return `import { IpcSpawnError, SpawnedProcessBackend } from '@aztec-foundation/ipc-runtime';
+import { AsyncApi, type IpcErrorFactory } from './generated/async.js';
+import { ${findBinary} } from './platform.js';
+
+export * from './generated/api_types.js';
+export { AsyncApi } from './generated/async.js';
+export { SyncApi } from './generated/sync.js';
+
+export type ${serviceTransport} = ${transports};
+
+export interface ${serviceOptions} {
+  binaryPath?: string;
+  transport?: ${serviceTransport};
+  logger?: (msg: string) => void;
+  connectTimeoutMs?: number;
+  env?: NodeJS.ProcessEnv;
+  extraArgs?: string[];
+  createError?: IpcErrorFactory;
+  /**
+   * Respawn the server on the next call after it dies, instead of failing all
+   * subsequent calls. Only enable for stateless servers: a respawned process
+   * remembers nothing, so any server-side session state held by callers would
+   * silently dangle.
+   */
+  respawn?: boolean;
+${supportsShm ? "  napiPath?: string;\n  clientId?: number;\n" : ""}}
+
+/**
+ * Spawns and talks to a '${this.opts.binaryName}' server process. Process
+ * lifecycle — connectivity, death detection, optional respawn, teardown — is
+ * owned by the backend (see SpawnedProcessBackend in ipc-runtime); it never
+ * leaks onto this API. Failed calls carry a 'retry' property set to true when
+ * the failure was environmental and the operation may be retried.
+ */
+export class ${serviceClass} extends AsyncApi {
+  private constructor(private spawnedBackend: SpawnedProcessBackend, createError?: IpcErrorFactory) {
+    super(spawnedBackend, createError);
+  }
+
+  static async spawn(options: ${serviceOptions} = {}): Promise<${serviceClass}> {
+    const binaryPath = ${findBinary}(options.binaryPath);
+    if (!binaryPath) {
+      throw new IpcSpawnError('${this.opts.binaryName} binary not found', /*retry=*/ false);
+    }
+    const backend = await SpawnedProcessBackend.spawn({
+      binaryPath,
+      binaryName: '${this.opts.binaryName}',
+      instancePrefix: '${toSnakeCase(prefix)}',
+      ipcPathArgs: ${ipcPathArgs},
+      transport: options.transport ?? '${defaultTransport}',
+      logger: options.logger,
+      connectTimeoutMs: options.connectTimeoutMs,
+      env: options.env,
+      extraArgs: options.extraArgs,
+      respawn: options.respawn,
+${supportsShm ? "      clientId: options.clientId,\n      napiPath: options.napiPath,\n" : ""}    });
+    return new ${serviceClass}(backend, options.createError);
+  }
+
+  getIpcPath(): string {
+    return this.spawnedBackend.getIpcPath();
+  }
+
+  sendProcessSignal(signal: NodeJS.Signals): void {
+    this.spawnedBackend.sendProcessSignal(signal);
+  }
+}
+`;
+  }
+
+  generatePlatform(): string {
+    const packageName = this.opts.packageName;
+    const findBinary = binaryFinderName(this.opts.prefix);
+    const envVar = this.opts.binaryEnvVar;
+    const stem = packageStem(packageName);
+    const archPackages = archPackageNames(packageName);
+
+    return `import { createRequire } from 'node:module';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+export type Platform = 'x86_64-linux' | 'x86_64-darwin' | 'aarch64-linux' | 'aarch64-darwin';
+
+const PLATFORM_TO_PACKAGE: Record<Platform, string> = {
+  'x86_64-linux': '${archPackages["linux-x64"]}',
+  'x86_64-darwin': '${archPackages["darwin-x64"]}',
+  'aarch64-linux': '${archPackages["linux-arm64"]}',
+  'aarch64-darwin': '${archPackages["darwin-arm64"]}',
+};
+
+function currentDir(): string {
+  return path.dirname(fileURLToPath(import.meta.url));
+}
+
+function detectPlatform(): Platform | null {
+  if (process.arch === 'x64' && process.platform === 'linux') return 'x86_64-linux';
+  if (process.arch === 'x64' && process.platform === 'darwin') return 'x86_64-darwin';
+  if (process.arch === 'arm64' && process.platform === 'linux') return 'aarch64-linux';
+  if (process.arch === 'arm64' && process.platform === 'darwin') return 'aarch64-darwin';
+  return null;
+}
+
+function findArchPackageDir(platform: Platform): string | null {
+  const packageName = PLATFORM_TO_PACKAGE[platform];
+  try {
+    const require = createRequire(import.meta.url);
+    return path.dirname(require.resolve(packageName + '/package.json'));
+  } catch {
+    const siblingPackageDir = path.join(currentDir(), '..', 'packages', packageName.split('/').pop()!);
+    return fs.existsSync(path.join(siblingPackageDir, 'package.json')) ? siblingPackageDir : null;
+  }
+}
+
+export function ${findBinary}(customPath?: string): string | null {
+  if (customPath) {
+    return fs.existsSync(customPath) ? path.resolve(customPath) : null;
+  }
+
+  const envPath = process.env.${envVar};
+  if (envPath) {
+    return fs.existsSync(envPath) ? path.resolve(envPath) : null;
+  }
+
+  const platform = detectPlatform();
+  if (!platform) {
+    return null;
+  }
+
+  const archDir = findArchPackageDir(platform);
+  if (archDir) {
+    const candidate = path.join(archDir, '${this.opts.binaryName}');
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+export const ARCH_PACKAGE_STEM = '${stem}';
+`;
+  }
+
+  generatePrepareArchPackagesScript(): string {
+    return `#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+declare -A PLATFORMS=(
+${ARCH_PACKAGES.map(({ buildDir, suffix, os, cpu }) => `  ["${buildDir}"]="${suffix} ${os} ${cpu}"`).join("\n")}
+)
+
+version=$(node -p "require('./package.json').version")
+
+declare -A BINARIES=()
+for arg in "$@"; do
+  case "$arg" in
+    *=*)
+      key="\${arg%%=*}"
+      value="\${arg#*=}"
+      BINARIES["$key"]="$value"
+      ;;
+    *)
+      echo "Usage: npm run prepare_arch_packages -- [<platform>=<binary> ...]" >&2
+      echo "Platforms: linux-x64, linux-arm64, darwin-x64, darwin-arm64" >&2
+      exit 1
+      ;;
+  esac
+done
+
+for build_dir in "\${!PLATFORMS[@]}"; do
+  read -r suffix os cpu <<< "\${PLATFORMS[$build_dir]}"
+  pkg_name="${this.opts.packageName}-\${suffix}"
+  out_dir="packages/${packageStem(this.opts.packageName)}-\${suffix}"
+  binary_path="\${BINARIES[$suffix]:-\${BINARIES[$build_dir]:-}}"
+
+  if [ -z "$binary_path" ]; then
+    binary_path="build/\${build_dir}/${this.opts.binaryName}"
+  fi
+
+  if [ ! -f "$binary_path" ]; then
+    echo "Skipping \${pkg_name}: no binary at \${binary_path}"
+    continue
+  fi
+
+  rm -rf "\${out_dir}"
+  mkdir -p "\${out_dir}"
+  cp "$binary_path" "\${out_dir}/${this.opts.binaryName}"
+  chmod +x "\${out_dir}/${this.opts.binaryName}" 2>/dev/null || true
+
+  cat > "\${out_dir}/package.json" <<EOF
+{
+  "name": "\${pkg_name}",
+  "version": "\${version}",
+  "description": "Native binary for ${this.opts.packageName} (\${suffix})",
+  "license": "MIT",
+  "os": ["\${os}"],
+  "cpu": ["\${cpu}"],
+  "files": ["${this.opts.binaryName}"],
+  "preferUnplugged": true
+}
+EOF
+done
+`;
+  }
+
+  generateReadme(): string {
+    return `# ${this.opts.packageName}
+
+Generated TypeScript IPC package for the ${this.opts.prefix} service.
+
+\`\`\`ts
+import { ${className(this.opts.prefix)} } from '${this.opts.packageName}';
+
+const service = await ${className(this.opts.prefix)}.spawn({ transport: 'uds' });
+try {
+  const response = await service.bytes({ data: new Uint8Array([1, 2, 3]) });
+} finally {
+  await service.destroy();
+}
+\`\`\`
+
+The package resolves \`${this.opts.binaryName}\` from \`${this.opts.binaryEnvVar}\`,
+an explicit \`binaryPath\`, or an installed/prepared arch package.
+
+## Build
+
+The package shell (package.json, tsconfig, src/index.ts, scripts/) is
+generated; build through the owning project's \`./bootstrap.sh\`, which
+regenerates and then runs \`npm install --omit=optional && npm run build\`.
+
+To prepare per-architecture binary packages:
+
+\`\`\`sh
+npm run prepare_arch_packages -- linux-x64=/path/to/${this.opts.binaryName}
+\`\`\`
+`;
+  }
+}

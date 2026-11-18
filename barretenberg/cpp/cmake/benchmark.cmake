@@ -1,0 +1,24 @@
+include(FetchContent)
+
+FetchContent_Declare(
+    benchmark
+    GIT_REPOSITORY https://github.com/AztecProtocol/google-benchmark
+    GIT_TAG v0.0.1 # arbitrary tag we used so that GIT_SHALLOW works
+    GIT_SHALLOW TRUE
+    FIND_PACKAGE_ARGS
+)
+
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Benchmark tests off")
+set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "Benchmark installation off")
+
+FetchContent_MakeAvailable(benchmark)
+if(NOT benchmark_FOUND)
+    # FetchContent_MakeAvailable calls FetchContent_Populate if `find_package` is unsuccessful
+    # so these variables will be available if we reach this case
+    set_property(DIRECTORY ${benchmark_SOURCE_DIR} PROPERTY EXCLUDE_FROM_ALL)
+    set_property(DIRECTORY ${benchmark_BINARY_DIR} PROPERTY EXCLUDE_FROM_ALL)
+endif()
+# The library builds with -pedantic-errors, and clang 23 (wasi-sdk 34) flags its __COUNTER__ as a C2y extension.
+if(TARGET benchmark AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 23)
+    target_compile_options(benchmark PRIVATE -Wno-c2y-extensions)
+endif()

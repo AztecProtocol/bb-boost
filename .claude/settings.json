@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/scripts/check-ci-url.py\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'GITROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; [ -n \"$GITROOT\" ] && exec \"$GITROOT/.claude/scripts/format-file.sh\"; exit 0'"
+          }
+        ]
+      }
+    ]
+  }
+}

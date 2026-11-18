@@ -1,0 +1,490 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 Aztec Labs.
+pragma solidity >=0.8.27;
+
+import {RollupConfig, SubmitEpochRootProofArgs} from "@aztec/core/interfaces/IRollup.sol";
+import {CompressedFeeHeader, FeeHeaderLib} from "@aztec/core/libraries/compressed-data/fees/FeeStructs.sol";
+import {Errors} from "@aztec/core/libraries/Errors.sol";
+import {ProposedHeader} from "@aztec/core/libraries/rollup/ProposedHeaderLib.sol";
+import {SequencerRewardCalculatorLib} from "@aztec/core/libraries/rollup/SequencerRewardCalculatorLib.sol";
+import {STFLib} from "@aztec/core/libraries/rollup/STFLib.sol";
+import {ValidatorSelectionLib} from "@aztec/core/libraries/rollup/ValidatorSelectionLib.sol";
+import {Epoch, Timestamp, TimeLib} from "@aztec/core/libraries/TimeLib.sol";
+import {IBoosterCore} from "@aztec/core/reward-boost/RewardBooster.sol";
+import {IRewardDistributor} from "@aztec/governance/interfaces/IRewardDistributor.sol";
+import {IERC20} from "@oz/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@oz/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@oz/utils/math/Math.sol";
+import {SafeCast} from "@oz/utils/math/SafeCast.sol";
+import {BitMaps} from "@oz/utils/structs/BitMaps.sol";
+
+type Bps is uint32;
+
+library BpsLib {
+  function mul(uint256 _a, Bps _b) internal pure returns (uint256) {
+    return _a * uint256(Bps.unwrap(_b)) / 10_000;
+  }
+}
+
+struct ProverRegistration {
+  uint248 shares;
+  bool fullEpoch; // Set to true when the registration was submitted after the epoch is closed, with a proof of the
+    // full epoch. Used for activity score bumping
+}
+
+struct SubEpochRewards {
+  uint256 summedShares;
+  mapping(address prover => ProverRegistration) registrations;
+}
+
+struct EpochRewards {
+  uint128 longestProvenLength;
+  uint128 rewards;
+  mapping(uint256 length => SubEpochRewards) subEpoch;
+}
+
+struct RewardConfig {
+  IRewardDistributor rewardDistributor;
+  Bps sequencerBps;
+  IBoosterCore booster;
+  uint96 checkpointReward;
+}
+
+/// @notice The post-deployment-mutable subset of {RewardConfig}.
+/// @dev `rewardDistributor` and `booster` are deliberately *not* in this struct: they are
+///      set once at construction and immutable thereafter.
+struct MutableRewardConfig {
+  Bps sequencerBps;
+  uint96 checkpointReward;
+}
+
+struct RewardStorage {
+  mapping(address => uint256) sequencerRewards;
+  mapping(Epoch => EpochRewards) epochRewards;
+  mapping(address prover => BitMaps.BitMap claimed) proverClaimed;
+  RewardConfig config;
+  address protocolFeeRecipient;
+  // ISequencerRewardCalculator; zero means every checkpoint receives the default sequencer reward.
+  address sequencerRewardCalculator;
+}
+
+struct Values {
+  address sequencer;
+  uint256 fee;
+  uint256 protocolFee;
+  uint256 proverFee;
+  uint256 sequencerFee;
+  // Default path: every newly proven checkpoint receives this reward.
+  uint256 sequencerCheckpointReward;
+  // Calculator path: one reward per newly proven checkpoint; empty on the default path.
+  uint256[] sequencerCheckpointRewards;
+  uint256 manaUsed;
+}
+
+struct Totals {
+  uint256 feesToClaim;
+  uint256 totalProtocolFee;
+  uint256 proverRewards;
+}
+
+library RewardLib {
+  using SafeERC20 for IERC20;
+  using BitMaps for BitMaps.BitMap;
+  using TimeLib for Timestamp;
+  using TimeLib for Epoch;
+  using FeeHeaderLib for CompressedFeeHeader;
+  using SafeCast for uint256;
+
+  bytes32 private constant REWARD_STORAGE_POSITION = keccak256("aztec.reward.storage");
+
+  /// @notice One-shot writer used during rollup construction. Writes every field of
+  ///         {RewardConfig}, including the immutable `rewardDistributor` and `booster`.
+  /// @dev Must only be reachable from the constructor path. Post-deployment updates go through
+  ///      {updateConfig}, which preserves the immutable fields.
+  function initializeConfig(RewardConfig memory _config) internal {
+    require(Bps.unwrap(_config.sequencerBps) <= 10_000, Errors.RewardLib__InvalidSequencerBps());
+    RewardStorage storage rewardStorage = getStorage();
+    rewardStorage.config = _config;
+    // A Cuauhxicalli ("eagle gourd bowl") is a ceremonial Aztec vessel used to hold offerings.
+    rewardStorage.protocolFeeRecipient = address(bytes20("CUAUHXICALLI"));
+  }
+
+  /// @notice Writes the sequencer reward calculator. The zero address disables it.
+  /// @dev No validation: an address that does not implement the calculator fails the response checks and pays the
+  ///      default, exactly like no calculator.
+  /// @param _calculator The new calculator, or zero for none
+  /// @return oldCalculator The calculator in effect before this call
+  function setSequencerRewardCalculator(address _calculator) internal returns (address oldCalculator) {
+    RewardStorage storage rewardStorage = getStorage();
+    oldCalculator = rewardStorage.sequencerRewardCalculator;
+    rewardStorage.sequencerRewardCalculator = _calculator;
+  }
+
+  /// @notice Owner-gated post-deployment writer for the protocol fee recipient.
+  /// @param _recipient The new recipient of the protocol fee tranche
+  /// @return oldRecipient The recipient in effect before this call
+  function updateProtocolFeeRecipient(address _recipient) internal returns (address oldRecipient) {
+    require(_recipient != address(0), Errors.RewardLib__InvalidProtocolFeeRecipient());
+    RewardStorage storage rewardStorage = getStorage();
+    oldRecipient = rewardStorage.protocolFeeRecipient;
+    rewardStorage.protocolFeeRecipient = _recipient;
+  }
+
+  /// @notice Owner-gated post-deployment writer. Only updates the mutable subset
+  ///         (`sequencerBps`, `checkpointReward`). The `rewardDistributor` and `booster`
+  ///         addresses MUST NOT be reachable from this path -- they remain whatever was
+  ///         written by {initializeConfig}.
+  function updateConfig(MutableRewardConfig memory _config) internal {
+    require(Bps.unwrap(_config.sequencerBps) <= 10_000, Errors.RewardLib__InvalidSequencerBps());
+    RewardStorage storage rewardStorage = getStorage();
+    rewardStorage.config.sequencerBps = _config.sequencerBps;
+    rewardStorage.config.checkpointReward = _config.checkpointReward;
+  }
+
+  function claimSequencerRewards(address _sequencer, IERC20 _feeAsset) internal returns (uint256) {
+    RewardStorage storage rewardStorage = getStorage();
+    uint256 amount = rewardStorage.sequencerRewards[_sequencer];
+
+    if (amount > 0) {
+      rewardStorage.sequencerRewards[_sequencer] = 0;
+      _feeAsset.safeTransfer(_sequencer, amount);
+    }
+
+    return amount;
+  }
+
+  function claimProverRewards(address _prover, Epoch[] memory _epochs, IERC20 _feeAsset) internal returns (uint256) {
+    Epoch currentEpoch = Timestamp.wrap(block.timestamp).epochFromTimestamp();
+
+    RewardStorage storage rewardStorage = getStorage();
+
+    uint256 accumulatedRewards = 0;
+    for (uint256 i = 0; i < _epochs.length; i++) {
+      require(
+        !_epochs[i].isAcceptingProofsAtEpoch(currentEpoch),
+        Errors.Rollup__NotPastDeadline(_epochs[i].toDeadlineEpoch(), currentEpoch)
+      );
+
+      if (rewardStorage.proverClaimed[_prover].get(Epoch.unwrap(_epochs[i]))) {
+        continue;
+      }
+      rewardStorage.proverClaimed[_prover].set(Epoch.unwrap(_epochs[i]));
+
+      EpochRewards storage e = rewardStorage.epochRewards[_epochs[i]];
+      SubEpochRewards storage se = e.subEpoch[e.longestProvenLength];
+      uint256 shares = se.registrations[_prover].shares;
+      if (shares > 0) {
+        accumulatedRewards += (shares * e.rewards / se.summedShares);
+      }
+    }
+
+    if (accumulatedRewards > 0) {
+      _feeAsset.safeTransfer(_prover, accumulatedRewards);
+    }
+
+    return accumulatedRewards;
+  }
+
+  /**
+   * @notice Records the prover's shares and, if the proof extends the longest proven prefix of the epoch, pays the
+   *         checkpoint rewards and fees of the newly covered checkpoints.
+   * @param _args The epoch proof submission arguments
+   * @param _endEpoch The epoch being proven
+   * @param _config The rollup's deployment-time configuration
+   * @param _fullEpochProof Whether the proof covers the whole epoch, which updates the prover's activity score
+   * @param _committee The committee the proof's attestations were verified against, in committee order; empty for
+   *        escape-hatch epochs and zero-size committees, which skip the sequencer reward calculator
+   */
+  function handleRewardsAndFees(
+    SubmitEpochRootProofArgs calldata _args,
+    Epoch _endEpoch,
+    RollupConfig memory _config,
+    bool _fullEpochProof,
+    address[] memory _committee
+  ) internal {
+    RewardStorage storage rewardStorage = getStorage();
+
+    uint256 length = _args.end - _args.start + 1;
+    EpochRewards storage $er = rewardStorage.epochRewards[_endEpoch];
+
+    {
+      SubEpochRewards storage $sr = $er.subEpoch[length];
+      address prover = _args.args.proverId;
+
+      ProverRegistration memory previousRegistration = $sr.registrations[prover];
+      // There is a point in updating in 2 cases:
+      // 1. This is the first time we are submitting, so shares are at 0
+      // 2. A prover is submitting the same proof a second time after an epoch closed so they would get their activity
+      // score bump. If the second check wasn't there, it would theoretically be possible (but unlikely) to block a
+      // prover from increasing their activity score by submitting a proof for the epoch while it is ongoing
+      require(
+        previousRegistration.shares == 0 || (!previousRegistration.fullEpoch && _fullEpochProof),
+        Errors.Rollup__ProverHaveAlreadySubmitted(prover, _endEpoch)
+      );
+      // The prover is only marked active if they have provided a full epoch proof
+      uint256 shares = _fullEpochProof
+        ? rewardStorage.config.booster.updateAndGetShares(prover)
+        : rewardStorage.config.booster.getSharesFor(prover);
+
+      // The duplicate-submission guard above uses `shares == 0` as the sentinel for "not yet
+      // submitted". A booster that ever returns zero would let the same prover submit again
+      // for the same epoch length, breaking that guard. RewardBooster's constructor rejects
+      // configs that can return zero, but the booster slot is an external pointer; bounce
+      // back if a misbehaving booster ever crosses this layer.
+      require(shares > 0, Errors.RewardLib__ZeroShares(prover));
+
+      $sr.registrations[prover] = ProverRegistration({shares: shares.toUint248(), fullEpoch: _fullEpochProof});
+      $sr.summedShares = $sr.summedShares - previousRegistration.shares + shares;
+    }
+
+    uint256 provenLength = $er.longestProvenLength;
+    if (length > provenLength) {
+      Values memory v;
+      Totals memory t;
+
+      t.proverRewards =
+        distributeCheckpointRewards(_args, _endEpoch, _committee, provenLength, length - provenLength, v);
+
+      for (uint256 i = provenLength; i < length; i++) {
+        {
+          ProposedHeader calldata header = _args.headers[i - _args.provenCheckpointFees.length];
+          v.fee = header.accumulatedFees;
+          v.sequencer = header.coinbase;
+        }
+        CompressedFeeHeader feeHeader = STFLib.getFeeHeader(_args.start + i);
+
+        v.manaUsed = feeHeader.getManaUsed();
+        v.protocolFee = feeHeader.getProtocolFee() * v.manaUsed;
+
+        t.feesToClaim += v.fee;
+        t.totalProtocolFee += v.protocolFee;
+
+        // Compute the proving fee in the fee asset
+        v.proverFee = Math.min(v.manaUsed * feeHeader.getProverCost(), v.fee - v.protocolFee);
+        t.proverRewards += v.proverFee;
+
+        v.sequencerFee = v.fee - v.protocolFee - v.proverFee;
+
+        {
+          uint256 toSequencer =
+            (v.sequencerCheckpointRewards.length > 0
+                ? v.sequencerCheckpointRewards[i - provenLength]
+                : v.sequencerCheckpointReward) + v.sequencerFee;
+          if (toSequencer > 0) {
+            rewardStorage.sequencerRewards[v.sequencer] += toSequencer;
+          }
+        }
+      }
+
+      if (t.proverRewards > 0) {
+        $er.rewards += t.proverRewards.toUint128();
+      }
+      $er.longestProvenLength = length.toUint128();
+
+      if (t.feesToClaim > 0) {
+        _config.feeAssetPortal.distributeFees(address(this), t.feesToClaim);
+      }
+
+      if (t.totalProtocolFee > 0) {
+        _config.feeAsset.safeTransfer(rewardStorage.protocolFeeRecipient, t.totalProtocolFee);
+      }
+    }
+  }
+
+  function getSharesFor(address _prover) internal view returns (uint256) {
+    return getStorage().config.booster.getSharesFor(_prover);
+  }
+
+  function getSequencerRewards(address _sequencer) internal view returns (uint256) {
+    return getStorage().sequencerRewards[_sequencer];
+  }
+
+  function getCollectiveProverRewardsForEpoch(Epoch _epoch) internal view returns (uint256) {
+    return getStorage().epochRewards[_epoch].rewards;
+  }
+
+  function getLongestProvenLength(Epoch _epoch) internal view returns (uint256) {
+    return getStorage().epochRewards[_epoch].longestProvenLength;
+  }
+
+  function getHasSubmitted(Epoch _epoch, uint256 _length, address _prover) internal view returns (bool) {
+    return getStorage().epochRewards[_epoch].subEpoch[_length].registrations[_prover].shares > 0;
+  }
+
+  function getHasSubmittedFullEpoch(Epoch _epoch, uint256 _length, address _prover) internal view returns (bool) {
+    return getStorage().epochRewards[_epoch].subEpoch[_length].registrations[_prover].fullEpoch;
+  }
+
+  function getHasClaimed(address _prover, Epoch _epoch) internal view returns (bool) {
+    return getStorage().proverClaimed[_prover].get(Epoch.unwrap(_epoch));
+  }
+
+  function getCheckpointReward() internal view returns (uint256) {
+    return getStorage().config.checkpointReward;
+  }
+
+  function getProtocolFeeRecipient() internal view returns (address) {
+    return getStorage().protocolFeeRecipient;
+  }
+
+  function getSequencerRewardCalculator() internal view returns (address) {
+    return getStorage().sequencerRewardCalculator;
+  }
+
+  function getSpecificProverRewardsForEpoch(Epoch _epoch, address _prover) internal view returns (uint256) {
+    RewardStorage storage rewardStorage = getStorage();
+
+    if (rewardStorage.proverClaimed[_prover].get(Epoch.unwrap(_epoch))) {
+      return 0;
+    }
+
+    EpochRewards storage er = rewardStorage.epochRewards[_epoch];
+    SubEpochRewards storage se = er.subEpoch[er.longestProvenLength];
+
+    // Only if prover has shares will he get a reward. Also avoid a 0-div
+    // in case of no shares at all.
+    if (se.registrations[_prover].shares == 0) {
+      return 0;
+    }
+
+    return (se.registrations[_prover].shares * er.rewards / se.summedShares);
+  }
+
+  function getStorage() internal pure returns (RewardStorage storage storageStruct) {
+    bytes32 position = REWARD_STORAGE_POSITION;
+    assembly {
+      storageStruct.slot := position
+    }
+  }
+
+  /**
+   * @notice Claims the checkpoint rewards of `_added` newly proven checkpoints and splits them between the
+   *         sequencers and the prover pool.
+   *
+   * @dev Without an accepted calculator response (no committee, no calculator, or a failed or malformed call) this
+   *      is the default split, identical to a rollup without a calculator: claim up to `_added * checkpointReward`,
+   *      give the sequencers `sequencerBps` of what was claimed split evenly per checkpoint (written to
+   *      `_v.sequencerCheckpointReward`), and give the prover pool the remainder including the rounding dust.
+   *
+   *      With an accepted response, checkpoint `i` is owed `rewards[i]` and the prover share stays
+   *      `checkpointReward - defaultReward` per checkpoint, so only `Σ rewards + _added * proverShare` is claimed and
+   *      whatever a below-default reward leaves unpaid stays in the distributor. If the distributor holds less, each
+   *      sequencer reward is scaled by `available / desired` and the prover pool receives the remainder, which keeps
+   *      the proportional outcome of the default split. The per-checkpoint rewards are written to
+   *      `_v.sequencerCheckpointRewards`, which stays empty on the default path.
+   *
+   * @return proverRewards The checkpoint rewards that go to the prover pool
+   */
+  function distributeCheckpointRewards(
+    SubmitEpochRootProofArgs calldata _args,
+    Epoch _endEpoch,
+    address[] memory _committee,
+    uint256 _provenLength,
+    uint256 _added,
+    Values memory _v
+  ) private returns (uint256 proverRewards) {
+    RewardStorage storage rewardStorage = getStorage();
+    uint256 checkpointReward = rewardStorage.config.checkpointReward;
+    Bps sequencerBps = rewardStorage.config.sequencerBps;
+
+    uint256 sequencerTotal;
+    uint256 desired;
+    // Escape-hatch epochs and zero-size committees have no proposers to pass, so they never reach the calculator.
+    if (_committee.length > 0 && rewardStorage.sequencerRewardCalculator != address(0)) {
+      uint256 defaultReward = BpsLib.mul(checkpointReward, sequencerBps);
+      sequencerTotal = callSequencerRewardCalculator(
+        _args, _endEpoch, _committee, _provenLength, _added, defaultReward, checkpointReward, _v
+      );
+      desired = (checkpointReward - defaultReward) * _added + sequencerTotal;
+    }
+
+    // An accepted response has one entry per newly proven checkpoint, and `_added` is at least one.
+    if (_v.sequencerCheckpointRewards.length > 0) {
+      uint256 available = claimCheckpointRewards(desired);
+      if (available < desired) {
+        uint256[] memory sequencerRewards = _v.sequencerCheckpointRewards;
+        sequencerTotal = 0;
+        for (uint256 i = 0; i < _added; i++) {
+          sequencerRewards[i] = Math.mulDiv(sequencerRewards[i], available, desired);
+          sequencerTotal += sequencerRewards[i];
+        }
+      }
+      proverRewards = available - sequencerTotal;
+    } else {
+      uint256 available = claimCheckpointRewards(_added * checkpointReward);
+      sequencerTotal = BpsLib.mul(available, sequencerBps);
+      _v.sequencerCheckpointReward = sequencerTotal / _added;
+      uint256 dust = sequencerTotal - (_v.sequencerCheckpointReward * _added);
+      proverRewards = available - sequencerTotal + dust;
+    }
+  }
+
+  /**
+   * @notice Claims up to `_desired` from the reward distributor
+   * @return available The amount claimed: `_desired`, or what the distributor holds for this rollup if less
+   */
+  function claimCheckpointRewards(uint256 _desired) private returns (uint256 available) {
+    if (_desired > 0) {
+      IRewardDistributor distributor = getStorage().config.rewardDistributor;
+      available = Math.min(_desired, distributor.availableTo(address(this)));
+      if (available > 0) {
+        distributor.claim(address(this), available);
+      }
+    }
+  }
+
+  /**
+   * @notice Asks the sequencer reward calculator for the reward of each newly proven checkpoint
+   * @dev On an accepted response, writes the rewards to `_v.sequencerCheckpointRewards` and returns their sum. On any
+   *      failure, leaves `_v.sequencerCheckpointRewards` empty so the caller falls back to the default path.
+   * @return total The sum of the accepted rewards, or zero
+   */
+  function callSequencerRewardCalculator(
+    SubmitEpochRootProofArgs calldata _args,
+    Epoch _endEpoch,
+    address[] memory _committee,
+    uint256 _provenLength,
+    uint256 _added,
+    uint256 _defaultReward,
+    uint256 _checkpointReward,
+    Values memory _v
+  ) private view returns (uint256 total) {
+    (bool accepted, uint256[] memory rewards, uint256 sum) = SequencerRewardCalculatorLib.tryGetSequencerRewards(
+      getStorage().sequencerRewardCalculator,
+      _endEpoch,
+      getProposers(_args, _endEpoch, _committee, _provenLength, _added),
+      _defaultReward,
+      _checkpointReward
+    );
+    if (accepted) {
+      _v.sequencerCheckpointRewards = rewards;
+      total = sum;
+    }
+  }
+
+  /**
+   * @notice Derives the proposer of each newly proven checkpoint from the committee the proof verified
+   * @dev Mirrors the proposer selection at propose time: `computeProposerIndex(epoch, slot, sampleSeed, size)`. The
+   *      headers of every rewarded checkpoint are present and were bound to the stored header hashes by the proof.
+   * @return proposers One committee member per newly proven checkpoint, in checkpoint order
+   */
+  function getProposers(
+    SubmitEpochRootProofArgs calldata _args,
+    Epoch _endEpoch,
+    address[] memory _committee,
+    uint256 _provenLength,
+    uint256 _added
+  ) private view returns (address[] memory proposers) {
+    proposers = new address[](_added);
+    uint256 seed = ValidatorSelectionLib.getSampleSeed(_endEpoch);
+    uint256 committeeSize = _committee.length;
+    uint256 firstHeader = _provenLength - _args.provenCheckpointFees.length;
+    for (uint256 i = 0; i < _added; i++) {
+      proposers[i] = _committee[
+        ValidatorSelectionLib.computeProposerIndex(
+          _endEpoch, _args.headers[firstHeader + i].slotNumber, seed, committeeSize
+        )
+      ];
+    }
+  }
+}

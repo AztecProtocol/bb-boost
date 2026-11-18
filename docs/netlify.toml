@@ -1,0 +1,6 @@
+# The developer docs site (Netlify: aztec-docs-dev) is configured in the Netlify UI to build
+# this directory, which moved to the labs repository (aztec-labs-eng/aztec-node, docs/). Until
+# the site is repointed or removed there, skip every build so deploy previews stop failing.
+# barretenberg/docs has its own netlify.toml and is unaffected.
+[build]
+  ignore = "exit 0"

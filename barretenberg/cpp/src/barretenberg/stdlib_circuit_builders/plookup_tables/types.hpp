@@ -1,0 +1,421 @@
+// === AUDIT STATUS ===
+// internal:    { status: Complete, auditors: [Luke, Raju], commit: }
+// external_1:  { status: not started, auditors: [], commit: }
+// external_2:  { status: not started, auditors: [], commit: }
+// =====================
+//
+// === CODE ROLE: Builder-agnostic data structures ===
+// This file defines the core data structures for plookup tables. Everything here is builder-agnostic:
+// no circuit gates are created, no witnesses are added. These structures are used both for native
+// (out-of-circuit) computation and for passing data to builder methods that create actual lookup gates.
+//
+// Key structures:
+//   - MultiTable: Manages multiple BasicTables and accumulator metadata (slice sizes, step sizes)
+//   - BasicTable: Stores raw table data (column values) and lookup entries for a single table
+//   - ReadData: Container for accumulator values computed during native lookup evaluation
+//   - LookupHashTable: Maps table entries (3-column rows) to their row index; used for read_counts construction
+// =====================
+
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <vector>
+
+#include "./fixed_base/fixed_base_params.hpp"
+#include "./secp256r1_fixed_base_params.hpp"
+#include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/throw_or_abort.hpp"
+#include "barretenberg/ecc/curves/bn254/fr.hpp"
+
+namespace bb::plookup {
+
+enum BasicTableId {
+    XOR,
+    AND,
+    PEDERSEN,
+    AES_SPARSE_MAP,
+    AES_SBOX_MAP,
+    AES_SPARSE_NORMALIZE,
+    SHA256_WITNESS_NORMALIZE,
+    SHA256_WITNESS_SLICE_3,
+    SHA256_WITNESS_SLICE_7_ROTATE_4,
+    SHA256_WITNESS_SLICE_8_ROTATE_7,
+    SHA256_WITNESS_SLICE_14_ROTATE_1,
+    SHA256_CH_NORMALIZE,
+    SHA256_MAJ_NORMALIZE,
+    SHA256_BASE28,
+    SHA256_BASE28_ROTATE6,
+    SHA256_BASE28_ROTATE3,
+    SHA256_BASE16,
+    SHA256_BASE16_ROTATE2,
+    UINT_XOR_SLICE_6_ROTATE_0,
+    UINT_XOR_SLICE_2_ROTATE_0,
+    UINT_XOR_SLICE_4_ROTATE_0,
+    UINT_AND_SLICE_6_ROTATE_0,
+    UINT_AND_SLICE_2_ROTATE_0,
+    UINT_AND_SLICE_4_ROTATE_0,
+    SECP256K1_XLO_BASIC,
+    SECP256K1_XHI_BASIC,
+    SECP256K1_YLO_BASIC,
+    SECP256K1_YHI_BASIC,
+    SECP256K1_XYPRIME_BASIC,
+    SECP256K1_XLO_ENDO_BASIC,
+    SECP256K1_XHI_ENDO_BASIC,
+    SECP256K1_XYPRIME_ENDO_BASIC,
+    BLAKE_XOR_ROTATE0,
+    BLAKE_XOR_ROTATE0_SLICE5_MOD4,
+    BLAKE_XOR_ROTATE1,
+    BLAKE_XOR_ROTATE2,
+    BLAKE_XOR_ROTATE4,
+    FIXED_BASE_0_0,
+    FIXED_BASE_1_0 = FIXED_BASE_0_0 + FixedBaseParams::NUM_TABLES_PER_LO_MULTITABLE,
+    FIXED_BASE_2_0 = FIXED_BASE_1_0 + FixedBaseParams::NUM_TABLES_PER_HI_MULTITABLE,
+    FIXED_BASE_3_0 = FIXED_BASE_2_0 + FixedBaseParams::NUM_TABLES_PER_LO_MULTITABLE,
+    HONK_DUMMY_BASIC1 = FIXED_BASE_3_0 + FixedBaseParams::NUM_TABLES_PER_HI_MULTITABLE,
+    HONK_DUMMY_BASIC2,
+    KECCAK_INPUT,
+    KECCAK_THETA,
+    RESERVED_KECCAK_RHO, // Preserve subsequent table IDs embedded in verification keys.
+    KECCAK_CHI,
+    KECCAK_OUTPUT,
+    KECCAK_RHO_1,
+    KECCAK_RHO_2,
+    KECCAK_RHO_3,
+    KECCAK_RHO_4,
+    KECCAK_RHO_5,
+    KECCAK_RHO_6,
+    KECCAK_RHO_7,
+    KECCAK_RHO_8,
+    RESERVED_KECCAK_RHO_9,
+    // Used by straus_plookup_table for fixed-base MSM with constant EC points (e.g. IPA verifier SRS elements).
+    // Each table instance gets this id; uniqueness within a circuit is ensured by table_index, not id.
+    STRAUS_EC_POINT,
+    SECP256R1_FIXED_BASE_XLO_0,
+    SECP256R1_FIXED_BASE_XHI_0 = SECP256R1_FIXED_BASE_XLO_0 + Secp256r1FixedBaseParams::NUM_WINDOWS,
+    SECP256R1_FIXED_BASE_YLO_0 = SECP256R1_FIXED_BASE_XHI_0 + Secp256r1FixedBaseParams::NUM_WINDOWS,
+    SECP256R1_FIXED_BASE_YHI_0 = SECP256R1_FIXED_BASE_YLO_0 + Secp256r1FixedBaseParams::NUM_WINDOWS,
+    SECP256R1_FIXED_BASE_END = SECP256R1_FIXED_BASE_YHI_0 + Secp256r1FixedBaseParams::NUM_WINDOWS,
+};
+
+enum MultiTableId {
+    SHA256_CH_INPUT,
+    SHA256_CH_OUTPUT,
+    SHA256_MAJ_INPUT,
+    SHA256_MAJ_OUTPUT,
+    SHA256_WITNESS_INPUT,
+    SHA256_WITNESS_OUTPUT,
+    AES_NORMALIZE,
+    AES_INPUT,
+    AES_SBOX,
+    FIXED_BASE_LEFT_LO,
+    FIXED_BASE_LEFT_HI,
+    FIXED_BASE_RIGHT_LO,
+    FIXED_BASE_RIGHT_HI,
+    UINT8_XOR,
+    UINT16_XOR,
+    UINT32_XOR,
+    UINT64_XOR,
+    UINT8_AND,
+    UINT16_AND,
+    UINT32_AND,
+    UINT64_AND,
+    SECP256K1_XLO,
+    SECP256K1_XHI,
+    SECP256K1_YLO,
+    SECP256K1_YHI,
+    SECP256K1_XYPRIME,
+    SECP256K1_XLO_ENDO,
+    SECP256K1_XHI_ENDO,
+    SECP256K1_XYPRIME_ENDO,
+    // secp256r1 fixed-base MultiTables — one per (axis, scalar-half) pair. Each chains the 32 per-window
+    // BasicTables for an axis: _LO covers the low 17 windows (136 bits), _HI covers the high 15 windows
+    // (120 bits). Used by `element::secp256r1_fixed_base_mul`.
+    SECP256R1_FIXED_BASE_XLO_LO,
+    SECP256R1_FIXED_BASE_XLO_HI,
+    SECP256R1_FIXED_BASE_XHI_LO,
+    SECP256R1_FIXED_BASE_XHI_HI,
+    SECP256R1_FIXED_BASE_YLO_LO,
+    SECP256R1_FIXED_BASE_YLO_HI,
+    SECP256R1_FIXED_BASE_YHI_LO,
+    SECP256R1_FIXED_BASE_YHI_HI,
+    BLAKE_XOR,
+    BLAKE_XOR_ROTATE_16,
+    BLAKE_XOR_ROTATE_8,
+    BLAKE_XOR_ROTATE_7,
+    HONK_DUMMY_MULTI,
+    KECCAK_THETA_OUTPUT,
+    KECCAK_CHI_OUTPUT,
+    KECCAK_FORMAT_INPUT,
+    KECCAK_FORMAT_OUTPUT,
+    KECCAK_NORMALIZE_AND_ROTATE,
+    NUM_MULTI_TABLES = KECCAK_NORMALIZE_AND_ROTATE + 25,
+};
+
+/**
+ * @brief Container for managing multiple BasicTables plus the data needed to combine basic table outputs (e.g. limbs)
+ * into accumulators. Does not store actual raw table data.
+ * @details As a simple example, consider using lookups to compute XOR on uint32_t inputs. To do this we decompose the
+ * inputs into 6 limbs and use a BasicTable for 6-bit XOR lookups. In this case the MultiTable simply manages 6 basic
+ * tables, all of which are the XOR BasicTable. (In many cases all of the BasicTables managed by a MultiTable are
+ * identical, however there are some cases where more than 1 type is required, e.g. if a certain limb has to be handled
+ * differently etc.). This class also stores the scalars needed to reconstruct full values from the components that are
+ * contained in the basic lookup tables.
+ * @note Note that a MultiTable does not actually *store* any table data. Rather it stores a set of basic table IDs, the
+ * methods used to compute the basic table entries, plus some metadata.
+ *
+ */
+struct MultiTable {
+    // Coefficients are accumulated products of corresponding step sizes until that point
+    std::vector<bb::fr> column_1_coefficients;
+    std::vector<bb::fr> column_2_coefficients;
+    std::vector<bb::fr> column_3_coefficients;
+    MultiTableId id;
+    std::vector<BasicTableId> basic_table_ids;
+    std::vector<uint64_t> slice_sizes;
+    std::vector<bb::fr> column_1_step_sizes;
+    std::vector<bb::fr> column_2_step_sizes;
+    std::vector<bb::fr> column_3_step_sizes;
+    typedef std::array<bb::fr, 2> table_out;
+    typedef std::array<uint64_t, 2> table_in;
+    // Function pointers for computing table output values from input keys. Each BasicTable in the MultiTable must
+    // provide a function that maps (key_a, key_b) -> (value_0, value_1). The i-th function pointer corresponds to the
+    // i-th BasicTable in basic_table_ids.
+    std::vector<table_out (*)(table_in)> get_table_values;
+
+  private:
+    void init_step_sizes()
+    {
+        const size_t num_lookups = column_1_coefficients.size();
+        column_1_step_sizes.emplace_back(bb::fr(1));
+        column_2_step_sizes.emplace_back(bb::fr(1));
+        column_3_step_sizes.emplace_back(bb::fr(1));
+
+        std::vector<bb::fr> coefficient_inverses(column_1_coefficients.begin(), column_1_coefficients.end());
+        std::copy(column_2_coefficients.begin(), column_2_coefficients.end(), std::back_inserter(coefficient_inverses));
+        std::copy(column_3_coefficients.begin(), column_3_coefficients.end(), std::back_inserter(coefficient_inverses));
+
+        bb::fr::batch_invert(&coefficient_inverses[0], num_lookups * 3);
+
+        for (size_t i = 1; i < num_lookups; ++i) {
+            column_1_step_sizes.emplace_back(column_1_coefficients[i] * coefficient_inverses[i - 1]);
+            column_2_step_sizes.emplace_back(column_2_coefficients[i] * coefficient_inverses[num_lookups + i - 1]);
+            column_3_step_sizes.emplace_back(column_3_coefficients[i] * coefficient_inverses[2 * num_lookups + i - 1]);
+        }
+    }
+
+  public:
+    MultiTable(const bb::fr& col_1_repeated_coeff,
+               const bb::fr& col_2_repeated_coeff,
+               const bb::fr& col_3_repeated_coeff,
+               const size_t num_lookups)
+    {
+        column_1_coefficients.emplace_back(1);
+        column_2_coefficients.emplace_back(1);
+        column_3_coefficients.emplace_back(1);
+
+        for (size_t i = 1; i < num_lookups; ++i) {
+            column_1_coefficients.emplace_back(column_1_coefficients.back() * col_1_repeated_coeff);
+            column_2_coefficients.emplace_back(column_2_coefficients.back() * col_2_repeated_coeff);
+            column_3_coefficients.emplace_back(column_3_coefficients.back() * col_3_repeated_coeff);
+        }
+        init_step_sizes();
+    }
+    MultiTable(const std::vector<bb::fr>& col_1_coeffs,
+               const std::vector<bb::fr>& col_2_coeffs,
+               const std::vector<bb::fr>& col_3_coeffs)
+        : column_1_coefficients(col_1_coeffs)
+        , column_2_coefficients(col_2_coeffs)
+        , column_3_coefficients(col_3_coeffs)
+    {
+        BB_ASSERT(column_1_coefficients.size() == column_2_coefficients.size() &&
+                  column_2_coefficients.size() == column_3_coefficients.size());
+        init_step_sizes();
+    }
+
+    MultiTable() {};
+    MultiTable(const MultiTable& other) = default;
+    MultiTable(MultiTable&& other) = default;
+
+    MultiTable& operator=(const MultiTable& other) = default;
+    MultiTable& operator=(MultiTable&& other) = default;
+    bool operator==(const MultiTable& other) const = default;
+};
+
+/**
+ * @brief A map from 'entry' to 'index' where entry is a row in a BasicTable and index is the row at which that entry
+ * exists in the table
+ * @details Needed to construct read_counts (the polynomial containing the number of reads from each entry in a table)
+ * for the log-derivative lookup argument: a lookup gate is created from an entry, and the row holding it has to be
+ * found. The map is an open-addressing index over the table's own columns: each slot holds a row number (plus one; 0
+ * is empty), and a probe compares the candidate row's columns with the entry, so the map stores no keys of its own.
+ * It lives throughout circuit construction and uses a power-of-two array with at least two slots per table row.
+ */
+struct LookupHashTable {
+    using FF = bb::fr;
+    using Key = std::array<FF, 3>; // an entry in a lookup table
+    using Value = size_t;          // the index of an entry in a lookup table
+    using Columns = std::array<const std::vector<FF>*, 3>;
+
+    // Define a simple hash on three field elements
+    struct HashFunction {
+        FF mult_const;
+        FF const_sqr;
+
+        HashFunction()
+            : mult_const(FF(uint256_t(0x1337, 0x1336, 0x1335, 0x1334)))
+            , const_sqr(mult_const.sqr())
+        {}
+
+        size_t operator()(const Key& entry) const
+        {
+            FF result = entry[0] + mult_const * entry[1] + const_sqr * entry[2];
+            return static_cast<size_t>(result.reduce_once().data[0]);
+        }
+    };
+
+    std::vector<uint32_t> slots; // row + 1, or 0 when empty; a power of two in size, at most half full
+
+    LookupHashTable() = default;
+
+    // Initialize the entry-index map with the columns of a table
+    void initialize(const std::vector<FF>& column_1, const std::vector<FF>& column_2, const std::vector<FF>& column_3)
+    {
+        BB_ASSERT_DEBUG(column_1.size() == column_2.size() && column_2.size() == column_3.size());
+        const size_t capacity = std::bit_ceil(std::max<size_t>(2 * column_1.size(), 2));
+        slots.assign(capacity, 0);
+        const HashFunction hash;
+        for (size_t i = 0; i < column_1.size(); ++i) {
+            size_t slot = hash({ column_1[i], column_2[i], column_3[i] }) & (capacity - 1);
+            while (slots[slot] != 0) {
+                const size_t row = slots[slot] - 1;
+                if (column_1[row] == column_1[i] && column_2[row] == column_2[i] && column_3[row] == column_3[i]) {
+                    break;
+                }
+                slot = (slot + 1) & (capacity - 1);
+            }
+            slots[slot] = static_cast<uint32_t>(i + 1);
+        }
+    }
+
+    // Given an entry in the table, return its index in the table. The columns are the ones the map was initialized
+    // with.
+    Value find(const Key& key, const Columns& columns) const
+    {
+        BB_ASSERT(!slots.empty(), "LookupHashTable: not initialized");
+        const size_t mask = slots.size() - 1;
+        for (size_t slot = HashFunction{}(key)&mask;; slot = (slot + 1) & mask) {
+            BB_ASSERT(slots[slot] != 0, "LookupHashTable: Key not found!");
+            const size_t row = slots[slot] - 1;
+            if ((*columns[0])[row] == key[0] && (*columns[1])[row] == key[1] && (*columns[2])[row] == key[2]) {
+                return row;
+            }
+        }
+    }
+
+    bool operator==(const LookupHashTable& other) const = default;
+};
+
+/**
+ * @brief A basic table from which we can perform lookups (for example, an xor table)
+ * @details Also stores the lookup gate data for all lookups performed on this table
+ *
+ */
+struct BasicTable {
+    struct LookupEntry {
+        bool operator==(const LookupEntry& other) const = default;
+
+        // Storage for two key values and two result values to support different lookup formats, i.e. 1:1, 1:2, and 2:1
+        std::array<uint256_t, 2> key{ 0, 0 };
+        std::array<bb::fr, 2> value{ bb::fr(0), bb::fr(0) };
+        // Comparison operator required for sorting; Used to construct sorted-concatenated table/lookup polynomial
+        bool operator<(const LookupEntry& other) const
+        {
+            return key[0] < other.key[0] || ((key[0] == other.key[0]) && key[1] < other.key[1]);
+        }
+
+        // Express the key-value pair as the entries of a 3-column row in a table
+        std::array<bb::fr, 3> to_table_components(const bool use_two_keys) const
+        {
+            return {
+                bb::fr(key[0]),
+                use_two_keys ? bb::fr(key[1]) : value[0],
+                use_two_keys ? value[0] : value[1],
+            };
+        }
+    };
+
+    // Unique id of the table which is used to look it up, when we need its functionality. One of BasicTableId enum
+    BasicTableId id;
+    // Circuit-local identity in the LogDeriv lookup relation. Defaults to 0 (unset); assigned by the
+    // builder's allocation sites (create_basic_table, register_basic_lookup_table).
+    size_t table_index = 0;
+    // This means that we are using two inputs to look up stuff, not translate a single entry into another one.
+    bool use_twin_keys;
+
+    bb::fr column_1_step_size = bb::fr(0);
+    bb::fr column_2_step_size = bb::fr(0);
+    bb::fr column_3_step_size = bb::fr(0);
+    std::vector<bb::fr> column_1;
+    std::vector<bb::fr> column_2;
+    std::vector<bb::fr> column_3;
+    // The table row each lookup gate on this table reads, in gate creation order; all the read-count construction
+    // needs.
+    std::vector<uint32_t> lookup_gate_rows;
+
+    // Map from a table entry to its index in the table; filled when the table is created, used by create_lookup_gate.
+    LookupHashTable index_map;
+
+    void initialize_index_map() { index_map.initialize(column_1, column_2, column_3); }
+
+    /** @brief The row of this table holding entry; the table's index map must have been initialized. */
+    uint32_t row_of(const LookupEntry& entry) const
+    {
+        return static_cast<uint32_t>(
+            index_map.find(entry.to_table_components(use_twin_keys), { &column_1, &column_2, &column_3 }));
+    }
+
+    std::array<bb::fr, 2> (*get_values_from_key)(const std::array<uint64_t, 2>);
+
+    bool operator==(const BasicTable& other) const = default;
+
+    size_t size() const
+    {
+        BB_ASSERT_DEBUG(column_1.size() == column_2.size());
+        BB_ASSERT_DEBUG(column_2.size() == column_3.size());
+        return column_1.size();
+    }
+};
+
+enum ColumnIdx { C1, C2, C3 };
+
+/**
+ * @brief Container for lookup accumulator values and table reads.
+ *
+ * @tparam DataType: a native (`bb::fr`), stdlib field (`field_t<Builder>`), or the witness index (`uint32_t`).
+ *
+ * @details Stores the accumulator values for each of the 3 columns across the N lookup gates generated by a single
+ * multi-table lookup. For a lookup decomposed into N slices:
+ *   - columns[C1][0], columns[C2][0], columns[C3][0] contain the fully accumulated values (the final result)
+ *   - columns[Ci][N-1] contains the raw slice value for the last lookup
+ *   - Intermediate indices contain partial accumulations
+ *
+ * Also stores the raw lookup entries (key-value pairs). For more details, especially re: the accumulation pattern, see
+ * ./README.md.
+ *
+ */
+template <class DataType> class ReadData {
+  public:
+    ReadData() = default;
+
+    // Container for the lookup accumulators; 0th index of each column contains full accumulated value
+    std::array<std::vector<DataType>, 3> columns;
+    std::vector<BasicTable::LookupEntry> lookup_entries;
+
+    // Convenience accessors
+    std::vector<DataType>& operator[](ColumnIdx idx) { return columns[static_cast<size_t>(idx)]; };
+    const std::vector<DataType>& operator[](ColumnIdx idx) const { return columns[static_cast<size_t>(idx)]; };
+};
+
+} // namespace bb::plookup

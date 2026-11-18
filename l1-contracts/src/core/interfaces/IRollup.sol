@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 Aztec Labs.
+pragma solidity >=0.8.27;
+
+import {IFeeJuicePortal} from "@aztec/core/interfaces/IFeeJuicePortal.sol";
+import {IVerifier} from "@aztec/core/interfaces/IVerifier.sol";
+import {IInbox} from "@aztec/core/interfaces/messagebridge/IInbox.sol";
+import {IOutbox} from "@aztec/core/interfaces/messagebridge/IOutbox.sol";
+import {CheckpointLog, CompressedTempCheckpointLog} from "@aztec/core/libraries/compressed-data/CheckpointLog.sol";
+import {EthPerFeeAssetE12, EthValue, FeeAssetValue} from "@aztec/core/libraries/compressed-data/fees/FeeConfig.sol";
+import {FeeHeader, L1FeeData} from "@aztec/core/libraries/compressed-data/fees/FeeStructs.sol";
+import {StakingQueueConfig} from "@aztec/core/libraries/compressed-data/StakingQueueConfig.sol";
+import {CompressedChainTips, ChainTips} from "@aztec/core/libraries/compressed-data/Tips.sol";
+import {CommitteeAttestations} from "@aztec/core/libraries/rollup/AttestationLib.sol";
+import {ManaMinFeeComponents} from "@aztec/core/libraries/rollup/FeeLib.sol";
+import {ProposedHeader} from "@aztec/core/libraries/rollup/ProposedHeaderLib.sol";
+import {ProposeArgs} from "@aztec/core/libraries/rollup/ProposeLib.sol";
+import {RewardConfig, MutableRewardConfig} from "@aztec/core/libraries/rollup/RewardLib.sol";
+import {RewardBoostConfig} from "@aztec/core/reward-boost/RewardBooster.sol";
+import {IHaveVersion} from "@aztec/governance/interfaces/IRegistry.sol";
+import {IRewardDistributor} from "@aztec/governance/interfaces/IRewardDistributor.sol";
+import {Signature} from "@aztec/shared/libraries/SignatureLib.sol";
+import {Timestamp, Slot, Epoch} from "@aztec/shared/libraries/TimeMath.sol";
+import {IERC20} from "@oz/token/ERC20/IERC20.sol";
+
+struct PublicInputArgs {
+  bytes32 previousArchive;
+  bytes32 endArchive;
+  bytes32 outHash;
+  // Inbox rolling-hash chain segment consumed across the proven epoch. Both boundaries are
+  // anchored at proof submission against the rolling hashes recorded at propose for checkpoints start - 1 and end.
+  bytes32 previousInboxRollingHash;
+  bytes32 endInboxRollingHash;
+  address proverId;
+}
+
+struct ProvenCheckpointFees {
+  address coinbase;
+  uint256 accumulatedFees;
+}
+
+struct SubmitEpochRootProofArgs {
+  uint256 start; // inclusive
+  uint256 end; // inclusive
+  PublicInputArgs args;
+  ProvenCheckpointFees[] provenCheckpointFees; // Optional prefix already proven and accounted for
+  ProposedHeader[] headers; // Remaining suffix; must match what was proposed by the committee
+  CommitteeAttestations attestations; // attestations for the last checkpoint in epoch
+  bytes blobInputs;
+  bytes proof;
+}
+
+/**
+ * @notice Struct for storing flags for checkpoint header validation
+ * @param ignoreDA - True will ignore DA check, otherwise checks
+ */
+struct CheckpointHeaderValidationFlags {
+  bool ignoreDA;
+}
+
+/**
+ * @notice Inputs of the proposer's integrated header and Inbox preflight
+ * @dev Bundles the `validateHeaderWithAttestations` argument set with the two Inbox inputs so the call stays off
+ *      the stack limit and the Rollup's forwarder stays small.
+ * @param header - The proposed checkpoint header
+ * @param attestations - Committee attestations to validate, or empty to skip signature checks
+ * @param signers - Addresses of the signers in the attestations
+ * @param attestationsAndSignersSignature - The proposer's signature over the attestations and signers
+ * @param digest - The digest the attestations signed
+ * @param blobsHash - The blobs hash for this checkpoint
+ * @param flags - Which header checks to skip
+ * @param expectedTotal - The cumulative Inbox message count the checkpoint consumed up to
+ * @param expectedParentCheckpointNumber - The checkpoint number the header was built on
+ */
+struct CheckpointPreflightArgs {
+  ProposedHeader header;
+  CommitteeAttestations attestations;
+  address[] signers;
+  Signature attestationsAndSignersSignature;
+  bytes32 digest;
+  bytes32 blobsHash;
+  CheckpointHeaderValidationFlags flags;
+  uint64 expectedTotal;
+  uint256 expectedParentCheckpointNumber;
+}
+
+struct GenesisState {
+  bytes32 vkTreeRoot;
+  bytes32 protocolContractsHash;
+  bytes32 genesisArchiveRoot;
+}
+
+struct RollupConfigInput {
+  uint256 aztecSlotDuration;
+  uint256 aztecEpochDuration;
+  uint256 targetCommitteeSize;
+  uint256 lagInEpochsForValidatorSet;
+  uint256 lagInEpochsForRandao;
+  uint256 aztecProofSubmissionEpochs;
+  uint256 slashingQuorum;
+  uint256 slashingRoundSize;
+  uint256 slashingLifetimeInRounds;
+  uint256 slashingExecutionDelayInRounds;
+  uint256[3] slashAmounts;
+  uint256 slashingOffsetInRounds;
+  bool slasherEnabled;
+  address slashingVetoer;
+  uint256 slashingDisableDuration;
+  uint256 manaTarget;
+  uint256 exitDelaySeconds;
+  uint32 version;
+  EthValue provingCostPerMana;
+  EthPerFeeAssetE12 initialEthPerFeeAsset;
+  RewardConfig rewardConfig;
+  RewardBoostConfig rewardBoostConfig;
+  StakingQueueConfig stakingQueueConfig;
+  uint256 localEjectionThreshold;
+  uint256 ethereumSlotDuration;
+  // Initial ISequencerRewardCalculator; zero for none.
+  address sequencerRewardCalculator;
+}
+
+/**
+ * @notice The rollup's deployment-time configuration.
+ * @dev Every field is fixed at construction, so the values live in the Rollup's immutables rather than
+ *      in storage. This struct is assembled in memory and threaded down into the libraries, which cannot
+ *      read the contract's immutables themselves.
+ */
+struct RollupConfig {
+  bytes32 vkTreeRoot;
+  bytes32 protocolContractsHash;
+  uint32 version;
+  IERC20 feeAsset;
+  IFeeJuicePortal feeAssetPortal;
+  IVerifier epochProofVerifier;
+  IInbox inbox;
+  IOutbox outbox;
+}
+
+struct RollupStore {
+  CompressedChainTips tips; // put first such that the struct slot structure is easy to follow for cheatcodes
+  mapping(uint256 checkpointNumber => bytes32 archive) archives;
+  // The following represents a circular buffer. Key is `checkpointNumber % size`.
+  mapping(uint256 circularIndex => CompressedTempCheckpointLog temp) tempCheckpointLogs;
+  // Only written at the checkpoint a proof ended at, so entries are sparse: a proof of checkpoints 1-10 followed by
+  // one of 11-20 records entries at 10 and 20 only. Use getFirstProvenBy to resolve an arbitrary checkpoint number.
+  mapping(uint256 checkpointNumber => uint256 encodedProverId) firstProvenBy;
+}
+
+interface IRollupCore {
+  event CheckpointProposed(
+    uint256 indexed checkpointNumber,
+    bytes32 indexed archive,
+    bytes32[] versionedBlobHashes,
+    bytes32 payloadDigest,
+    bytes32 attestationsHash
+  );
+  event L2ProofVerified(uint256 indexed checkpointNumber, address indexed proverId);
+  event CheckpointInvalidated(uint256 indexed checkpointNumber);
+  event RewardConfigUpdated(MutableRewardConfig rewardConfig);
+  event ManaTargetUpdated(uint256 indexed manaTarget);
+  event PrunedPending(uint256 provenCheckpointNumber, uint256 pendingCheckpointNumber);
+  event ProtocolFeeMarginUpdated(uint16 oldBps, uint16 newBps);
+  event ProtocolFeeRecipientUpdated(address oldRecipient, address newRecipient);
+  event SequencerRewardCalculatorUpdated(address oldCalculator, address newCalculator);
+
+  function claimSequencerRewards(address _recipient) external returns (uint256);
+  function claimProverRewards(address _recipient, Epoch[] memory _epochs) external returns (uint256);
+
+  function prune() external;
+  function updateL1GasFeeOracle() external;
+
+  function setProvingCostPerMana(EthValue _provingCostPerMana) external;
+
+  function setProtocolFeeMargin(uint16 _protocolFeeMarginBps) external;
+  function setProtocolFeeRecipient(address _recipient) external;
+
+  function propose(
+    ProposeArgs calldata _args,
+    CommitteeAttestations memory _attestations,
+    address[] memory _signers,
+    Signature memory _attestationsAndSignersSignature,
+    bytes calldata _blobInput
+  ) external;
+
+  function submitEpochRootProof(SubmitEpochRootProofArgs calldata _args) external;
+
+  function invalidateBadAttestation(
+    uint256 _checkpointNumber,
+    CommitteeAttestations memory _attestations,
+    address[] memory _committee,
+    uint256 _invalidIndex
+  ) external;
+
+  function invalidateInsufficientAttestations(
+    uint256 _checkpointNumber,
+    CommitteeAttestations memory _attestations,
+    address[] memory _committee
+  ) external;
+
+  function setRewardConfig(MutableRewardConfig memory _config) external;
+  function setSequencerRewardCalculator(address _calculator) external;
+  function updateManaTarget(uint256 _manaTarget) external;
+
+  // solhint-disable-next-line func-name-mixedcase
+  function L1_BLOCK_AT_GENESIS() external view returns (uint256);
+}
+
+interface IRollup is IRollupCore, IHaveVersion {
+  function validateHeaderWithAttestations(
+    ProposedHeader calldata _header,
+    CommitteeAttestations memory _attestations,
+    address[] memory _signers,
+    Signature memory _attestationsAndSignersSignature,
+    bytes32 _digest,
+    bytes32 _blobsHash,
+    CheckpointHeaderValidationFlags memory _flags
+  ) external;
+
+  function validateCheckpointHeaderAndInbox(CheckpointPreflightArgs calldata _args) external returns (uint64);
+
+  function canProposeAtTime(Timestamp _ts, bytes32 _archive, address _who) external returns (Slot, uint256);
+
+  function getTips() external view returns (ChainTips memory);
+
+  function status(uint256 _myHeaderCheckpointNumber)
+    external
+    view
+    returns (
+      uint256 provenCheckpointNumber,
+      bytes32 provenArchive,
+      uint256 pendingCheckpointNumber,
+      bytes32 pendingArchive,
+      bytes32 archiveOfMyCheckpoint,
+      Epoch provenEpochNumber
+    );
+
+  function getEpochProofPublicInputs(
+    uint256 _start,
+    uint256 _end,
+    PublicInputArgs calldata _args,
+    ProposedHeader[] calldata _headers,
+    bytes calldata _blobPublicInputs
+  ) external view returns (bytes32[] memory);
+
+  function validateBlobs(bytes calldata _blobsInputs) external view returns (bytes32[] memory, bytes32, bytes[] memory);
+
+  function getManaMinFeeComponentsAt(Timestamp _timestamp, bool _inFeeAsset)
+    external
+    view
+    returns (ManaMinFeeComponents memory);
+  function getManaMinFeeAt(Timestamp _timestamp, bool _inFeeAsset) external view returns (uint256);
+  function getL1FeesAt(Timestamp _timestamp) external view returns (L1FeeData memory);
+  function getEthPerFeeAsset() external view returns (EthPerFeeAssetE12);
+
+  function getEpochForCheckpoint(uint256 _checkpointNumber) external view returns (Epoch);
+  function getFirstProvenBy(uint256 _checkpointNumber) external view returns (address);
+  function canPruneAtTime(Timestamp _ts) external view returns (bool);
+
+  function archive() external view returns (bytes32);
+  function archiveAt(uint256 _checkpointNumber) external view returns (bytes32);
+  function getProvenCheckpointNumber() external view returns (uint256);
+  function getPendingCheckpointNumber() external view returns (uint256);
+  function getCheckpoint(uint256 _checkpointNumber) external view returns (CheckpointLog memory);
+  function getFeeHeader(uint256 _checkpointNumber) external view returns (FeeHeader memory);
+  function getBlobCommitmentsHash(uint256 _checkpointNumber) external view returns (bytes32);
+  function getCurrentBlobCommitmentsHash() external view returns (bytes32);
+
+  function getSharesFor(address _prover) external view returns (uint256);
+  function getSequencerRewards(address _sequencer) external view returns (uint256);
+  function getCollectiveProverRewardsForEpoch(Epoch _epoch) external view returns (uint256);
+  function getSpecificProverRewardsForEpoch(Epoch _epoch, address _prover) external view returns (uint256);
+  function getHasSubmitted(Epoch _epoch, uint256 _length, address _prover) external view returns (bool);
+  function getHasSubmittedFullEpoch(Epoch _epoch, uint256 _length, address _prover) external view returns (bool);
+  function getHasClaimed(address _prover, Epoch _epoch) external view returns (bool);
+
+  function getProofSubmissionEpochs() external view returns (uint256);
+  function getManaTarget() external view returns (uint256);
+  function getManaLimit() external view returns (uint256);
+  function getProvingCostPerManaInEth() external view returns (EthValue);
+
+  function getProvingCostPerManaInFeeAsset() external view returns (FeeAssetValue);
+
+  function getFeeAsset() external view returns (IERC20);
+  function getFeeAssetPortal() external view returns (IFeeJuicePortal);
+  function getRewardDistributor() external view returns (IRewardDistributor);
+  function getProtocolFeeRecipient() external view returns (address);
+  function getProtocolFeeMargin() external view returns (uint16);
+
+  function getInbox() external view returns (IInbox);
+  function getOutbox() external view returns (IOutbox);
+
+  function getVkTreeRoot() external view returns (bytes32);
+  function getProtocolContractsHash() external view returns (bytes32);
+  function getEpochProofVerifier() external view returns (IVerifier);
+
+  function getRewardConfig() external view returns (RewardConfig memory);
+  function getSequencerRewardCalculator() external view returns (address);
+  function getCheckpointReward() external view returns (uint256);
+}

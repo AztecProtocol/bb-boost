@@ -1,0 +1,353 @@
+#include "api_chonk.hpp"
+#include "barretenberg/api/file_io.hpp"
+#include "barretenberg/api/json_output.hpp"
+#include "barretenberg/api/log.hpp"
+#include "barretenberg/bbapi/bbapi.hpp"
+#include "barretenberg/chonk/chonk.hpp"
+#include "barretenberg/chonk/private_execution_steps.hpp"
+#include "barretenberg/chonk/proof_compression.hpp"
+#include "barretenberg/common/get_bytecode.hpp"
+#include "barretenberg/common/map.hpp"
+#include "barretenberg/common/throw_or_abort.hpp"
+#include "barretenberg/common/try_catch_shim.hpp"
+#include "barretenberg/dsl/acir_format/acir_to_constraint_buf.hpp"
+#include "barretenberg/dsl/acir_format/hypernova_recursion_constraint.hpp"
+#include "barretenberg/serialize/msgpack.hpp"
+#include "barretenberg/serialize/msgpack_check_eq.hpp"
+#include <algorithm>
+#include <charconv>
+#include <optional>
+#include <set>
+#include <stdexcept>
+
+namespace bb {
+namespace { // anonymous namespace
+
+CircuitKind parse_circuit_kind(const std::string& s)
+{
+    if (s == "app") {
+        return CircuitKind::App;
+    }
+    if (s == "kernel") {
+        return CircuitKind::Kernel;
+    }
+    if (s == "hiding") {
+        return CircuitKind::HidingKernel;
+    }
+    throw_or_abort("write_chonk_vk: --circuit_kind must be one of 'app' / 'kernel' / 'hiding' (got '" + s + "')");
+    __builtin_unreachable();
+}
+
+std::optional<size_t> parse_batch_file_index(std::string_view filename, std::string_view prefix)
+{
+    if (!filename.starts_with(prefix)) {
+        return std::nullopt;
+    }
+    const std::string_view suffix = filename.substr(prefix.size());
+    if (suffix.empty()) {
+        return std::nullopt;
+    }
+    size_t index = 0;
+    const auto [end, error] = std::from_chars(suffix.data(), suffix.data() + suffix.size(), index);
+    if (error != std::errc{} || end != suffix.data() + suffix.size()) {
+        return std::nullopt;
+    }
+    if (suffix.size() > 1 && suffix.front() == '0') {
+        throw_or_abort("batch_verify: file index must not contain leading zeros: " + std::string(filename));
+    }
+    return index;
+}
+
+size_t count_batch_indices(const std::filesystem::path& proofs_dir)
+{
+    std::error_code error;
+    if (!std::filesystem::is_directory(proofs_dir, error)) {
+        throw_or_abort("batch_verify: no proof_0/vk_0 pairs found in " + proofs_dir.string());
+    }
+
+    std::set<size_t> proof_indices;
+    std::set<size_t> vk_indices;
+    for (const auto& entry : std::filesystem::directory_iterator(proofs_dir)) {
+        const std::string filename = entry.path().filename().string();
+        if (auto index = parse_batch_file_index(filename, "proof_")) {
+            proof_indices.insert(*index);
+        } else if (auto index = parse_batch_file_index(filename, "vk_")) {
+            vk_indices.insert(*index);
+        }
+    }
+    if (proof_indices.empty() && vk_indices.empty()) {
+        throw_or_abort("batch_verify: no proof_0/vk_0 pairs found in " + proofs_dir.string());
+    }
+    if (proof_indices != vk_indices) {
+        throw_or_abort("batch_verify: proof/vk indices must match and be contiguous starting at 0");
+    }
+    size_t expected = 0;
+    for (const size_t index : proof_indices) {
+        if (index != expected++) {
+            throw_or_abort("batch_verify: proof/vk indices must be contiguous starting at 0");
+        }
+    }
+    return expected;
+}
+
+bool paths_refer_to_same_file(const std::filesystem::path& lhs, const std::filesystem::path& rhs)
+{
+    if (std::filesystem::absolute(lhs).lexically_normal() == std::filesystem::absolute(rhs).lexically_normal()) {
+        return true;
+    }
+    std::error_code error;
+    const bool equivalent = std::filesystem::equivalent(lhs, rhs, error);
+    return !error && equivalent;
+}
+
+/**
+ * @brief Compute and write a Chonk VK in the per-kind flavor selected by `flags.circuit_kind`
+ * (app → MegaApp, kernel → MegaKernel, hiding → MegaZK). Delegates to ChonkComputeVk; the dummy
+ * IVC inputs that make a kernel's recursion constraints satisfiable are handled in the ACIR layer.
+ */
+void write_chonk_vk(std::vector<uint8_t> bytecode, const std::filesystem::path& output_path, const API::Flags& flags)
+{
+    const CircuitKind kind = parse_circuit_kind(flags.circuit_kind);
+    auto response = bbapi::ChonkComputeVk{ .circuit = { .bytecode = std::move(bytecode) }, .kind = kind }.execute();
+
+    const bool is_stdout = output_path == "-";
+    if (is_stdout) {
+        write_bytes_to_stdout(response.bytes);
+    } else if (flags.output_format == "json") {
+        // Note: Chonk VK doesn't have a hash, so we pass an empty string
+        std::string json_content = VkJson::build(response.fields, "", flags.scheme);
+        write_file(output_path / "vk.json", std::vector<uint8_t>(json_content.begin(), json_content.end()));
+        info("VK (JSON) saved to ", output_path / "vk.json");
+    } else {
+        write_file(output_path / "vk", response.bytes);
+    }
+}
+} // anonymous namespace
+
+void ChonkAPI::prove(const Flags& flags,
+                     const std::filesystem::path& input_path,
+                     const std::filesystem::path& output_dir)
+{
+    BB_BENCH_NAME("ChonkAPI::prove");
+    bbapi::BBApiRequest request;
+    request.vk_policy = bbapi::parse_vk_policy(flags.vk_policy);
+    // Steps stay compressed until accumulated, so only one decompressed step is resident at a time.
+    std::vector<PrivateExecutionStepRaw> raw_steps = PrivateExecutionStepRaw::load(input_path);
+
+    std::vector<CircuitKind> kinds;
+    kinds.reserve(raw_steps.size());
+    for (const auto& step : raw_steps) {
+        kinds.push_back(step.kind);
+    }
+    bbapi::ChonkStart{ .kinds = std::move(kinds) }.execute(request);
+    info("Chonk: starting with ", raw_steps.size(), " circuits");
+
+    for (auto& step : raw_steps) {
+        step.self_decompress();
+        bbapi::ChonkLoad{
+            .circuit = { .name = step.function_name,
+                         .bytecode = std::move(step.bytecode),
+                         .verification_key = std::move(step.vk) },
+            .kind = step.kind,
+        }
+            .execute(request);
+
+        info("Chonk: accumulating " + step.function_name);
+        bbapi::ChonkAccumulate{ .witness = std::move(step.witness) }.execute(request);
+    }
+
+    auto proof = bbapi::ChonkProve{}.execute(request).proof;
+
+    const bool output_to_stdout = output_dir == "-";
+
+    const auto proof_fields = proof.to_field_elements();
+    if (output_to_stdout) {
+        vinfo("writing Chonk proof to stdout");
+        write_bytes_to_stdout(to_buffer(proof_fields));
+    } else if (flags.output_format == "json") {
+        vinfo("writing Chonk proof (JSON) in directory ", output_dir);
+        // Note: Chonk proof doesn't have a vk_hash, so we pass an empty string
+        std::string json_content = ProofJson::build(proof_fields, "", flags.scheme);
+        write_file(output_dir / "proof.json", std::vector<uint8_t>(json_content.begin(), json_content.end()));
+        info("Proof (JSON) saved to ", output_dir / "proof.json");
+    } else {
+        vinfo("writing Chonk proof in directory ", output_dir);
+        write_file(output_dir / "proof", to_buffer(proof_fields));
+    }
+}
+
+bool ChonkAPI::verify([[maybe_unused]] const Flags& flags,
+                      [[maybe_unused]] const std::filesystem::path& public_inputs_path,
+                      const std::filesystem::path& proof_path,
+                      const std::filesystem::path& vk_path)
+{
+    BB_BENCH_NAME("ChonkAPI::verify");
+    auto proof_fields = many_from_buffer_exact<fr>(read_file(proof_path), "Chonk proof file");
+    auto proof = ChonkProof::from_field_elements(proof_fields);
+
+    auto vk_buffer = read_vk_file(vk_path);
+
+    auto response = bbapi::ChonkVerify{ .proof = std::move(proof), .vk = std::move(vk_buffer) }.execute();
+    return response.valid;
+}
+
+bool ChonkAPI::batch_verify([[maybe_unused]] const Flags& flags, const std::filesystem::path& proofs_dir)
+{
+    BB_BENCH_NAME("ChonkAPI::batch_verify");
+
+    std::vector<ChonkProof> proofs;
+    std::vector<std::vector<uint8_t>> vks;
+
+    const size_t count = count_batch_indices(proofs_dir);
+    for (size_t i = 0; i < count; ++i) {
+        auto proof_file = proofs_dir / ("proof_" + std::to_string(i));
+        auto vk_file = proofs_dir / ("vk_" + std::to_string(i));
+
+        auto proof_fields = many_from_buffer_exact<fr>(read_file(proof_file), "Chonk proof file");
+        proofs.push_back(ChonkProof::from_field_elements(proof_fields));
+        vks.push_back(read_vk_file(vk_file));
+    }
+
+    info("ChonkAPI::batch_verify - found ", proofs.size(), " proof/vk pairs in ", proofs_dir.string());
+
+    auto response = bbapi::ChonkBatchVerify{ .proofs = std::move(proofs), .vks = std::move(vks) }.execute();
+    return response.valid;
+}
+
+void ChonkAPI::proof_stats(const std::filesystem::path& proof_path, const std::filesystem::path& output_path)
+{
+    std::filesystem::path compressed_proof_path;
+    if (output_path != "-") {
+        compressed_proof_path = output_path.string() + ".bin";
+        if (paths_refer_to_same_file(compressed_proof_path, proof_path) ||
+            paths_refer_to_same_file(compressed_proof_path, output_path) ||
+            paths_refer_to_same_file(proof_path, output_path)) {
+            throw_or_abort("proof_stats: compressed proof path conflicts with input or output path");
+        }
+    }
+
+    auto proof_fields = many_from_buffer_exact<fr>(read_file(proof_path), "Chonk proof file");
+    auto proof = ChonkProof::from_field_elements(proof_fields);
+
+    auto compressed = ProofCompressor::compress_chonk_proof(proof);
+
+    std::string json = "{\n"
+                       "  \"compressed_proof_size_bytes\": " +
+                       std::to_string(compressed.size()) +
+                       "\n"
+                       "}";
+
+    if (output_path == "-") {
+        std::cout << json << std::endl;
+    } else {
+        write_file(output_path, std::vector<uint8_t>(json.begin(), json.end()));
+        // Write the compressed proof alongside the JSON for further processing (e.g. gzip)
+        write_file(compressed_proof_path, compressed);
+        info("Proof stats written to ", output_path, "; compressed proof written to ", compressed_proof_path);
+    }
+}
+
+void ChonkAPI::gates(const Flags& flags, const std::filesystem::path& bytecode_path)
+{
+    BB_BENCH_NAME("ChonkAPI::gates");
+    chonk_gate_count(bytecode_path.string(), flags.include_gates_per_opcode);
+}
+
+void ChonkAPI::write_solidity_verifier([[maybe_unused]] const Flags& flags,
+                                       [[maybe_unused]] const std::filesystem::path& output_path,
+                                       [[maybe_unused]] const std::filesystem::path& vk_path)
+{
+    BB_BENCH_NAME("ChonkAPI::write_solidity_verifier");
+    throw_or_abort("API function contract not implemented");
+}
+
+bool ChonkAPI::check_precomputed_vks(const Flags& flags, const std::filesystem::path& input_path)
+{
+    BB_BENCH_NAME("ChonkAPI::check_precomputed_vks");
+    std::vector<PrivateExecutionStepRaw> raw_steps = PrivateExecutionStepRaw::load_and_decompress(input_path);
+
+    bbapi::VkPolicy vk_policy = bbapi::parse_vk_policy(flags.vk_policy);
+    bool check_failed = false;
+    for (size_t i = 0; i < raw_steps.size(); ++i) {
+        auto& step = raw_steps[i];
+        if (step.vk.empty()) {
+            info("FAIL: Expected precomputed vk for function ", step.function_name);
+            return false;
+        }
+        auto response =
+            bbapi::ChonkCheckPrecomputedVk{
+                .circuit = { .name = step.function_name, .bytecode = step.bytecode, .verification_key = step.vk },
+                .kind = step.kind,
+            }
+                .execute();
+
+        if (!response.valid) {
+            info("VK mismatch detected for function ", step.function_name);
+            if (vk_policy != bbapi::VkPolicy::REWRITE) {
+                info("Computed VK differs from precomputed VK in ivc-inputs.msgpack");
+                return false;
+            }
+            info("Updating VK in ivc-inputs.msgpack with computed value");
+            step.vk = response.actual_vk;
+            check_failed = true;
+        }
+    }
+    if (check_failed) {
+        PrivateExecutionStepRaw::compress_and_save(std::move(raw_steps), input_path);
+        return false;
+    }
+    return true;
+}
+
+void ChonkAPI::write_vk(const Flags& flags,
+                        const std::filesystem::path& bytecode_path,
+                        const std::filesystem::path& output_path)
+{
+    BB_BENCH_NAME("ChonkAPI::write_vk");
+    write_chonk_vk(get_bytecode(bytecode_path), output_path, flags);
+}
+
+bool ChonkAPI::check([[maybe_unused]] const Flags& flags,
+                     [[maybe_unused]] const std::filesystem::path& bytecode_path,
+                     [[maybe_unused]] const std::filesystem::path& witness_path)
+{
+    throw_or_abort("API function check_witness not implemented");
+    return false;
+}
+
+void chonk_gate_count(const std::string& bytecode_path, bool include_gates_per_opcode)
+{
+    BB_BENCH_NAME("chonk_gate_count");
+    // All circuit reports will be built into the std::string below
+    std::string functions_string = "{\"functions\": [\n  ";
+
+    bbapi::BBApiRequest request;
+
+    auto bytecode = get_bytecode(bytecode_path);
+    auto response = bbapi::ChonkStats{ .circuit = { .name = "ivc_circuit", .bytecode = std::move(bytecode) },
+                                       .include_gates_per_opcode = include_gates_per_opcode }
+                        .execute(request);
+
+    // Build the circuit report. It always has one function, corresponding to the ACIR constraint systems.
+    // NOTE: can be reconsidered
+    std::string gates_per_opcode_str;
+    if (include_gates_per_opcode && !response.gates_per_opcode.empty()) {
+        for (size_t j = 0; j < response.gates_per_opcode.size(); j++) {
+            gates_per_opcode_str += std::to_string(response.gates_per_opcode[j]);
+            if (j != response.gates_per_opcode.size() - 1) {
+                gates_per_opcode_str += ",";
+            }
+        }
+    }
+    auto result_string = format(
+        "{\n        \"acir_opcodes\": ",
+        response.acir_opcodes,
+        ",\n        \"circuit_size\": ",
+        response.circuit_size,
+        (include_gates_per_opcode ? format(",\n        \"gates_per_opcode\": [", gates_per_opcode_str, "]") : ""),
+        "\n  }");
+    functions_string = format(functions_string, result_string);
+    std::cout << format(functions_string, "\n]}");
+}
+
+} // namespace bb

@@ -1,0 +1,109 @@
+#pragma once
+
+#include <span>
+#include <stack>
+#include <tuple>
+
+#include "barretenberg/crypto/merkle_tree/hash_path.hpp"
+#include "barretenberg/crypto/merkle_tree/indexed_tree/indexed_leaf.hpp"
+#include "barretenberg/crypto/merkle_tree/response.hpp"
+#include "barretenberg/vm2/common/avm_io.hpp"
+#include "barretenberg/vm2/common/aztec_types.hpp"
+#include "barretenberg/vm2/common/field.hpp"
+#include "barretenberg/vm2/common/map.hpp"
+#include "barretenberg/vm2/simulation/interfaces/db.hpp"
+#include "barretenberg/vm2/simulation/lib/cancellation_token.hpp"
+#include "barretenberg/vm2/simulation/lib/db_types.hpp"
+#include "barretenberg/vm2/simulation/lib/written_slots_tree.hpp"
+
+namespace bb::avm2::simulation {
+
+// This class interacts with the external world, without emiting any simulation events.
+// It is used for a given TX and its hinting structure assumes that the content cannot
+// change during the TX.
+class HintedRawContractDB final : public ContractDBInterface {
+  public:
+    HintedRawContractDB(const ExecutionHints& hints);
+
+    std::optional<ContractInstance> get_contract_instance(const AztecAddress& address) const override;
+    std::optional<ContractClass> get_contract_class(const ContractClassId& class_id) const override;
+    std::optional<FF> get_bytecode_commitment(const ContractClassId& class_id) const override;
+    std::optional<std::string> get_debug_function_name(const AztecAddress& address,
+                                                       const FunctionSelector& selector) const override;
+
+    void add_contracts(const ContractDeploymentData& contract_deployment_data) override;
+
+    void create_checkpoint() override;
+    void commit_checkpoint() override;
+    void revert_checkpoint() override;
+
+  private:
+    uint32_t get_checkpoint_id() const;
+    unordered_flat_map<GetContractInstanceKey, ContractInstanceHint> contract_instances;
+    unordered_flat_map<GetContractClassKey, ContractClassHint> contract_classes;
+    unordered_flat_map<GetBytecodeCommitmentKey, FF> bytecode_commitments;
+    unordered_flat_map<GetDebugFunctionNameKey, std::string> debug_function_names;
+
+    uint32_t action_counter = 0;
+    std::stack<uint32_t> checkpoint_stack{ { 0 } };
+    unordered_flat_map<uint32_t, ContractDBCreateCheckpointHint> create_checkpoint_hints;
+    unordered_flat_map<uint32_t, ContractDBCommitCheckpointHint> commit_checkpoint_hints;
+    unordered_flat_map<uint32_t, ContractDBRevertCheckpointHint> revert_checkpoint_hints;
+};
+
+// This class interacts with the external world, without emiting any simulation events.
+class HintedRawMerkleDB final : public LowLevelMerkleDBInterface {
+  public:
+    HintedRawMerkleDB(const ExecutionHints& hints);
+
+    TreeSnapshots get_tree_roots() const override { return tree_roots; }
+
+    // Query methods.
+    SiblingPath get_sibling_path(MerkleTreeId tree_id, index_t leaf_index) const override;
+    GetLowIndexedLeafResponse get_low_indexed_leaf(MerkleTreeId tree_id, const FF& value) const override;
+    FF get_leaf_value(MerkleTreeId tree_id, index_t leaf_index) const override;
+    IndexedLeaf<PublicDataLeafValue> get_leaf_preimage_public_data_tree(index_t leaf_index) const override;
+    IndexedLeaf<NullifierLeafValue> get_leaf_preimage_nullifier_tree(index_t leaf_index) const override;
+
+    // State modification methods.
+    SequentialInsertionResult<PublicDataLeafValue> insert_indexed_leaves_public_data_tree(
+        const PublicDataLeafValue& leaf_value) override;
+    SequentialInsertionResult<NullifierLeafValue> insert_indexed_leaves_nullifier_tree(
+        const NullifierLeafValue& leaf_value) override;
+    void append_leaves(MerkleTreeId tree_id, std::span<const FF> leaves) override;
+    void pad_tree(MerkleTreeId tree_id, size_t num_leaves) override;
+
+    void create_checkpoint() override;
+    void commit_checkpoint() override;
+    void revert_checkpoint() override;
+    uint32_t get_checkpoint_id() const override;
+
+  private:
+    TreeSnapshots tree_roots;
+    uint32_t checkpoint_action_counter = 0;
+    // We start with a checkpoint id of 0, which is the assumed initial state checkpoint.
+    // This stack is for debugging purposes only.
+    std::stack<uint32_t> checkpoint_stack{ { 0 } };
+
+    // Query hints.
+    unordered_flat_map<GetSiblingPathKey, SiblingPath> get_sibling_path_hints;
+    unordered_flat_map<GetPreviousValueIndexKey, GetLowIndexedLeafResponse> get_previous_value_index_hints;
+    unordered_flat_map<GetLeafPreimageKey, IndexedLeaf<PublicDataLeafValue>> get_leaf_preimage_hints_public_data_tree;
+    unordered_flat_map<GetLeafPreimageKey, IndexedLeaf<NullifierLeafValue>> get_leaf_preimage_hints_nullifier_tree;
+    unordered_flat_map<GetLeafValueKey, FF> get_leaf_value_hints;
+    // State modification hints.
+    unordered_flat_map<SequentialInsertHintPublicDataTreeKey, SequentialInsertHint<PublicDataLeafValue>>
+        sequential_insert_hints_public_data_tree;
+    unordered_flat_map<SequentialInsertHintNullifierTreeKey, SequentialInsertHint<NullifierLeafValue>>
+        sequential_insert_hints_nullifier_tree;
+    unordered_flat_map<AppendLeavesHintKey, AppendOnlyTreeSnapshot> append_leaves_hints;
+    unordered_flat_map</*action_counter*/ uint32_t, CreateCheckpointHint> create_checkpoint_hints;
+    unordered_flat_map</*action_counter*/ uint32_t, CommitCheckpointHint> commit_checkpoint_hints;
+    unordered_flat_map</*action_counter*/ uint32_t, RevertCheckpointHint> revert_checkpoint_hints;
+
+    // Private helper methods.
+    const AppendOnlyTreeSnapshot& get_tree_info(MerkleTreeId tree_id) const;
+    AppendOnlyTreeSnapshot& get_tree_info(MerkleTreeId tree_id);
+};
+
+} // namespace bb::avm2::simulation

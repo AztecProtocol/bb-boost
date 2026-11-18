@@ -1,0 +1,480 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 Aztec Labs.
+pragma solidity >=0.8.27;
+
+import {DecoderBase} from "./base/DecoderBase.sol";
+
+import {FeeJuicePortal} from "@aztec/core/messagebridge/FeeJuicePortal.sol";
+import {TestERC20} from "@aztec/mock/TestERC20.sol";
+import {TestConstants} from "./harnesses/TestConstants.sol";
+import {ProposeArgs, ProposeLib} from "@aztec/core/libraries/rollup/ProposeLib.sol";
+
+import {Timestamp, Slot, Epoch, TimeLib} from "@aztec/core/libraries/TimeLib.sol";
+
+import {Strings} from "@oz/utils/Strings.sol";
+import {Errors} from "@aztec/core/libraries/Errors.sol";
+
+import {RollupBase, IInstance} from "./base/RollupBase.sol";
+import {RollupBuilder} from "./builder/RollupBuilder.sol";
+import {stdStorage, StdStorage} from "forge-std/StdStorage.sol";
+import {RewardBooster, ActivityScore} from "@aztec/core/reward-boost/RewardBooster.sol";
+import {BoostedHelper} from "./boosted_rewards/BoostRewardHelper.sol";
+
+// solhint-disable comprehensive-interface
+
+/**
+ * Checkpoints are generated using the `integration_l1_publisher.test.ts` tests.
+ * Main use of these test is shorter cycles when updating the decoder contract.
+ */
+contract MultiProofTest is RollupBase {
+  using stdStorage for StdStorage;
+  using ProposeLib for ProposeArgs;
+  using TimeLib for Timestamp;
+  using TimeLib for Slot;
+  using TimeLib for Epoch;
+
+  TestERC20 internal testERC20;
+  FeeJuicePortal internal feeJuicePortal;
+  RewardBooster internal rewardBooster;
+
+  uint256 internal SLOT_DURATION;
+  uint256 internal EPOCH_DURATION;
+
+  address internal sequencer = address(bytes20("sequencer"));
+
+  constructor() {
+    TimeLib.initialize(
+      block.timestamp,
+      TestConstants.AZTEC_SLOT_DURATION,
+      TestConstants.AZTEC_EPOCH_DURATION,
+      TestConstants.AZTEC_PROOF_SUBMISSION_EPOCHS,
+      TestConstants.ETHEREUM_SLOT_DURATION
+    );
+    SLOT_DURATION = TestConstants.AZTEC_SLOT_DURATION;
+    EPOCH_DURATION = TestConstants.AZTEC_EPOCH_DURATION;
+  }
+
+  /**
+   * @notice  Set up the contracts needed for the tests with time aligned to the provided checkpoint name
+   */
+  modifier setUpFor(string memory _name) {
+    {
+      DecoderBase.Full memory full = load(_name);
+      uint256 slotNumber = Slot.unwrap(full.checkpoint.header.slotNumber);
+      uint256 initialTime = Timestamp.unwrap(full.checkpoint.header.timestamp) - slotNumber * SLOT_DURATION;
+      vm.warp(initialTime);
+    }
+
+    RollupBuilder builder = new RollupBuilder(address(this)).setTargetCommitteeSize(0);
+    builder.deploy();
+
+    rollup = IInstance(address(builder.getConfig().rollup));
+    testERC20 = builder.getConfig().testERC20;
+
+    feeJuicePortal = FeeJuicePortal(address(rollup.getFeeAssetPortal()));
+
+    rewardBooster = RewardBooster(address(rollup.getRewardConfig().booster));
+
+    // Deploy the test helper such that we can easily update storage and replace the implementation
+    BoostedHelper boostedHelper = new BoostedHelper(rollup, rewardBooster.getConfig());
+    vm.etch(address(rewardBooster), address(boostedHelper).code);
+
+    _;
+  }
+
+  function warpToL2Slot(uint256 _slot) public {
+    vm.warp(Timestamp.unwrap(rollup.getTimestampForSlot(Slot.wrap(_slot))));
+  }
+
+  function logStatus() public {
+    uint256 provenCheckpointNumber = rollup.getProvenCheckpointNumber();
+    uint256 pendingCheckpointNumber = rollup.getPendingCheckpointNumber();
+    emit log_named_uint("proven checkpoint number", provenCheckpointNumber);
+    emit log_named_uint("pending checkpoint number", pendingCheckpointNumber);
+
+    address[2] memory provers = [address(bytes20("alice")), address(bytes20("bob"))];
+
+    emit log_named_decimal_uint("sequencer rewards", rollup.getSequencerRewards(sequencer), 18);
+    emit log_named_decimal_uint("prover rewards", rollup.getCollectiveProverRewardsForEpoch(Epoch.wrap(0)), 18);
+
+    for (uint256 i = 0; i < provers.length; i++) {
+      for (uint256 j = 1; j <= provenCheckpointNumber; j++) {
+        bool hasSubmitted = rollup.getHasSubmitted(Epoch.wrap(0), j, provers[i]);
+        if (hasSubmitted) {
+          emit log_named_string(
+            string.concat("prover has submitted proof up till checkpoint ", Strings.toString(j)),
+            string(abi.encode(provers[i]))
+          );
+        }
+      }
+      emit log_named_decimal_uint(
+        string.concat("prover ", string(abi.encode(provers[i])), " rewards"),
+        rollup.getSpecificProverRewardsForEpoch(Epoch.wrap(0), provers[i]),
+        18
+      );
+    }
+  }
+
+  function testMultipleProvers() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+    address bob = address(bytes20("bob"));
+
+    // We need to mint some fee asset to the portal to cover the 30M mana spent.
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+    _proposeCheckpoint("mixed_checkpoint_2", 2, 15e6);
+
+    assertEq(rollup.getProvenCheckpointNumber(), 0, "Checkpoint already proven");
+
+    string memory name = "mixed_checkpoint_";
+    _proveCheckpoints(name, 1, 1, alice);
+    _proveCheckpoints(name, 1, 1, bob);
+    _proveCheckpoints(name, 1, 2, bob);
+
+    logStatus();
+
+    assertTrue(rollup.getHasSubmitted(Epoch.wrap(0), 1, alice));
+    assertFalse(rollup.getHasSubmitted(Epoch.wrap(0), 2, alice));
+    assertTrue(rollup.getHasSubmitted(Epoch.wrap(0), 1, bob));
+    assertTrue(rollup.getHasSubmitted(Epoch.wrap(0), 2, bob));
+
+    assertEq(rollup.getProvenCheckpointNumber(), 2, "Checkpoint not proven");
+
+    {
+      uint256 sequencerRewards = rollup.getSequencerRewards(sequencer);
+      assertGt(sequencerRewards, 0, "Sequencer rewards is zero");
+      uint256 sequencerRewardsClaimed = rollup.claimSequencerRewards(sequencer);
+      assertEq(sequencerRewardsClaimed, sequencerRewards, "Sequencer rewards not claimed");
+      assertEq(rollup.getSequencerRewards(sequencer), 0, "Sequencer rewards not zeroed");
+      assertEq(testERC20.balanceOf(sequencer), sequencerRewards, "Sequencer rewards not transferred");
+    }
+
+    Epoch[] memory epochs = new Epoch[](1);
+    epochs[0] = Epoch.wrap(0);
+
+    {
+      uint256 aliceRewards = rollup.getSpecificProverRewardsForEpoch(Epoch.wrap(0), alice);
+      assertEq(aliceRewards, 0, "Alice rewards not zero");
+    }
+
+    {
+      uint256 bobRewards = rollup.getSpecificProverRewardsForEpoch(Epoch.wrap(0), bob);
+      assertGt(bobRewards, 0, "Bob rewards is zero");
+
+      Epoch deadline = TimeLib.toDeadlineEpoch(epochs[0]);
+
+      vm.expectRevert(abi.encodeWithSelector(Errors.Rollup__NotPastDeadline.selector, deadline, Epoch.wrap(0)));
+      rollup.claimProverRewards(bob, epochs);
+
+      vm.warp(Timestamp.unwrap(rollup.getTimestampForSlot(deadline.toSlots())));
+      uint256 bobRewardsClaimed = rollup.claimProverRewards(bob, epochs);
+      assertEq(testERC20.balanceOf(bob), bobRewardsClaimed, "Bob rewards not transferred");
+
+      assertEq(bobRewardsClaimed, bobRewards, "Bob rewards not claimed");
+      assertEq(rollup.getSpecificProverRewardsForEpoch(Epoch.wrap(0), bob), 0, "Bob rewards not zeroed");
+      vm.record();
+
+      rollup.claimProverRewards(bob, epochs);
+      (, bytes32[] memory writes) = vm.accesses(address(rollup));
+      // Ensure that there was no writes! We are just doing no-ops if they were already claimed.
+      assertEq(writes.length, 0);
+    }
+  }
+
+  function testMultipleProversBoostedRewards() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+    address bob = address(bytes20("bob"));
+
+    // We need to mint some fee asset to the portal to cover the 30M mana spent.
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+    _proposeCheckpoint("mixed_checkpoint_2", 2, 15e6);
+
+    assertEq(rollup.getProvenCheckpointNumber(), 0, "Checkpoint already proven");
+
+    ActivityScore memory activityScore = rewardBooster.getActivityScore(alice);
+
+    assertEq(rollup.getSharesFor(alice), rollup.getSharesFor(bob), "Alice shares not equal to bob shares");
+
+    uint256 maxActivityScore = TestConstants.getRewardBoostConfig().maxScore;
+    uint256 maxShares = TestConstants.getRewardBoostConfig().k;
+
+    BoostedHelper(address(rewardBooster)).setActivityScore(alice, maxActivityScore);
+
+    assertGt(rollup.getSharesFor(alice), rollup.getSharesFor(bob), "Alice shares not greater than bob shares");
+
+    activityScore = rewardBooster.getActivityScore(alice);
+    assertEq(activityScore.value, maxActivityScore, "Activity score not set");
+    assertEq(rollup.getSharesFor(alice), maxShares, "Alice shares not set");
+
+    assertEq(rollup.getSpecificProverRewardsForEpoch(Epoch.wrap(0), alice), 0, "Alice rewards not zeroed");
+    assertEq(rollup.getSpecificProverRewardsForEpoch(Epoch.wrap(0), bob), 0, "Bob rewards not zeroed");
+
+    string memory name = "mixed_checkpoint_";
+    _proveCheckpoints(name, 1, 1, alice);
+    _proveCheckpoints(name, 1, 1, bob);
+
+    logStatus();
+
+    assertTrue(rollup.getHasSubmitted(Epoch.wrap(0), 1, alice));
+    assertTrue(rollup.getHasSubmitted(Epoch.wrap(0), 1, bob));
+    assertEq(rollup.getProvenCheckpointNumber(), 1, "Checkpoint not proven");
+
+    uint256 totalRewards = rollup.getCollectiveProverRewardsForEpoch(Epoch.wrap(0));
+    uint256 totalShares = (rollup.getSharesFor(bob) + rollup.getSharesFor(alice));
+
+    {
+      uint256 aliceRewards = rollup.getSpecificProverRewardsForEpoch(Epoch.wrap(0), alice);
+      assertEq(aliceRewards, totalRewards * rollup.getSharesFor(alice) / totalShares, "Alice rewards not correct");
+    }
+    {
+      uint256 bobRewards = rollup.getSpecificProverRewardsForEpoch(Epoch.wrap(0), bob);
+      assertEq(bobRewards, totalRewards * rollup.getSharesFor(bob) / totalShares, "Bob rewards not correct");
+    }
+  }
+
+  function testNoHolesInProvenCheckpoints() public setUpFor("mixed_checkpoint_1") {
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+    _proposeCheckpoint("mixed_checkpoint_2", TestConstants.AZTEC_EPOCH_DURATION + 1, 15e6);
+
+    string memory name = "mixed_checkpoint_";
+    _proveCheckpointsFail(
+      name, 2, 2, address(bytes20("alice")), abi.encodeWithSelector(Errors.Rollup__StartIsNotBuildingOnProven.selector)
+    );
+  }
+
+  function testFirstProvenByRecordsFirstProver() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+    address bob = address(bytes20("bob"));
+
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+    _proposeCheckpoint("mixed_checkpoint_2", 2, 15e6);
+
+    vm.expectRevert(abi.encodeWithSelector(Errors.Rollup__CheckpointNotProven.selector, 0, 1));
+    rollup.getFirstProvenBy(1);
+
+    string memory name = "mixed_checkpoint_";
+    _proveCheckpoints(name, 1, 1, alice);
+    // Bob proving the same range again must not take credit for checkpoint 1.
+    _proveCheckpoints(name, 1, 1, bob);
+    _proveCheckpoints(name, 1, 2, bob);
+
+    assertEq(rollup.getFirstProvenBy(1), alice, "Checkpoint 1 not credited to alice");
+    assertEq(rollup.getFirstProvenBy(2), bob, "Checkpoint 2 not credited to bob");
+
+    vm.expectRevert(abi.encodeWithSelector(Errors.Rollup__CheckpointNotProven.selector, 2, 3));
+    rollup.getFirstProvenBy(3);
+  }
+
+  function testFirstProvenByWalksForwardToNextEntry() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+    _proposeCheckpoint("mixed_checkpoint_2", 2, 15e6);
+
+    // A single proof of 1-2 only records an entry at checkpoint 2, so a lookup of 1 walks forward to it.
+    string memory name = "mixed_checkpoint_";
+    _proveCheckpoints(name, 1, 2, alice);
+
+    assertEq(rollup.getFirstProvenBy(1), alice, "Checkpoint 1 not credited to alice");
+    assertEq(rollup.getFirstProvenBy(2), alice, "Checkpoint 2 not credited to alice");
+  }
+
+  function testFirstProvenByRecordsZeroAddress() public setUpFor("mixed_checkpoint_1") {
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+
+    string memory name = "mixed_checkpoint_";
+    _proveCheckpoints(name, 1, 1, address(0));
+
+    assertEq(rollup.getFirstProvenBy(1), address(0), "Checkpoint 1 not credited to zero address");
+
+    vm.expectRevert(abi.encodeWithSelector(Errors.Rollup__CheckpointNotProven.selector, 1, 0));
+    rollup.getFirstProvenBy(0);
+  }
+
+  function testProofsAreInOneEpoch() public setUpFor("mixed_checkpoint_1") {
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+    _proposeCheckpoint("mixed_checkpoint_2", TestConstants.AZTEC_EPOCH_DURATION + 1, 15e6);
+
+    string memory name = "mixed_checkpoint_";
+    _proveCheckpointsFail(
+      name,
+      1,
+      2,
+      address(bytes20("alice")),
+      abi.encodeWithSelector(Errors.Rollup__StartAndEndNotSameEpoch.selector, 0, 1)
+    );
+  }
+
+  function testPartialEpochProofDoesNotUpdateActivityScore() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+
+    // Mint some fee asset to the portal to cover the 30M mana spent.
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    // Propose 2 checkpoints (we need 2 to ensure a partial proof is possible)
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+    _proposeCheckpoint("mixed_checkpoint_2", 2, 15e6);
+
+    // Close epoch 0 by advancing time to the first slot of epoch 1
+    warpToL2Slot(EPOCH_DURATION);
+
+    // Record, prove, record
+    uint256 activityScoreBefore = rewardBooster.getActivityScore(alice).value;
+
+    _proveCheckpoints("mixed_checkpoint_", 1, 1, alice);
+
+    uint256 activityScoreAfter = rewardBooster.getActivityScore(alice).value;
+
+    assertEq(
+      activityScoreBefore, activityScoreAfter, "Alice's activity score changed despite not proving a whole epoch"
+    );
+  }
+
+  function testFullEpochProofUpdatesActivityScore() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+
+    // We need to mint some fee asset to the portal to cover the 30M mana spent.
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+    _proposeCheckpoint("mixed_checkpoint_2", 2, 15e6);
+
+    // Close epoch 0 by advancing time to the first slot of epoch 1
+    warpToL2Slot(EPOCH_DURATION);
+
+    uint256 activityScoreBefore = rewardBooster.getActivityScore(alice).value;
+
+    _proveCheckpoints("mixed_checkpoint_", 1, 2, alice);
+
+    uint256 activityScoreAfter = rewardBooster.getActivityScore(alice).value;
+
+    assertGt(
+      activityScoreAfter, activityScoreBefore, "Alice's activity score didn't increase despite proving a whole epoch"
+    );
+  }
+
+  function testSingleCheckpointFullEpochUpdatesActivityScore() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+
+    // We need to mint fee asset to the portal to cover the spent mana
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    // Single checkpoint that will constitute the epoch
+    _proposeCheckpoint("mixed_checkpoint_1", 1, 15e6);
+
+    // Additional checkpoint in the new epoch to move the pending tip and close the previous epoch
+    _proposeCheckpoint("mixed_checkpoint_2", EPOCH_DURATION, 15e6);
+
+    uint256 activityScoreBefore = rewardBooster.getActivityScore(alice).value;
+
+    _proveCheckpoints("mixed_checkpoint_", 1, 1, alice);
+
+    uint256 activityScoreAfter = rewardBooster.getActivityScore(alice).value;
+
+    assertGt(
+      activityScoreAfter,
+      activityScoreBefore,
+      "Alice's score didn't increase despite proving a whole epoch, though it was only 1 checkpoint"
+    );
+  }
+
+  function testOpenEpochProofDoesNotUpdateActivityScore() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+
+    // We need to mint fee asset to the portal to cover the spend mana
+    deal(address(testERC20), address(feeJuicePortal), 15e6 * 1e18);
+
+    // Go to epoch 1 immediately. Booster only updates once in an epoch and epoch 0 is chosen as default, so we will not
+    // be able to update the score without warping
+    warpToL2Slot(EPOCH_DURATION);
+
+    _proposeCheckpoint("mixed_checkpoint_1", EPOCH_DURATION, 15e6);
+
+    uint256 activityScoreBefore = rewardBooster.getActivityScore(alice).value;
+
+    // Prove without closing
+    _proveCheckpoints("mixed_checkpoint_", 1, 1, alice);
+
+    uint256 activityScoreAfter = rewardBooster.getActivityScore(alice).value;
+
+    assertEq(activityScoreBefore, activityScoreAfter, "Proving an open epoch should not increase activity score");
+  }
+
+  function testFullEpochProofUpgradesOpenEpochRegistration() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+    Epoch epoch = Epoch.wrap(1);
+
+    deal(address(testERC20), address(feeJuicePortal), 15e6 * 1e18);
+
+    // Start in epoch 1, booster can't boost in epoch 0.
+    warpToL2Slot(EPOCH_DURATION);
+    _proposeCheckpoint("mixed_checkpoint_1", EPOCH_DURATION, 15e6);
+
+    // The proof lands while epoch 1 is still running. It covers every checkpoint the epoch will have, but the
+    // contract cannot know that yet. The proverId is alice (but the actual prover could be anyone at all)
+    _proveCheckpoints("mixed_checkpoint_", 1, 1, alice);
+    assertTrue(rollup.getHasSubmitted(epoch, 1, alice), "open-epoch proof not registered");
+    assertFalse(rollup.getHasSubmittedFullEpoch(epoch, 1, alice), "open-epoch proof registered as full epoch");
+
+    // Close epoch 1 without proposing anything else in it. The proof Alice submitted is now a full proof.
+    warpToL2Slot(2 * EPOCH_DURATION);
+    uint256 activityScoreBefore = rewardBooster.getActivityScore(alice).value;
+
+    // Alice submits the proof again
+    _proveCheckpoints("mixed_checkpoint_", 1, 1, alice);
+
+    assertGt(
+      rewardBooster.getActivityScore(alice).value, activityScoreBefore, "full-finished resubmission did not bump score"
+    );
+    assertTrue(rollup.getHasSubmittedFullEpoch(epoch, 1, alice), "registration not upgraded to full epoch");
+
+    // Alice is the only registration, so she must be owed the whole pool. Counting her shares twice in summedShares
+    // would halve this.
+    uint256 pool = rollup.getCollectiveProverRewardsForEpoch(epoch);
+    assertGt(pool, 0, "empty prover pool");
+    assertEq(rollup.getSpecificProverRewardsForEpoch(epoch, alice), pool, "alice not owed the whole pool");
+
+    // The registration can be upgraded only once.
+    _proveCheckpointsFail(
+      "mixed_checkpoint_",
+      1,
+      1,
+      alice,
+      abi.encodeWithSelector(Errors.Rollup__ProverHaveAlreadySubmitted.selector, alice, epoch)
+    );
+  }
+
+  function testNonFullResubmissionOfOpenEpochProofReverts() public setUpFor("mixed_checkpoint_1") {
+    address alice = address(bytes20("alice"));
+    Epoch epoch = Epoch.wrap(1);
+
+    deal(address(testERC20), address(feeJuicePortal), 30e6 * 1e18);
+
+    warpToL2Slot(EPOCH_DURATION);
+    _proposeCheckpoint("mixed_checkpoint_1", EPOCH_DURATION, 15e6);
+    _proveCheckpoints("mixed_checkpoint_", 1, 1, alice);
+
+    // A second checkpoint lands in epoch 1, so the earlier proof does not cover the whole epoch.
+    _proposeCheckpoint("mixed_checkpoint_2", EPOCH_DURATION + 1, 15e6);
+    warpToL2Slot(2 * EPOCH_DURATION);
+
+    // Resubmitting it after the epoch closed would re-read alice's shares at the decayed score, so it must revert.
+    _proveCheckpointsFail(
+      "mixed_checkpoint_",
+      1,
+      1,
+      alice,
+      abi.encodeWithSelector(Errors.Rollup__ProverHaveAlreadySubmitted.selector, alice, epoch)
+    );
+    assertFalse(rollup.getHasSubmittedFullEpoch(epoch, 1, alice), "partial registration marked full epoch");
+  }
+}

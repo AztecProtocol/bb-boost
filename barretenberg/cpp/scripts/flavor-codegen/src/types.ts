@@ -1,0 +1,59 @@
+export type EntityName = string;
+
+// "masking" entities are counted separately from witness in NUM_*_ENTITIES.
+export type EntityKind = "precomputed" | "witness" | "masking";
+
+export interface EntityDecl {
+    name: EntityName;
+    kind: EntityKind;
+}
+
+// Named subsets emitted as `get_<name>()` views on AllEntities and the transport classes.
+// Unioned across relations; if two relations declare the same subset, members are concatenated
+// in declaration order.
+export type SubsetMap = Readonly<Record<string, readonly EntityName[]>>;
+
+export interface Relation {
+    // Stable identity (survives module re-evaluation); keyed by capability-bool emission.
+    readonly id: string;
+    readonly cppName: string;
+    readonly header: string;
+    readonly entities: readonly EntityDecl[];
+    readonly shiftedEntities: readonly EntityName[];
+    // Each member must appear in `entities` (validated at flavor-resolution time).
+    readonly subsets: SubsetMap;
+    // Extra C++ template args after `<FF, ...>` when emitting into `Relations_<FF>`, e.g.
+    // `["EntityId::kernel_calldata", ...]` for a `SingleBusLookupRelation` instantiation.
+    readonly cppExtraTemplateArgs: readonly string[];
+    // Structural relations contribute entities to the layout but are skipped when emitting the
+    // `Relations_<FF>` tuple. Used for relations that own columns but have no algebraic
+    // constraint (e.g. MaskingRelation).
+    readonly structural: boolean;
+    // Name of the builder-side TraceBlock member holding this relation's gate selector
+    // polynomial (e.g. ArithmeticRelation → "arithmetic"). Aggregated per flavor into
+    // `get_gate_blocks()`.
+    readonly gateBlockName?: string;
+    // Selectors consumed here but declared by another relation to preserve entity ordering.
+    readonly requiredNonGateSelectors: readonly EntityName[];
+}
+
+// Layout is derived: kind-bucketed (masking → precomputed → witness) per-relation walk; subsets
+// first, then leftover entities. First mention wins on dedupe. Reorder at the relation/subset
+// level — there is no per-flavor layout override.
+export interface Flavor {
+    readonly name: string;
+    readonly family: string;
+    // C++ class name; defaults to a title-cased family (e.g. "ultra_zk" → "UltraZKFlavor_Generated").
+    readonly generatedClassName: string;
+    // C++ circuit-builder alias for this flavor's arithmetization, e.g. "MegaKernelCircuitBuilder".
+    readonly builderName: string;
+    readonly relations: readonly Relation[];
+    // Subset name → list of existing subsets whose entries are concatenated. Example:
+    // `selectors: ["non_gate_selectors", "gate_selectors"]`.
+    readonly composites: Readonly<Record<string, readonly string[]>>;
+    // Arithmetization this flavor builds on: "mega" or "ultra". Selects the execution-trace wrapper
+    // (`MegaExecutionTraceBlocks_` / `UltraExecutionTraceBlocks_`) that the emitted trace type uses.
+    // The blocks themselves are derived per flavor from its own relations, so a flavor that drops a
+    // relation gets a trace without the corresponding block.
+    readonly arithmetization: string;
+}
