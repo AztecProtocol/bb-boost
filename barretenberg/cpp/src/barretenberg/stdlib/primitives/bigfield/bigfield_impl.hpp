@@ -24,22 +24,22 @@ namespace bb::stdlib {
 template <typename Builder, typename T>
 bigfield<Builder, T>::bigfield(Builder* parent_context)
     : context(parent_context)
-    , binary_basis_limbs{ Limb(field_t<Builder>(parent_context, bb::fr(0))),
-                          Limb(field_t<Builder>(parent_context, bb::fr(0))),
-                          Limb(field_t<Builder>(parent_context, bb::fr(0))),
-                          Limb(field_t<Builder>(parent_context, bb::fr(0))) }
-    , prime_basis_limb(context, 0)
-{}
+    , prime_basis_limb(parent_context)
+{
+    // Default limbs are constant zeros with maximum value 0. bb::fr(0) is the all-zero representation, so this equals
+    // building each limb from field_t(parent_context, bb::fr(0)) without the Montgomery conversions.
+    for (auto& limb : binary_basis_limbs) {
+        limb.element.context = parent_context;
+    }
+}
 
 template <typename Builder, typename T>
 bigfield<Builder, T>::bigfield(Builder* parent_context, const uint256_t& value)
     : context(parent_context)
-    , binary_basis_limbs{ Limb(field_t<Builder>(parent_context, bb::fr(value.slice(0, NUM_LIMB_BITS)))),
-                          Limb(field_t<Builder>(parent_context, bb::fr(value.slice(NUM_LIMB_BITS, NUM_LIMB_BITS * 2)))),
-                          Limb(field_t<Builder>(parent_context,
-                                                bb::fr(value.slice(NUM_LIMB_BITS * 2, NUM_LIMB_BITS * 3)))),
-                          Limb(field_t<Builder>(parent_context,
-                                                bb::fr(value.slice(NUM_LIMB_BITS * 3, NUM_LIMB_BITS * 4)))) }
+    , binary_basis_limbs{ Limb::from_constant(parent_context, value.slice(0, NUM_LIMB_BITS)),
+                          Limb::from_constant(parent_context, value.slice(NUM_LIMB_BITS, NUM_LIMB_BITS * 2)),
+                          Limb::from_constant(parent_context, value.slice(NUM_LIMB_BITS * 2, NUM_LIMB_BITS * 3)),
+                          Limb::from_constant(parent_context, value.slice(NUM_LIMB_BITS * 3, NUM_LIMB_BITS * 4)) }
     , prime_basis_limb(context, value)
 {
     BB_ASSERT_LT(value, modulus);
@@ -775,7 +775,8 @@ bigfield<Builder, T> bigfield<Builder, T>::sum(const std::vector<bigfield>& term
 template <typename Builder, typename T>
 bigfield<Builder, T> bigfield<Builder, T>::internal_div(const std::vector<bigfield>& numerators,
                                                         const bigfield& denominator,
-                                                        bool check_for_zero)
+                                                        bool check_for_zero,
+                                                        NativeDivisionCache* cache)
 {
     BB_ASSERT_LT(numerators.size(), MAXIMUM_SUMMAND_COUNT);
     if (numerators.empty()) {
@@ -813,11 +814,22 @@ bigfield<Builder, T> bigfield<Builder, T>::internal_div(const std::vector<bigfie
     if (denominator_reduced != 0) {
         using NativeField = bb::field<T>;
         const NativeField numerator_native(uint256_t((left % modulus).lo.lo));
-        inverse_value = uint512_t(uint256_t(numerator_native * NativeField(denominator_reduced).invert()));
+        NativeField denominator_inverse;
+        if (cache != nullptr && cache->valid_ && cache->denominator_ == denominator_reduced) {
+            denominator_inverse = cache->inverse_;
+        } else {
+            denominator_inverse = NativeField(denominator_reduced).invert();
+            if (cache != nullptr) {
+                cache->denominator_ = denominator_reduced;
+                cache->inverse_ = denominator_inverse;
+                cache->valid_ = true;
+            }
+        }
+        inverse_value = uint512_t(uint256_t(numerator_native * denominator_inverse));
     }
 
-    const uint1024_t quotient_1024 =
-        (uint1024_t(inverse_value) * right + unreduced_zero().get_value() - left) / modulus;
+    static const uint512_t unreduced_zero_value = unreduced_zero().get_value();
+    const uint1024_t quotient_1024 = (uint1024_t(inverse_value) * right + unreduced_zero_value - left) / modulus;
     const uint512_t quotient_value = quotient_1024.lo;
 
     bigfield inverse;
@@ -847,7 +859,7 @@ bigfield<Builder, T> bigfield<Builder, T>::internal_div(const std::vector<bigfie
         if (reduction_required) {
 
             denominator.self_reduce();
-            return internal_div(numerators, denominator, check_for_zero);
+            return internal_div(numerators, denominator, check_for_zero, cache);
         }
         // We do this after the quotient check, since this creates gates and we don't want to do this twice
         if (check_for_zero) {
@@ -874,6 +886,14 @@ bigfield<Builder, T> bigfield<Builder, T>::div_without_denominator_check(const s
                                                                          const bigfield& denominator)
 {
     return internal_div(numerators, denominator, false);
+}
+
+template <typename Builder, typename T>
+bigfield<Builder, T> bigfield<Builder, T>::div_without_denominator_check(const std::vector<bigfield>& numerators,
+                                                                         const bigfield& denominator,
+                                                                         NativeDivisionCache& cache)
+{
+    return internal_div(numerators, denominator, false, &cache);
 }
 
 template <typename Builder, typename T>
@@ -1070,14 +1090,11 @@ bigfield<Builder, T> bigfield<Builder, T>::madd(const bigfield& to_mul, const st
     const uint1024_t add_right(add_values);
     const uint1024_t modulus(target_basis.modulus);
 
-    const auto [quotient_1024, remainder_1024] = (left * mul_right + add_right).divmod(modulus);
-
-    const uint512_t quotient_value = quotient_1024.lo;
-    const uint512_t remainder_value = remainder_1024.lo;
-
     bigfield remainder;
     bigfield quotient;
     if (is_constant() && to_mul.is_constant() && add_constant) {
+        const auto [_, remainder_1024] = (left * mul_right + add_right).divmod(modulus);
+        const uint512_t remainder_value = remainder_1024.lo;
         remainder = bigfield(ctx, uint256_t(remainder_value.lo));
         return remainder;
     } else if (is_constant() && to_mul.is_constant()) {
@@ -1096,6 +1113,10 @@ bigfield<Builder, T> bigfield<Builder, T>::madd(const bigfield& to_mul, const st
             }
             return (*this).madd(to_mul, to_add);
         }
+        // Only compute the quotient and remainder after ruling out paths that do not consume them.
+        const auto [quotient_1024, remainder_1024] = (left * mul_right + add_right).divmod(modulus);
+        const uint512_t quotient_value = quotient_1024.lo;
+        const uint512_t remainder_value = remainder_1024.lo;
         quotient = create_from_u512_as_witness(ctx, quotient_value, false, num_quotient_bits);
         remainder = create_from_u512_as_witness(ctx, remainder_value);
     };

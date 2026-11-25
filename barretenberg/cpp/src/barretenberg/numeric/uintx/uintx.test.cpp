@@ -371,6 +371,12 @@ TEST(uintx, Bn254ReciprocalDivisionBoundaries)
         check(value >> (1024 - 576));
         check(value >> (1024 - 544));
         check(value >> 512);
+        check(value >> 516); // Fully exercise the native x < 2^508 path.
+        check(value >> 520);
+        const auto narrow_multiple = (value >> 770) * modulus;
+        check(narrow_multiple - 1);
+        check(narrow_multiple);
+        check(narrow_multiple + 1);
         const auto quotient = value >> 704;
         const auto multiple = quotient * modulus;
         check(multiple - 1);

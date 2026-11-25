@@ -11,6 +11,7 @@
 #include "barretenberg/common/mem.hpp"
 #include "barretenberg/common/ref_array.hpp"
 #include "barretenberg/common/ref_vector.hpp"
+#include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/common/serialize.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include <algorithm>
@@ -201,8 +202,35 @@ template <typename Tile, size_t ChunkShift = 8> class TileChunks {
 
     void reserve(size_t num_tiles) { chunks_.reserve((num_tiles + CHUNK_MASK) >> CHUNK_SHIFT); }
 
+    /**
+     * @brief Grows the store to `num_tiles` tiles, allocating chunks as `emplace_back` would. Chunks are
+     * zero-initialized when allocated, so the new tiles read as empty until the caller writes them.
+     */
+    void grow_for_overwrite(size_t num_tiles)
+    {
+        while (capacity() < num_tiles) {
+            chunks_.push_back(std::make_unique<Chunk>());
+        }
+        size_ = std::max(size_, num_tiles);
+    }
+
     size_t size() const { return size_; }
     size_t capacity() const { return chunks_.size() * CHUNK_TILES; }
+
+    /**
+     * @brief Adds every chunk to `blocks` (a PageBlockList or BatchedPageRelease), so the pages of the tiles can be
+     * released just before the store is freed.
+     * @details Chunks under the release floor are skipped by `blocks.add`.
+     */
+    template <typename Blocks> void add_chunks_to(Blocks& blocks) const noexcept
+    {
+        // Tiles fill the chunks in order, so the tiles in use in a chunk are a prefix of it.
+        for (size_t c = 0; c < chunks_.size(); ++c) {
+            const size_t first_tile = c * CHUNK_TILES;
+            const size_t used_tiles = std::min(size_ - std::min(size_, first_tile), CHUNK_TILES);
+            blocks.add(chunks_[c].get(), sizeof(Chunk), sizeof(Tile) * used_tiles);
+        }
+    }
 
     void clear()
     {
@@ -753,6 +781,98 @@ template <typename FF> class ExecutionTraceBlockStorage {
     void reserve(size_t num_rows) { tiles.reserve((num_rows + GATE_TILE_SIZE - 1) >> GATE_TILE_SHIFT); }
 
     /**
+     * @brief Adds `count` rows, to be filled by copy_translated_rows before the block is read, and returns the index of
+     * the first.
+     */
+    size_t grow_rows_for_overwrite(size_t count)
+    {
+        const size_t first = num_rows_;
+        const size_t end = first + count;
+        const size_t num_tiles = (end + GATE_TILE_SIZE - 1) >> GATE_TILE_SHIFT;
+        if (num_tiles > tiles.size()) {
+            // New tiles are zero, so slots past the last row read as zero, as they do after appends.
+            tiles.grow_for_overwrite(num_tiles);
+        }
+        for (size_t i = 0; i < count; ++i) {
+#ifdef CHECK_CIRCUIT_STACKTRACES
+            this->stack_traces.populate();
+#endif
+            this->tracy_gate();
+        }
+        num_rows_ = end;
+        return first;
+    }
+
+    /** @brief Per value table (the non-gate selectors', then the gate values'): this block's id of each source id. */
+    using ValueIdMaps = std::array<std::vector<uint32_t>, NUM_NON_GATE_SELECTORS + 1>;
+
+    /**
+     * @brief Interns every value of `source`'s value tables here and returns the id translation copy_translated_rows
+     * needs. Not thread-safe (it may add values to this block's tables): call it before any concurrent copy.
+     */
+    ValueIdMaps intern_values_of(const ExecutionTraceBlockStorage& source)
+    {
+        ValueIdMaps maps;
+        for (size_t t = 0; t < maps.size(); ++t) {
+            const Table& from = source.value_tables_[t];
+            maps[t].resize(from.size());
+            for (uint32_t id = 0; id < from.size(); ++id) {
+                maps[t][id] = value_tables_[t].intern(from[id]);
+            }
+        }
+        return maps;
+    }
+
+    /**
+     * @brief Fills rows [row, row + count), added by grow_rows_for_overwrite, with rows [source_row, source_row +
+     * count) of `source`, every wire w replaced by wire_map[w] and every selector value id translated by `value_ids`
+     * (from intern_values_of(source)), so each row holds the same selector values as in `source`.
+     * @details `source` must own the same gate kinds, so that every copied gate kind is owned here. Calls on disjoint
+     * row ranges may run concurrently.
+     */
+    void copy_translated_rows(const ExecutionTraceBlockStorage& source,
+                              const size_t source_row,
+                              const size_t row,
+                              const size_t count,
+                              const uint32_t* wire_map,
+                              const ValueIdMaps& value_ids)
+    {
+        BB_ASSERT(owns_same_gate_kinds(source), "copy_translated_rows: source owns other gate kinds");
+        BB_ASSERT_LTE(source_row + count, source.num_rows_);
+        BB_ASSERT_LTE(row + count, num_rows_);
+        size_t i = 0;
+        while (i < count) {
+            const size_t from_row = source_row + i;
+            const size_t to_row = row + i;
+            const size_t from_slot = from_row & GATE_TILE_MASK;
+            const size_t to_slot = to_row & GATE_TILE_MASK;
+            // The longest run of rows that stays inside one tile on both sides.
+            const size_t len = std::min({ count - i, GATE_TILE_SIZE - from_slot, GATE_TILE_SIZE - to_slot });
+            const Tile& from = source.tiles[from_row >> GATE_TILE_SHIFT];
+            Tile& to = tiles[to_row >> GATE_TILE_SHIFT];
+            for (size_t w = 0; w < NUM_WIRES; ++w) {
+                const uint32_t* from_wires = from.wires[w].data() + from_slot;
+                uint32_t* to_wires = to.wires[w].data() + to_slot;
+                for (size_t k = 0; k < len; ++k) {
+                    to_wires[k] = wire_map[from_wires[k]];
+                }
+            }
+            for (size_t c = 0; c < NUM_NON_GATE_SELECTORS; ++c) {
+                const auto field = NON_GATE_SELECTORS<FF, NUM_WIRES>[c].tile_field;
+                const std::vector<uint32_t>& ids = value_ids[c];
+                for (size_t k = 0; k < len; ++k) {
+                    (to.*field)[to_slot + k] = ids[(from.*field)[from_slot + k]];
+                }
+            }
+            for (size_t k = 0; k < len; ++k) {
+                to.gate_value[to_slot + k] = value_ids.back()[from.gate_value[from_slot + k]];
+            }
+            std::copy_n(from.gate_kind.data() + from_slot, len, to.gate_kind.data() + to_slot);
+            i += len;
+        }
+    }
+
+    /**
      * @brief Reference to this block's selector view for `kind`; aborts if the block does not own it.
      * For cross-block reads, use `read_gate_selector` instead.
      */
@@ -822,9 +942,11 @@ template <typename FF> class ExecutionTraceBlockStorage {
     // Accessor indices follow NON_GATE_SELECTORS table order.
     SelectorColumn<FF, NUM_WIRES>& q_m() { return columns_[0]; };
     SelectorColumn<FF, NUM_WIRES>& q_c() { return columns_[1]; };
+    const SelectorColumn<FF, NUM_WIRES>& q_c() const { return columns_[1]; };
     SelectorColumn<FF, NUM_WIRES>& q_1() { return columns_[2]; };
     SelectorColumn<FF, NUM_WIRES>& q_2() { return columns_[3]; };
     SelectorColumn<FF, NUM_WIRES>& q_3() { return columns_[4]; };
+    const SelectorColumn<FF, NUM_WIRES>& q_3() const { return columns_[4]; };
     SelectorColumn<FF, NUM_WIRES>& q_4() { return columns_[5]; };
     SelectorColumn<FF, NUM_WIRES>& q_5() { return columns_[6]; };
 
@@ -862,6 +984,12 @@ template <typename FF> class ExecutionTraceBlockStorage {
         for (const auto& col : other.gate_columns_) {
             gate_columns_.emplace_back(&tiles, &num_rows_, col.kind(), &gate_value_table());
         }
+    }
+
+    bool owns_same_gate_kinds(const ExecutionTraceBlockStorage& other) const
+    {
+        return std::ranges::equal(
+            gate_columns_, other.gate_columns_, [](const auto& a, const auto& b) { return a.kind() == b.kind(); });
     }
 
     Tile& tile_for_append()

@@ -192,16 +192,13 @@ template <typename Curve> class GeminiProver_ {
                 batch(batched_to_be_shifted_by_one, to_be_shifted_by_one);
             }
 
-            // A₀[i] = F[i] + G[i + 1], written in one pass; coefficients from actual_data_size_ on are zero
-            Polynomial full_batched(full_batched_size, Polynomial::DontZeroMemory::FLAG);
+            // A₀[i] = F[i] + G[i + 1], written in one pass. Coefficients from actual_data_size_ on are zero and stay
+            // virtual, so the folds and their commitments cover only the data extent.
+            Polynomial full_batched(actual_data_size_, full_batched_size, Polynomial::DontZeroMemory::FLAG);
             parallel_for_heuristic(
-                full_batched_size,
+                actual_data_size_,
                 [&](size_t start, size_t end, BB_UNUSED size_t chunk_index) {
                     for (size_t i = start; i < end; ++i) {
-                        if (i >= actual_data_size_) {
-                            full_batched.at(i) = Fr::zero();
-                            continue;
-                        }
                         const Fr f = with_unshifted ? batched_unshifted[i] : Fr::zero();
                         const bool shifted_in_range = with_shifted && (i + 1 < actual_data_size_);
                         full_batched.at(i) = shifted_in_range ? f + batched_to_be_shifted_by_one[i + 1] : f;

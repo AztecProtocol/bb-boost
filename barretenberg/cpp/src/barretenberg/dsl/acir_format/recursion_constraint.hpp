@@ -108,6 +108,15 @@ struct RecursionConstraint {
 // A group of recursion constraints of one proof type, paired with their original ACIR opcode indices.
 using RecursionConstraintData = std::pair<std::vector<RecursionConstraint>, std::vector<size_t>>;
 
+class RecursionSplicer;
+
+/**
+ * @brief Add one Honk recursion constraint (proof type HONK, HONK_ZK, ROLLUP_HONK or ROOT_ROLLUP_HONK) to an Ultra
+ * builder.
+ */
+HonkRecursionConstraintOutput<UltraCircuitBuilder> create_ultra_honk_recursion_constraint(
+    UltraCircuitBuilder& builder, const RecursionConstraint& constraint);
+
 /**
  * @brief Single entrypoint to process recursion constraints
  *
@@ -134,6 +143,7 @@ using RecursionConstraintData = std::pair<std::vector<RecursionConstraint>, std:
  * @param avm_recursion_data pair of (AvmRecursionConstraints, AvmRecursionConstraintsOriginalOpcodeIndices)
  * @param hn_recursion_data pair of (HypernovaRecursionConstraints, HypernovaRecursionConstraintsOriginalOpcodeIndices)
  * @param chonk_recursion_data pair of (ChonkRecursionConstraints, ChonkRecursionConstraintsOriginalOpcodeIndices)
+ * @param splicer Scratch builds of the leading Honk recursion constraints, if any were launched (Ultra only)
  */
 template <typename Builder>
 [[nodiscard("pairing points and IPA claim must be accumulated")]] HonkRecursionConstraintsOutput<Builder>
@@ -144,7 +154,8 @@ create_recursion_constraints(Builder& builder,
                              const RecursionConstraintData& honk_recursion_data,
                              const RecursionConstraintData& avm_recursion_data,
                              const RecursionConstraintData& hn_recursion_data,
-                             const RecursionConstraintData& chonk_recursion_data);
+                             const RecursionConstraintData& chonk_recursion_data,
+                             RecursionSplicer* splicer = nullptr);
 
 /**
  * @brief Process HyperNova recursion constraints and complete kernel logic

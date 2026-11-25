@@ -6,6 +6,8 @@
 
 #include "trace_to_polynomials.hpp"
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/release_pages.hpp"
+#include "barretenberg/common/scratch_array.hpp"
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/constants.hpp"
 #include "barretenberg/ext/starknet/flavor/ultra_starknet_flavor.hpp"
@@ -19,6 +21,7 @@
 #include "barretenberg/flavor/ultra_keccak_flavor.hpp"
 #include "barretenberg/flavor/ultra_keccak_zk_flavor.hpp"
 #include "barretenberg/flavor/ultra_zk_flavor.hpp"
+#include <algorithm>
 #include <atomic>
 
 namespace bb {
@@ -72,23 +75,39 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
     // selector, sourced from the unique block that owns the matching `GateKind`.
     {
         BB_BENCH_NAME("populate_selectors");
+        // One task per row chunk of a (block, selector) pair: the blocks differ greatly in size, and with one task
+        // per pair the few pairs of the largest blocks would run alone after every other task has finished.
+        constexpr uint32_t SELECTOR_ROWS_PER_TASK = 1 << 15;
         struct SelectorTask {
             Selector<FF>* source;
             size_t target_poly_idx;
             uint32_t trace_offset;
-            uint32_t block_size;
+            uint32_t row_begin;
+            uint32_t row_end;
         };
 
         const auto& polynomials_ref = polynomials;
         const size_t num_non_gate = polynomials_ref.get_non_gate_selectors().size();
 
         std::vector<SelectorTask> selector_tasks;
+        const auto add_selector_tasks = [&](Selector<FF>* source,
+                                            size_t target_poly_idx,
+                                            uint32_t trace_offset,
+                                            uint32_t block_size) {
+            for (uint32_t row_begin = 0; row_begin < block_size; row_begin += SELECTOR_ROWS_PER_TASK) {
+                selector_tasks.emplace_back(SelectorTask{ source,
+                                                          target_poly_idx,
+                                                          trace_offset,
+                                                          row_begin,
+                                                          std::min(row_begin + SELECTOR_ROWS_PER_TASK, block_size) });
+            }
+        };
         for (auto& block : blocks_array) {
             const uint32_t offset = block.trace_offset();
             const uint32_t block_size = static_cast<uint32_t>(block.size());
             auto non_gate = Flavor::Generated::get_block_non_gate_selectors(block);
             for (size_t i = 0; i < non_gate.size(); ++i) {
-                selector_tasks.emplace_back(SelectorTask{ &non_gate[i], i, offset, block_size });
+                add_selector_tasks(&non_gate[i], i, offset, block_size);
             }
         }
 
@@ -96,10 +115,10 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
         constexpr auto& gate_kinds = Flavor::Generated::GATE_KINDS;
         for (size_t i = 0; i < gate_kinds.size(); ++i) {
             auto& block = gate_blocks[i];
-            selector_tasks.emplace_back(SelectorTask{ &block.gate_selector_for(gate_kinds[i]),
-                                                      num_non_gate + i,
-                                                      block.trace_offset(),
-                                                      static_cast<uint32_t>(block.size()) });
+            add_selector_tasks(&block.gate_selector_for(gate_kinds[i]),
+                               num_non_gate + i,
+                               block.trace_offset(),
+                               static_cast<uint32_t>(block.size()));
         }
 
         parallel_for(selector_tasks.size(), [&](size_t task_idx) {
@@ -109,8 +128,8 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
             // Bulk-copy the range that lands inside the polynomial's backing store (tile-wise, no
             // per-element virtual call); rows clamped off by the store bounds would previously have
             // been dropped by set_if_valid_index and must be zero.
-            const size_t dst_begin = std::max<size_t>(task.trace_offset, poly.start_index());
-            const size_t dst_end = std::min<size_t>(task.trace_offset + task.block_size, poly.end_index());
+            const size_t dst_begin = std::max<size_t>(task.trace_offset + task.row_begin, poly.start_index());
+            const size_t dst_end = std::min<size_t>(task.trace_offset + task.row_end, poly.end_index());
             if (dst_begin < dst_end) {
                 source.copy_into(&poly.at(dst_begin), dst_begin - task.trace_offset, dst_end - dst_begin);
             }
@@ -124,8 +143,8 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
     for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         cell_offsets[block_idx + 1] = cell_offsets[block_idx] + blocks_array[block_idx].size() * NUM_WIRES;
     }
-    // The real variable index of every wire cell.
-    std::vector<uint32_t> cell_real_var_idx(cell_offsets[num_blocks]);
+    // The real variable index of every wire cell; phase 2 writes every cell.
+    ScratchArray<uint32_t> cell_real_var_idx(cell_offsets[num_blocks]);
 
     // Phase 2: populate the wires and record each cell's real variable index, in parallel over row chunks of all
     // blocks (the blocks differ greatly in size). With CopiedCircuitData::RELEASE, the task that finishes a block's
@@ -172,51 +191,78 @@ CopyCycles TraceToPolynomials<Flavor>::populate_wires_and_selectors_and_compute_
             }
             if (copied_circuit_data == CopiedCircuitData::RELEASE &&
                 chunks_left[task.block_idx].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                if constexpr (IsUltraHonk<Flavor>) {
+                    // Freeing a large tile chunk unmaps its pages serially on this worker; hand them back from several
+                    // threads first, as the builder's destructor does. A store has far fewer than 64 chunks.
+                    PageBlockList<64> released;
+                    block.tiles.add_chunks_to(released);
+                    released.release();
+                }
                 block.free_data();
             }
         });
     }
 
-    // Phases 2.5 and 2.6 split the variables into one contiguous range per thread. Each thread scans all cells in
-    // order and handles only its own variables, so every copy cycle is counted and filled by one thread, in cell order.
+    // Phases 2.5 and 2.6 split the variables into one contiguous range per scan task. Each task scans all cells in
+    // order and handles only its own variables, so every copy cycle is counted and filled by one task, in cell order.
+    // Every task reads every cell in each phase, so beyond a few tasks more of them only add memory traffic.
+    constexpr size_t MAX_COPY_CYCLE_SCAN_TASKS = 16;
+    const size_t num_scan_tasks = std::clamp<size_t>(get_num_cpus(), 1, MAX_COPY_CYCLE_SCAN_TASKS);
+    const auto scan_task_vars = [&](size_t task_idx) {
+        return ThreadChunk{ .thread_index = task_idx, .total_threads = num_scan_tasks }.range(num_cycles);
+    };
+    // task_node_begin[t] is the first node of task t's variables in the CSR node array.
+    std::vector<uint32_t> task_node_begin(num_scan_tasks + 1, 0);
     {
         BB_BENCH_NAME("counting copy_cycles");
-        // Count copy-cycle sizes per real variable, then take the exclusive prefix sum to get the CSR offsets; a
-        // single flat node array replaces one heap-allocated vector per variable.
-        copy_cycles.offsets.assign(num_cycles + 1, 0);
-        parallel_for([&](const ThreadChunk& chunk) {
-            const auto vars = chunk.range(num_cycles);
+        // Count copy-cycle sizes per real variable; phase 2.6 turns them into CSR offsets. A single flat node array
+        // replaces one heap-allocated vector per variable.
+        copy_cycles.offsets = ScratchArray<uint32_t>(num_cycles + 1);
+        parallel_for(num_scan_tasks, [&](size_t task_idx) {
+            const auto vars = scan_task_vars(task_idx);
             if (vars.empty()) {
                 return;
             }
             const uint32_t var_begin = static_cast<uint32_t>(vars.front());
             const uint32_t num_vars = static_cast<uint32_t>(vars.size());
-            for (const uint32_t real_var_idx : cell_real_var_idx) {
+            uint32_t* counts = &copy_cycles.offsets[var_begin];
+            std::fill_n(counts, num_vars, 0U);
+            for (const uint32_t real_var_idx : cell_real_var_idx.span()) {
                 if (real_var_idx - var_begin < num_vars) {
-                    ++copy_cycles.offsets[real_var_idx];
+                    ++counts[real_var_idx - var_begin];
                 }
             }
+            uint32_t task_nodes = 0;
+            for (uint32_t i = 0; i < num_vars; ++i) {
+                task_nodes += counts[i];
+            }
+            task_node_begin[task_idx + 1] = task_nodes;
         });
-        uint32_t running = 0;
-        for (size_t i = 0; i < num_cycles; ++i) {
-            const uint32_t count = copy_cycles.offsets[i];
-            copy_cycles.offsets[i] = running;
-            running += count;
+        for (size_t task_idx = 0; task_idx < num_scan_tasks; ++task_idx) {
+            task_node_begin[task_idx + 1] += task_node_begin[task_idx];
         }
-        copy_cycles.offsets[num_cycles] = running;
-        copy_cycles.nodes.resize(running);
+        copy_cycles.offsets[num_cycles] = task_node_begin[num_scan_tasks];
+        copy_cycles.nodes = ScratchArray<cycle_node>(task_node_begin[num_scan_tasks]);
     }
 
     {
         BB_BENCH_NAME("fill_copy_cycles");
-        std::vector<uint32_t> cursors(copy_cycles.offsets.begin(), copy_cycles.offsets.end() - 1);
-        parallel_for([&](const ThreadChunk& chunk) {
-            const auto vars = chunk.range(num_cycles);
+        ScratchArray<uint32_t> cursors(num_cycles);
+        parallel_for(num_scan_tasks, [&](size_t task_idx) {
+            const auto vars = scan_task_vars(task_idx);
             if (vars.empty()) {
                 return;
             }
             const uint32_t var_begin = static_cast<uint32_t>(vars.front());
             const uint32_t num_vars = static_cast<uint32_t>(vars.size());
+            // Exclusive prefix sum of this task's counts, starting at the task's first node.
+            uint32_t running = task_node_begin[task_idx];
+            for (uint32_t var = var_begin; var < var_begin + num_vars; ++var) {
+                const uint32_t count = copy_cycles.offsets[var];
+                copy_cycles.offsets[var] = running;
+                cursors[var] = running;
+                running += count;
+            }
             for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
                 const uint32_t offset = blocks_array[block_idx].trace_offset();
                 const uint32_t block_size = static_cast<uint32_t>(blocks_array[block_idx].size());

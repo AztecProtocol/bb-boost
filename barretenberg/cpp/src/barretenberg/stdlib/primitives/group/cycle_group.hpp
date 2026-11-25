@@ -228,6 +228,7 @@ template <typename Builder> class cycle_group {
     // Allow straus_lookup_table and straus_plookup_table to access the private constructor for efficiency
     friend class ::bb::stdlib::straus_lookup_table<Builder>;
     friend class ::bb::stdlib::straus_plookup_table<Builder>;
+    template <typename> friend struct ::bb::stdlib::BuilderBindingWalk;
 
     // Private constructor that allows explicit control over infinity flag.
     // Use public constructors or factory methods instead - they auto-detect infinity from coordinates.

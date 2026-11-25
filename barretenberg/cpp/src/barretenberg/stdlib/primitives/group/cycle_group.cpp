@@ -12,6 +12,7 @@
 #include "barretenberg/ecc/curves/grumpkin/grumpkin.hpp"
 
 #include "./cycle_group.hpp"
+#include "./straus_native_hints.hpp"
 #include "barretenberg/numeric/general/general.hpp"
 #include "barretenberg/stdlib/primitives/circuit_builders/circuit_builders_fwd.hpp"
 #include "barretenberg/stdlib/primitives/plookup/plookup.hpp"
@@ -794,6 +795,13 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
             native_straus_tables.emplace_back(std::move(table));
         }
 
+        // Every round adds the same offset generators, so the offset generator accumulator adds their sum once per
+        // round.
+        Element offset_generator_sum = Group::point_at_infinity;
+        for (size_t j = 0; j < num_points; ++j) {
+            offset_generator_sum += offset_generators[j + 1];
+        }
+
         // Perform the Straus algorithm natively to generate the witness values (hints) for all intermediate points
         Element accumulator = offset_generators[0];
         for (size_t i = 0; i < num_rounds; ++i) {
@@ -811,10 +819,10 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
                 const Element point = native_straus_tables[j][slice_value];
                 accumulator += point;
 
-                // Populate hint and update offset generator accumulator
+                // Populate hint
                 operation_transcript.push_back(accumulator);
-                offset_generator_accumulator += Element(offset_generators[j + 1]);
             }
+            offset_generator_accumulator += offset_generator_sum;
         }
     }
 
@@ -1049,40 +1057,34 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
         point_tables.emplace_back(context, std::move(precomputed_tables[i]));
     }
 
-    // Compute all intermediate points natively for use as hints in the in-circuit Straus algorithm.
-    // Using projective coordinates + batch normalize to avoid per-operation modular inversions.
-    // The per-point lookup tables (point_tables) already hold the precomputed affine entries; we reuse
-    // them directly rather than rebuilding projective copies.
-    std::vector<Element> operation_transcript;
-    Element offset_generator_accumulator = offset_generators[0];
-    {
-        // Perform Straus algorithm natively
-        Element accumulator = offset_generators[0];
-        for (size_t i = 0; i < num_rounds; ++i) {
-            if (i != 0) {
-                for (size_t j = 0; j < table_bits; ++j) {
-                    accumulator = accumulator.dbl();
-                    operation_transcript.push_back(accumulator);
-                    offset_generator_accumulator = offset_generator_accumulator.dbl();
-                }
-            }
-            for (size_t j = 0; j < num_points; ++j) {
-                auto slice_value = static_cast<size_t>(scalar_slices[j].slices_native[num_rounds - i - 1]);
-                const Element point(point_tables[j].get_native_table()[slice_value]);
-                accumulator += point;
-                operation_transcript.push_back(accumulator);
-                offset_generator_accumulator += Element(offset_generators[j + 1]);
-            }
-        }
+    // Compute all intermediate points natively for use as hints in the in-circuit Straus algorithm, in projective
+    // coordinates to avoid per-operation inversions. The accumulator adds the tables' affine entries with mixed
+    // additions.
+    std::vector<const AffineElement*> native_tables(num_points);
+    std::vector<const uint64_t*> native_slices(num_points);
+    for (size_t j = 0; j < num_points; ++j) {
+        native_tables[j] = point_tables[j].get_native_table().data();
+        native_slices[j] = scalar_slices[j].slices_native.data();
     }
+    StrausNativeHints native_hints = compute_straus_hints({ .offset_generators = offset_generators,
+                                                            .tables = native_tables,
+                                                            .slices = native_slices,
+                                                            .num_rounds = num_rounds,
+                                                            .table_bits = table_bits });
+    Element* operation_transcript = native_hints.operation_transcript.get();
 
-    // Batch-normalize all hint points
-    Element::batch_normalize(operation_transcript.data(), operation_transcript.size());
-    std::vector<AffineElement> operation_hints;
-    operation_hints.reserve(operation_transcript.size());
-    for (const Element& element : operation_transcript) {
-        operation_hints.emplace_back(element.x, element.y);
-    }
+    // Normalize the hint points in chunks, one batched inversion per chunk. Affine coordinates are unique, so the
+    // hint values do not depend on where the chunks start.
+    std::vector<AffineElement> operation_hints(native_hints.transcript_size);
+    parallel_for_heuristic(
+        native_hints.transcript_size,
+        [&](size_t start, size_t end, size_t /*chunk_index*/) {
+            Element::batch_normalize(operation_transcript + start, end - start);
+            for (size_t k = start; k < end; ++k) {
+                operation_hints[k] = AffineElement(operation_transcript[k].x, operation_transcript[k].y);
+            }
+        },
+        /*heuristic_cost=*/7 * thread_heuristics::FF_MULTIPLICATION_COST);
 
     // Execute Straus algorithm in-circuit using plookup reads and precomputed hints
     AffineElement* hint_ptr = operation_hints.data();
@@ -1105,7 +1107,7 @@ typename cycle_group<Builder>::batch_mul_internal_output cycle_group<Builder>::_
     }
 
     accumulator.set_origin_tag(OriginTag::constant());
-    return { accumulator, AffineElement(offset_generator_accumulator) };
+    return { accumulator, AffineElement(native_hints.offset_generator_accumulator) };
 }
 
 /**

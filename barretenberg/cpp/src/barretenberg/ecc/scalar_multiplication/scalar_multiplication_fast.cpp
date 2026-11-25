@@ -21,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <queue>
 #include <span>
 #include <vector>
 #if !defined(__wasm__) && !defined(NO_MULTITHREADING) && SIZE_MAX > UINT32_MAX
@@ -287,6 +288,8 @@ template <typename Curve> inline void drain_batch(ThreadScratch<Curve>& s, size_
     // pair_dest[k] is the `next_len` value recorded when the k-th pair was queued, which is < the
     // read cursor at that level — so the write lands on an already-read slot (see tree_reduce_in_place).
     size_t k = 0;
+    s.out.x.require_backing(s.out.num_full_vectors());
+    s.out.y.require_backing(s.out.num_full_vectors());
     for (size_t g = 0; g < s.out.num_full_vectors(); ++g) {
         const auto xs = s.out.x[g].to_array();
         const auto ys = s.out.y[g].to_array();
@@ -3015,59 +3018,55 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
         }
 
         {
-            // Stage 6a — per-thread bucket partials. Each thread `tid` reduces its schedule
-            // slice via reduce_chunk and scatters the (digit, point) output directly into the
-            // per-thread dense bucket buffer at slot `(digit - chunk_bucket_lo[tid])`. Stage
-            // 6b then reads this buffer with O(1) slot lookup. `bucket_partials_present` is
-            // pre-zeroed per batch.
-            auto bucket_partials_per_thread_lambda = [&](size_t tid) {
-                auto& s = thread_scratch[tid];
-                for (size_t w = 0; w < windows_in_batch; ++w) {
-                    const size_t* chunk_start_w = chunk_start_all.data() + (w * (num_threads + 1));
-                    const size_t cs_lo = chunk_start_w[tid];
-                    const size_t cs_hi = chunk_start_w[tid + 1];
-                    if (cs_lo == cs_hi) {
-                        continue;
-                    }
-                    const uint32_t* sched_w = schedule.data() + (w * n);
-                    const size_t* bucket_start = bucket_start_all.data() + (w * (bucket_stride + 1));
-                    AffineElement* dst_dense =
-                        bucket_partials_dense.data() + bucket_partials_offsets[(tid * windows_in_batch) + w];
-                    uint8_t* dst_present =
-                        bucket_partials_present.data() + bucket_partials_offsets[(tid * windows_in_batch) + w];
-                    const size_t* chunk_bucket_lo = chunk_bucket_lo_all.data() + (w * (num_threads + 1));
-                    const uint32_t my_lo = static_cast<uint32_t>(chunk_bucket_lo[tid]);
-                    const size_t my_hi = chunk_bucket_hi_all[(w * num_threads) + tid];
-                    size_t bucket_cursor = my_lo;
-
-                    for (size_t pos = cs_lo; pos < cs_hi;) {
-                        const size_t end = std::min(pos + SUBCHUNK_ENTRIES_CAP, cs_hi);
-                        reduce_chunk<Curve>(s,
-                                            sched_w,
-                                            bucket_start,
-                                            pos,
-                                            end,
-                                            bucket_cursor,
-                                            my_hi,
-                                            points,
-                                            std::span<const AffineElement>(dedup_state.extra_points));
-                        const size_t len = s.result_len;
-                        for (size_t k = 0; k < len; ++k) {
-                            const uint32_t d = s.curr_buckets[k];
-                            const size_t slot = d - my_lo;
-                            if (dst_present[slot]) {
-                                s.overflow_slots[s.overflow_len] = static_cast<uint32_t>(slot);
-                                s.overflow_pts[s.overflow_len] = s.curr_pts[k];
-                                ++s.overflow_len;
-                            } else {
-                                dst_dense[slot] = s.curr_pts[k];
-                                dst_present[slot] = 1;
-                            }
-                        }
-                        pos = end;
-                    }
-                    merge_overflow<Curve>(s, dst_dense);
+            // Stage 6a: each (schedule slice, window) owns a separate dense output range.
+            // Scratch belongs to the worker executing that job; no state crosses job boundaries.
+            // Keep each job's original reduction order and output offsets so Stage 6b is unchanged.
+            auto bucket_partials_job = [&](size_t tid, size_t w, size_t worker_id) {
+                auto& s = thread_scratch[worker_id];
+                const size_t* chunk_start_w = chunk_start_all.data() + (w * (num_threads + 1));
+                const size_t cs_lo = chunk_start_w[tid];
+                const size_t cs_hi = chunk_start_w[tid + 1];
+                if (cs_lo == cs_hi) {
+                    return;
                 }
+                const uint32_t* sched_w = schedule.data() + (w * n);
+                const size_t* bucket_start = bucket_start_all.data() + (w * (bucket_stride + 1));
+                AffineElement* dst_dense =
+                    bucket_partials_dense.data() + bucket_partials_offsets[(tid * windows_in_batch) + w];
+                uint8_t* dst_present =
+                    bucket_partials_present.data() + bucket_partials_offsets[(tid * windows_in_batch) + w];
+                const size_t* chunk_bucket_lo = chunk_bucket_lo_all.data() + (w * (num_threads + 1));
+                const uint32_t my_lo = static_cast<uint32_t>(chunk_bucket_lo[tid]);
+                const size_t my_hi = chunk_bucket_hi_all[(w * num_threads) + tid];
+                size_t bucket_cursor = my_lo;
+
+                for (size_t pos = cs_lo; pos < cs_hi;) {
+                    const size_t end = std::min(pos + SUBCHUNK_ENTRIES_CAP, cs_hi);
+                    reduce_chunk<Curve>(s,
+                                        sched_w,
+                                        bucket_start,
+                                        pos,
+                                        end,
+                                        bucket_cursor,
+                                        my_hi,
+                                        points,
+                                        std::span<const AffineElement>(dedup_state.extra_points));
+                    const size_t len = s.result_len;
+                    for (size_t k = 0; k < len; ++k) {
+                        const uint32_t d = s.curr_buckets[k];
+                        const size_t slot = d - my_lo;
+                        if (dst_present[slot]) {
+                            s.overflow_slots[s.overflow_len] = static_cast<uint32_t>(slot);
+                            s.overflow_pts[s.overflow_len] = s.curr_pts[k];
+                            ++s.overflow_len;
+                        } else {
+                            dst_dense[slot] = s.curr_pts[k];
+                            dst_present[slot] = 1;
+                        }
+                    }
+                    pos = end;
+                }
+                merge_overflow<Curve>(s, dst_dense);
             };
 
             // Stage 6b (cross-thread bucket reduction): each rebalanced task `tprime` owns a
@@ -3207,7 +3206,31 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
 
             {
                 BB_BENCH_NAME("MSM_fast::Stage6a_bucket_partials");
-                round_parallel_detail::msm_parallel_for(num_threads, bucket_partials_per_thread_lambda);
+#ifndef __wasm__
+                if (num_threads > 1 && windows_in_batch > 1) {
+                    // A fixed slice owner can remain busy while peers finish all their windows.
+                    // Claim independent window/slice jobs dynamically, using the same scratch budget.
+                    // Window-major order starts every window with all of its slices available.
+                    std::atomic<size_t> next_job{ 0 };
+                    const size_t num_jobs = num_threads * windows_in_batch;
+                    round_parallel_detail::msm_parallel_for(num_threads, [&](size_t worker_id) {
+                        while (true) {
+                            const size_t job = next_job.fetch_add(1, std::memory_order_relaxed);
+                            if (job >= num_jobs) {
+                                break;
+                            }
+                            bucket_partials_job(job % num_threads, job / num_threads, worker_id);
+                        }
+                    });
+                } else
+#endif
+                {
+                    round_parallel_detail::msm_parallel_for(num_threads, [&](size_t tid) {
+                        for (size_t w = 0; w < windows_in_batch; ++w) {
+                            bucket_partials_job(tid, w, tid);
+                        }
+                    });
+                }
             }
             {
                 BB_BENCH_NAME("MSM_fast::Stage6b_reduce_cross_thread");
