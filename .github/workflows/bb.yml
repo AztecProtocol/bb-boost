@@ -1,0 +1,158 @@
+# aztec-golf's merged bb release: build bb and bb-avm, run bb's unit tests, and on a tag publish the native linux
+# tarballs. GitHub-hosted runners only, deliberately simple (not aztec-packages' CI, whose .github/ isn't in this repo).
+# Proof correctness (byte-identical proofs, holdouts) is checked by aztec-golf's runner on each submission, not here.
+#
+# The build is the golf runner's (runner/container/prepare.sh): the clang20 preset (Zig-wrapped clang, glibc 2.35),
+# with the AVM transpiler built from avm-transpiler/. The tests are the 20 programs the runner's unit-test guard runs
+# (TEST_PROGRAMS in runner/runner.py; srs_tests left out), split over parallel jobs to fit the hosted runners.
+name: bb
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bb-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  ZIG_VERSION: 0.15.1
+  ZIG_SHA256: c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  transpiler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Noir (the transpiler's dependency)
+        run: git submodule update --init --depth 1 noir/noir-repo
+      - name: Build libavm_transpiler.a
+        working-directory: avm-transpiler
+        # rust-toolchain.toml pins the toolchain; rustup installs it.
+        run: cargo build --release --locked --lib
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: avm-transpiler
+          path: avm-transpiler/target/release/libavm_transpiler.a
+          retention-days: 3
+
+  build:
+    needs: transpiler
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: binaries
+            targets: bb bb-avm
+          - name: tests-core
+            targets: >-
+              ecc_tests numeric_tests polynomials_tests commitment_schemes_tests sumcheck_tests relations_tests
+              flavor_tests transcript_tests common_tests crypto_poseidon2_tests op_queue_tests
+          - name: tests-honk
+            targets: honk_tests ultra_honk_tests eccvm_tests translator_vm_tests goblin_tests
+          - name: tests-chonk
+            targets: chonk_tests hypernova_tests multilinear_batching_tests
+          - name: tests-vm2
+            targets: vm2_tests
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Disk and swap
+        # The hosted runner is small: drop toolchains this build doesn't use, and give the big vm2 compilation units
+        # room to swap rather than be killed.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a && sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 16G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          free -g; df -h / /mnt
+      - name: Tools (Zig, Ninja, clang-format, Yarn)
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig && sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo /opt/zig >> "$GITHUB_PATH"
+          sudo apt-get update -q && sudo apt-get install -y -q ninja-build clang-format-20  # configure formats the generated aztec_constants.hpp
+          corepack enable
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: avm-transpiler
+          path: avm-transpiler/target/release
+      - name: Configure
+        working-directory: barretenberg/cpp
+        run: cmake --preset clang20
+      - name: Build ${{ matrix.targets }}
+        working-directory: barretenberg/cpp
+        # -k 0: keep going after a failed compilation unit, so one run shows every compile error.
+        run: cmake --build --preset clang20 --parallel "$(nproc)" --target ${{ matrix.targets }} -- -k 0
+      - name: CRS
+        # bb's tests don't download the CRS themselves: aztec-packages' own script fetches it to ~/.bb-crs.
+        if: matrix.name != 'binaries'
+        run: barretenberg/crs/bootstrap.sh
+      - name: Run the unit tests
+        if: matrix.name != 'binaries'
+        working-directory: barretenberg/cpp/build
+        run: |
+          failed=""
+          for t in ${{ matrix.targets }}; do
+            echo "::group::$t"
+            ./bin/$t --gtest_brief=1 || failed="$failed $t"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "::error::Failed:$failed"; exit 1; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: matrix.name == 'binaries'
+        with:
+          name: binaries
+          path: |
+            barretenberg/cpp/build/bin/bb
+            barretenberg/cpp/build/bin/bb-avm
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: binaries
+          path: bin
+      - name: Tarballs
+        # Like aztec-packages' build_release_dir (barretenberg/cpp/bootstrap.sh), native amd64 linux only: the
+        # release version is written after the binary's BARRETENBERG_VERSION_SENTINEL, then each binary is tarred.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          [ ${#version} -le 26 ] || { echo "::error::Version $version is longer than the binary's 26 bytes"; exit 1; }
+          mkdir out
+          for name in bb bb-avm; do
+            chmod +x "bin/$name"
+            offset=$(grep -aobF BARRETENBERG_VERSION_SENTINEL "bin/$name" | head -n 1 | cut -d: -f1)
+            [ -n "$offset" ] || { echo "::error::No version sentinel in $name"; exit 1; }
+            printf '%s\0' "$version" | dd of="bin/$name" bs=1 seek=$((offset + 29)) conv=notrunc status=none
+          done
+          bin/bb --version
+          tar -czf out/barretenberg-amd64-linux.tar.gz -C bin bb
+          tar -czf out/barretenberg-avm-amd64-linux.tar.gz -C bin bb-avm
+          (cd out && sha256sum *.tar.gz | tee SHA256SUMS)
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --verify-tag \
+            --notes "bb and bb-avm (amd64 linux, glibc 2.35+) built from $GITHUB_SHA."
