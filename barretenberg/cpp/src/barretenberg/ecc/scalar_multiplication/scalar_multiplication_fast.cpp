@@ -331,7 +331,7 @@ template <typename Curve> inline void drain_batch(ThreadScratch<Curve>& s, size_
  *          per pair, with every intermediate held in registers rather than in packed VectorField temporaries.
  */
 template <typename Curve>
-inline void drain_batch_scalar(ThreadScratch<Curve>& s, size_t pair_count) noexcept
+[[maybe_unused]] inline void drain_batch_scalar(ThreadScratch<Curve>& s, size_t pair_count) noexcept
 {
     using BaseField = typename Curve::BaseField;
     if (pair_count == 0) {
@@ -378,7 +378,8 @@ inline void drain_batch_scalar(ThreadScratch<Curve>& s, size_t pair_count) noexc
  *        queued operands written as plain field elements into the packed-drain backing and drained by
  *        drain_batch_scalar.
  */
-template <typename Curve> void tree_reduce_in_place_scalar(ThreadScratch<Curve>& s, size_t initial_len) noexcept
+template <typename Curve>
+[[maybe_unused]] void tree_reduce_in_place_scalar(ThreadScratch<Curve>& s, size_t initial_len) noexcept
 {
     using BaseField = typename Curve::BaseField;
     constexpr size_t W = bb::VectorField<typename BaseField::Params>::SIZE;
