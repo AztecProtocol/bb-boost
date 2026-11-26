@@ -5,6 +5,7 @@
 # The build is the golf runner's (runner/container/prepare.sh): the clang20 preset (Zig-wrapped clang, glibc 2.35),
 # with the AVM transpiler built from avm-transpiler/. The tests are the 20 programs the runner's unit-test guard runs
 # (TEST_PROGRAMS in runner/runner.py; srs_tests left out), split over parallel jobs to fit the hosted runners.
+# A separate job builds barretenberg.wasm (not released yet).
 name: bb
 
 on:
@@ -24,6 +25,9 @@ concurrency:
 env:
   ZIG_VERSION: 0.15.1
   ZIG_SHA256: c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05
+  # build-images/src/Dockerfile at v6.1.0; the checksum is GitHub's digest of the release asset.
+  WASI_SDK_VERSION: "34"
+  WASI_SDK_SHA256: b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
   COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
 
 jobs:
@@ -116,6 +120,32 @@ jobs:
           path: |
             barretenberg/cpp/build/bin/bb
             barretenberg/cpp/build/bin/bb-avm
+          retention-days: 14
+
+  wasm:
+    # barretenberg.wasm, the build bb.js loads (the wasm-threads preset, as the golf WASM runner builds it). Built
+    # only, not yet released or tested here: the golf WASM runner checks its proofs.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Tools (wasi-sdk, Ninja, clang-format, Yarn)
+        run: |
+          curl -fsSL -o /tmp/wasi-sdk.tar.gz "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+          echo "${WASI_SDK_SHA256}  /tmp/wasi-sdk.tar.gz" | sha256sum -c -
+          sudo mkdir -p /opt/wasi-sdk && sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+          sudo apt-get update -q && sudo apt-get install -y -q ninja-build clang-format-20  # configure formats the generated aztec_constants.hpp
+          corepack enable
+      - name: Configure
+        working-directory: barretenberg/cpp
+        run: cmake --preset wasm-threads
+      - name: Build barretenberg.wasm
+        working-directory: barretenberg/cpp
+        run: cmake --build --preset wasm-threads --parallel "$(nproc)" --target barretenberg.wasm -- -k 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasm
+          path: barretenberg/cpp/build-wasm-threads/bin/barretenberg.wasm
           retention-days: 14
 
   release:
