@@ -1,0 +1,30 @@
+[
+  {
+    "id": "base",
+    "label": "v6.1.0",
+    "title": "bb v6.1.0, as released by aztec-packages",
+    "ref": "806d6ca51baf4e5eeafd7d54691d59176dce249b",
+    "pr": null
+  },
+  {
+    "id": "pr1",
+    "label": "+ #1 AVM",
+    "title": "Season 2 leaders (1/3): the AVM leader's stack",
+    "ref": "fd15e950e66ab081e2c01078f30c15d923d034d6",
+    "pr": 1
+  },
+  {
+    "id": "pr2",
+    "label": "+ #2 rollup",
+    "title": "Season 2 leaders (2/3): the rollup leader's stack",
+    "ref": "812cd13d50bfb8cb25a17b7723bfbb163d5ea2fd",
+    "pr": 2
+  },
+  {
+    "id": "pr3",
+    "label": "+ #3 client-WASM",
+    "title": "Season 2 leaders (3/3): the client-WASM leader's stack",
+    "ref": "eb054124f0c70937d5db3401fad980a09f640d8f",
+    "pr": 3
+  }
+]
