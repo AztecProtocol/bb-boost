@@ -4,7 +4,10 @@
 #
 # The build is the golf runner's (runner/container/prepare.sh): the clang20 preset (Zig-wrapped clang, glibc 2.35),
 # with the AVM transpiler built from avm-transpiler/. The tests are the 20 programs the runner's unit-test guard runs
-# (TEST_PROGRAMS in runner/runner.py; srs_tests left out), split over parallel jobs to fit the hosted runners.
+# (TEST_PROGRAMS in runner/runner.py), plus the ones it doesn't run that cover code this release changes: ACIR to
+# circuit (dsl), the in-circuit stdlib, the CRS loaders (srs) and the recursive verifiers. bbapi_tests also proves and
+# verifies aztec-packages' pinned Chonk flows (real client transactions). All split over parallel jobs to fit the
+# hosted runners.
 # A separate job builds barretenberg.wasm (not released yet).
 name: bb
 
@@ -68,6 +71,19 @@ jobs:
             targets: chonk_tests hypernova_tests multilinear_batching_tests
           - name: tests-vm2
             targets: vm2_tests
+          - name: tests-dsl
+            targets: dsl_tests
+          - name: tests-stdlib
+            targets: >-
+              stdlib_primitives_tests stdlib_circuit_builders_tests stdlib_sha256_tests stdlib_poseidon2_tests
+              stdlib_keccak_tests stdlib_blake2s_tests stdlib_blake3s_tests stdlib_hash_utils_tests stdlib_aes128_tests
+              stdlib_ecdsa_tests crypto_sha256_tests srs_tests
+          - name: tests-recursion
+            targets: >-
+              commitment_schemes_recursion_tests stdlib_honk_verifier_tests stdlib_eccvm_verifier_tests
+              stdlib_translator_vm_verifier_tests
+          - name: tests-bbapi
+            targets: bbapi_tests
     name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -102,6 +118,19 @@ jobs:
         # bb's tests don't download the CRS themselves: aztec-packages' own script fetches it to ~/.bb-crs.
         if: matrix.name != 'binaries'
         run: barretenberg/crs/bootstrap.sh
+      - name: Pinned Chonk flows
+        # What aztec-packages' scripts/chonk_inputs.sh download fetches (without its ci3 dependencies): the tarball
+        # named by chonk-inputs.hash, which is the first 16 hex digits of its SHA-256. bbapi_tests'
+        # ChonkPinnedIvcInputsTest reads it from barretenberg/cpp/chonk-pinned-flows.
+        if: matrix.name == 'tests-bbapi'
+        working-directory: barretenberg/cpp
+        run: |
+          hash=$(tr -d ' \r\n' < scripts/chonk-inputs.hash)
+          [[ "$hash" =~ ^[a-f0-9]{16}$ ]] || { echo "::error::Bad chonk-inputs.hash: $hash"; exit 1; }
+          curl -fsSL -o /tmp/chonk-inputs.tar.gz "https://aztec-ci-artifacts.s3.us-east-2.amazonaws.com/protocol/bb-chonk-inputs-$hash.tar.gz"
+          [ "$(sha256sum /tmp/chonk-inputs.tar.gz | cut -c1-16)" = "$hash" ] || { echo "::error::Pinned Chonk inputs don't match $hash"; exit 1; }
+          mkdir -p chonk-pinned-flows && tar -xzf /tmp/chonk-inputs.tar.gz -C chonk-pinned-flows
+          ls chonk-pinned-flows
       - name: Run the unit tests
         if: matrix.name != 'binaries'
         working-directory: barretenberg/cpp/build
