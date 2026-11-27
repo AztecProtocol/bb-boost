@@ -1,0 +1,252 @@
+# Benchmarks: bb at each point of .github/bench/points.json (v6.1.0, then each merged leader's stack), timed in turns
+# on the same machine, per column. Run by hand (Actions > bench > Run workflow); a dispatched run publishes its
+# results to the gh-pages branch (GitHub Pages). A pull request that changes the benchmarks runs them without
+# publishing.
+#
+# Inputs:
+# - client: aztec-packages' pinned Chonk flows (barretenberg/cpp/scripts/chonk-inputs.hash), native;
+# - micro: aztec-packages' UltraHonk micro-benchmark (2^20 gates, with and without ZK);
+# - rollup, avm: the release asset bench-inputs-v6.1.0 (aztec-golf's season 2 public rollup and AVM inputs; see its
+#   README.md). Root is skipped by default: the original peaks near 16 GB, a hosted runner's whole memory.
+#
+# Hosted runners have 4 CPUs and 16 GB, so the numbers are far from those of a many-core prover machine; compare
+# points within a column, not columns or runs (each column runs on its own machine). Swap is turned off while timing,
+# so an input that doesn't fit fails instead of being timed while swapping.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      columns:
+        description: Columns to time (space-separated, of client micro rollup avm)
+        default: client micro rollup avm
+      skip:
+        description: Inputs to leave out (space-separated ids such as rollup/Root, or none)
+        default: rollup/Root
+      repeats:
+        description: Runs per input and point
+        default: "3"
+      publish:
+        description: Publish the results to GitHub Pages
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - .github/workflows/bench.yml
+      - .github/bench/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.15.1
+  ZIG_SHA256: c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05
+  INPUTS_URL: https://github.com/AztecProtocol/bb-boost/releases/download/bench-inputs-v6.1.0/bb-boost-bench-inputs-v6.1.0.tar.gz
+  INPUTS_SHA256: 710f42309b8aff61d31f8568a7683f8b18e6f502f95b45a898912c7c92e7e0cc
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      points: ${{ steps.config.outputs.points }}
+      columns: ${{ steps.config.outputs.columns }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: .github/bench
+      - name: Test the benchmark script
+        run: python3 -m unittest discover -s .github/bench -v
+      - name: Points and columns
+        id: config
+        env:
+          COLUMNS: ${{ inputs.columns || 'client micro rollup avm' }}
+        run: |
+          echo "points=$(jq -c . .github/bench/points.json)" >> "$GITHUB_OUTPUT"
+          echo "columns=$(python3 -c 'import json, os; c = os.environ["COLUMNS"].split(); assert c and set(c) <= {"client", "micro", "rollup", "avm"}, c; print(json.dumps(c))')" >> "$GITHUB_OUTPUT"
+
+  transpiler:
+    # The AVM transpiler (linked into bb-avm) is the same at every point: built once, from the first.
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ fromJSON(needs.setup.outputs.points)[0].ref }}
+      - name: Noir (the transpiler's dependency)
+        run: git submodule update --init --depth 1 noir/noir-repo
+      - name: Build libavm_transpiler.a
+        working-directory: avm-transpiler
+        run: cargo build --release --locked --lib
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-avm-transpiler
+          path: avm-transpiler/target/release/libavm_transpiler.a
+          retention-days: 3
+
+  build:
+    # Like bb.yml's binaries job, at each point, plus the micro-benchmark.
+    needs: [setup, transpiler]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      matrix:
+        point: ${{ fromJSON(needs.setup.outputs.points) }}
+    name: build ${{ matrix.point.id }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ matrix.point.ref }}
+      - name: Disk and swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a && sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 16G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          free -g; df -h / /mnt
+      - name: Tools (Zig, Ninja, clang-format, Yarn)
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig && sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo /opt/zig >> "$GITHUB_PATH"
+          sudo apt-get update -q && sudo apt-get install -y -q ninja-build clang-format-20
+          corepack enable
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bench-avm-transpiler
+          path: avm-transpiler/target/release
+      - name: Configure
+        working-directory: barretenberg/cpp
+        run: cmake --preset clang20
+      - name: Build bb, bb-avm and ultra_honk_bench
+        working-directory: barretenberg/cpp
+        run: cmake --build --preset clang20 --parallel "$(nproc)" --target bb bb-avm ultra_honk_bench
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-bin-${{ matrix.point.id }}
+          path: |
+            barretenberg/cpp/build/bin/bb
+            barretenberg/cpp/build/bin/bb-avm
+            barretenberg/cpp/build/bin/ultra_honk_bench
+          retention-days: 7
+
+  time:
+    needs: [setup, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        column: ${{ fromJSON(needs.setup.outputs.columns) }}
+    name: time ${{ matrix.column }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: |
+            .github/bench
+            barretenberg/crs
+            barretenberg/cpp/scripts/chonk-inputs.hash
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bench-bin-*
+          path: bins
+      - name: Binaries
+        # bins/bench-bin-<id>/ -> bins/<id>/
+        run: |
+          for d in bins/bench-bin-*; do mv "$d" "bins/${d#bins/bench-bin-}"; done
+          chmod +x bins/*/*
+          ls -l bins/*
+      - name: CRS
+        run: barretenberg/crs/bootstrap.sh
+      - name: Pinned Chonk flows
+        if: matrix.column == 'client'
+        run: |
+          hash=$(tr -d ' \r\n' < barretenberg/cpp/scripts/chonk-inputs.hash)
+          [[ "$hash" =~ ^[a-f0-9]{16}$ ]] || { echo "::error::Bad chonk-inputs.hash: $hash"; exit 1; }
+          curl -fsSL -o /tmp/chonk-inputs.tar.gz "https://aztec-ci-artifacts.s3.us-east-2.amazonaws.com/protocol/bb-chonk-inputs-$hash.tar.gz"
+          [ "$(sha256sum /tmp/chonk-inputs.tar.gz | cut -c1-16)" = "$hash" ] || { echo "::error::Pinned Chonk inputs don't match $hash"; exit 1; }
+          mkdir -p flows && tar -xzf /tmp/chonk-inputs.tar.gz -C flows
+          ls flows
+      - name: Bench inputs
+        if: matrix.column != 'micro'
+        run: |
+          curl -fsSL -o /tmp/inputs.tar.gz "$INPUTS_URL"
+          echo "${INPUTS_SHA256}  /tmp/inputs.tar.gz" | sha256sum -c -
+          mkdir -p inputs && tar -xzf /tmp/inputs.tar.gz -C inputs --strip-components=1
+      - name: Machine
+        # No swap while timing: an input that doesn't fit in memory fails rather than being timed while swapping.
+        run: |
+          sudo swapoff -a
+          nproc; free -m; lscpu | grep -E 'Model name|Thread|Core|Socket'
+      - name: Time ${{ matrix.column }}
+        env:
+          SKIP: ${{ inputs.skip || 'rollup/Root' }}
+          REPEATS: ${{ inputs.repeats || '3' }}
+        run: |
+          skip=(); [ "$SKIP" = none ] || read -ra skip <<< "$SKIP"
+          args=(); [ -d inputs ] && args+=(--inputs inputs); [ -d flows ] && args+=(--flows flows)
+          python3 .github/bench/bench.py run --points .github/bench/points.json --bins bins \
+            --column ${{ matrix.column }} "${args[@]}" --skip "${skip[@]}" --repeats "$REPEATS" \
+            --out results-${{ matrix.column }}.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: bench-results-${{ matrix.column }}
+          path: results-${{ matrix.column }}.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  publish:
+    needs: time
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: .github/bench
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bench-results-*
+          path: results
+      - name: Merge the results
+        run: |
+          python3 .github/bench/bench.py publish --points .github/bench/points.json --results results --out site \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          cat site/summary.md >> "$GITHUB_STEP_SUMMARY"
+          cp .github/bench/index.html site/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-site
+          path: site
+          retention-days: 90
+      - name: Publish to gh-pages
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$remote" gh-pages >/dev/null; then
+            git clone --depth 1 --branch gh-pages "$remote" pages
+          else
+            git init -b gh-pages pages && git -C pages remote add origin "$remote"
+          fi
+          mkdir -p "pages/runs/${GITHUB_RUN_ID}"
+          cp site/index.html site/data.json site/*.bench.json pages/
+          cp site/data.json site/*.bench.json "pages/runs/${GITHUB_RUN_ID}/"
+          touch pages/.nojekyll
+          cd pages
+          git add -A
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Benchmarks from run ${GITHUB_RUN_ID} (${GITHUB_SHA::10})"
+          git push origin gh-pages
