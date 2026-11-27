@@ -2,6 +2,7 @@
 
 #include "./types.hpp"
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/thread.hpp"
 #include "barretenberg/ecc/curves/secp256r1/secp256r1.hpp"
 #include "barretenberg/ecc/groups/precomputed_generators.hpp"
 #include "barretenberg/ecc/groups/precomputed_generators_secp256r1_impl.hpp"
@@ -20,39 +21,39 @@ void table::init_tables()
         constexpr AffineElement H =
             bb::get_precomputed_generators<G1, "biggroup table offset generator", 1UL, 0UL>()[0];
 
-        // Step per window: 2^(8w) · G.
+        // Per window w: step 2^(sum of the earlier windows' bits) · G and offset 2^w · H, both by doubling. The
+        // per-window size and step follow table_size(w) and window_bits(w) (7-bit "big" windows plus a 3-bit lo-tail
+        // and a 1-bit hi-tail).
+        std::array<Element, NUM_WINDOWS> window_steps;
+        std::array<Element, NUM_WINDOWS> window_offsets;
         Element window_step = Element(G1::affine_one);
-
+        Element window_offset = Element(H);
         // Total offset accumulator: sums all 2^w · H contributions.
         Element offset_total = Element::infinity();
-
         for (size_t w = 0; w < NUM_WINDOWS; ++w) {
-            // Per-window offset: 2^w · H. We compute it by doubling H w times rather than scalar-mul to keep this
-            // straightforward; this code runs once per process so the cost is irrelevant.
-            const G1::Fr offset_scalar(uint256_t(1) << w);
-            const Element window_offset = Element(H) * offset_scalar;
+            window_steps[w] = window_step;
+            window_offsets[w] = window_offset;
             offset_total += window_offset;
+            for (size_t i = 0; i < window_bits(w); ++i) {
+                window_step = window_step.dbl();
+            }
+            window_offset = window_offset.dbl();
+        }
 
-            // Build the entries for this window: T[k] = k · window_step + window_offset. The per-window
-            // size and step are determined by table_size(w) and window_bits(w) (7-bit "big" windows
-            // plus a 3-bit lo-tail and a 1-bit hi-tail).
+        // Entries T_w[k] = k · step_w + offset_w. Windows are independent, and normalization fixes each entry's
+        // affine coordinates whatever thread computed it.
+        parallel_for(NUM_WINDOWS, [&](size_t w) {
             const size_t ts = table_size(w);
-            const size_t wb = window_bits(w);
             std::array<Element, TABLE_SIZE_BIG> projective;
-            projective[0] = window_offset;
+            projective[0] = window_offsets[w];
             for (size_t k = 1; k < ts; ++k) {
-                projective[k] = projective[k - 1] + window_step;
+                projective[k] = projective[k - 1] + window_steps[w];
             }
             Element::batch_normalize(projective.data(), ts);
             for (size_t k = 0; k < ts; ++k) {
                 native_table[w][k] = AffineElement(projective[k].x, projective[k].y);
             }
-
-            // Advance the step for the next window: window_step *= 2^window_bits(w).
-            for (size_t i = 0; i < wb; ++i) {
-                window_step = window_step.dbl();
-            }
-        }
+        });
 
         cached_total_offset = AffineElement(offset_total);
     });

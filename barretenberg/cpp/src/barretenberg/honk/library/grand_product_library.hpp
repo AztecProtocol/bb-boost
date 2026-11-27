@@ -11,6 +11,10 @@
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/common/zip_view.hpp"
 #include "barretenberg/constants.hpp"
+#if defined(__wasm_simd128__)
+#include "barretenberg/common/throw_or_abort.hpp"
+#include "barretenberg/ecc/fields/vector_field.hpp"
+#endif
 #include "barretenberg/flavor/flavor.hpp"
 
 #include "barretenberg/relations/permutation_relation.hpp"
@@ -18,6 +22,54 @@
 #include "barretenberg/trace_to_polynomials/trace_to_polynomials.hpp"
 
 namespace bb {
+
+#if defined(__wasm_simd128__)
+namespace detail {
+// Only the permutation term inputs are stored, rather than a whole SIMD flavor row.
+template <typename Vec, typename EntityId_> struct PackedGrandProductRow {
+    using EntityId = EntityId_;
+    std::array<Vec, 4> wires;
+    std::array<Vec, 4> ids;
+    std::array<Vec, 4> sigmas;
+
+    auto& get_wires() { return wires; }
+    auto& get_ids() { return ids; }
+    auto& get_sigmas() { return sigmas; }
+
+    const Vec& operator[](EntityId id) const
+    {
+        switch (id) {
+        case EntityId::w_l:
+            return wires[0];
+        case EntityId::w_r:
+            return wires[1];
+        case EntityId::w_o:
+            return wires[2];
+        case EntityId::w_4:
+            return wires[3];
+        case EntityId::id_1:
+            return ids[0];
+        case EntityId::id_2:
+            return ids[1];
+        case EntityId::id_3:
+            return ids[2];
+        case EntityId::id_4:
+            return ids[3];
+        case EntityId::sigma_1:
+            return sigmas[0];
+        case EntityId::sigma_2:
+            return sigmas[1];
+        case EntityId::sigma_3:
+            return sigmas[2];
+        case EntityId::sigma_4:
+            return sigmas[3];
+        default:
+            throw_or_abort("Unexpected grand-product packed-row input");
+        }
+    }
+};
+} // namespace detail
+#endif
 
 /**
  * @brief Compute a grand product polynomial, `grand_product_polynomial`, which for historical reasons is sometimes also
@@ -119,7 +171,53 @@ void compute_grand_product(typename Flavor::ProverPolynomials& full_polynomials,
         const size_t end = thread_data.end[thread_idx];
         typename Flavor::AllValues row;
         uint32_t local_duplicates = 0;
-        for (size_t i = start; i < end; ++i) {
+        size_t i = start;
+#if defined(__wasm_simd128__)
+        if constexpr (std::is_same_v<FF, bb::fr> &&
+                      std::is_same_v<GrandProdRelation, UltraPermutationRelation<FF>>) {
+            using Vec = VectorField<typename FF::Params>;
+            // Reuse one row per worker, filling only the twelve entries read by the relation.
+            detail::PackedGrandProductRow<Vec, typename Flavor::AllValues::EntityId> packed_row;
+            struct PackedParameters {
+                using DataType = Vec;
+                Vec beta;
+                Vec gamma;
+            };
+            const PackedParameters packed_parameters{ Vec(relation_parameters.beta), Vec(relation_parameters.gamma) };
+            for (; end - i >= Vec::SIZE; i += Vec::SIZE) {
+                const size_t poly_idx = i + gp_start;
+                const auto load = [&](const auto& polynomial) {
+                    const size_t first = polynomial.start_index();
+                    const size_t last = polynomial.end_index();
+                    if (poly_idx >= first && poly_idx <= last && Vec::SIZE <= last - poly_idx) {
+                        return Vec(polynomial.data() + (poly_idx - first));
+                    }
+                    return Vec::from_lanes([&](size_t lane) { return polynomial[poly_idx + lane]; });
+                };
+                for (auto [value, polynomial] : zip_view(packed_row.get_wires(), full_polynomials.get_wires())) {
+                    value = load(polynomial);
+                }
+                for (auto [value, polynomial] : zip_view(packed_row.get_ids(), full_polynomials.get_ids())) {
+                    value = load(polynomial);
+                }
+                for (auto [value, polynomial] : zip_view(packed_row.get_sigmas(), full_polynomials.get_sigmas())) {
+                    value = load(polynomial);
+                }
+                const Vec num =
+                    GrandProdRelation::template compute_grand_product_numerator<Vec>(packed_row, packed_parameters);
+                const Vec den =
+                    GrandProdRelation::template compute_grand_product_denominator<Vec>(packed_row, packed_parameters);
+                num.store_to(&numerator.at(i));
+                den.store_to(&denominator.at(i));
+                if (count_duplicates) {
+                    for (size_t lane = 0; lane < Vec::SIZE; ++lane) {
+                        local_duplicates += static_cast<uint32_t>(numerator[i + lane] == denominator[i + lane]);
+                    }
+                }
+            }
+        }
+#endif
+        for (; i < end; ++i) {
             const size_t poly_idx = i + gp_start;
             // TODO: consider avoiding get_row if possible.
             if constexpr (std::is_same_v<GrandProdRelation, UltraPermutationRelation<FF>>) {

@@ -30,6 +30,10 @@ template <typename FF_> class Poseidon2InitialExternalRelationImpl {
         3, // A_3
     };
 
+    // A permutation's rows of each Poseidon2 gate kind are interleaved in one trace block, so this selector is live
+    // on few edges of a SIMD sumcheck group (see HasSparseSelector).
+    static constexpr bool SPARSE_SELECTOR = true;
+
     template <typename AllEntities> inline static bool skip(const AllEntities& in)
     {
         return in[AllEntities::EntityId::q_poseidon2_external_initial].is_zero();

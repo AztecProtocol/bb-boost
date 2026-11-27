@@ -65,6 +65,10 @@ template <typename FF_> class Poseidon2ExternalRelationImpl {
         7, // external poseidon2 round sub-relation for fourth value
     };
 
+    // A permutation's rows of each Poseidon2 gate kind are interleaved in one trace block, so this selector is live
+    // on few edges of a SIMD sumcheck group (see HasSparseSelector).
+    static constexpr bool SPARSE_SELECTOR = true;
+
     /**
      * @brief Returns true if the contribution from all subrelations for the provided inputs is identically zero
      *

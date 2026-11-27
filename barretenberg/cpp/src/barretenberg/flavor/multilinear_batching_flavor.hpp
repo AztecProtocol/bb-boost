@@ -172,6 +172,12 @@ template <size_t NumClaims> class MultilinearBatchingFlavor_ {
         std::array<FF, NUM_CLAIMS> non_shifted_evaluations;
         std::array<FF, NUM_CLAIMS> shifted_evaluations;
         size_t circuit_size = 0;
+        // Set when log2(circuit_size) >= 2 and every claim challenge r satisfies |r| >= log2(circuit_size) with no
+        // r_j = 1. The sumcheck then runs MultilinearBatchingSumcheckProver on eq_suffix_tables, which hold
+        // eq(y, (r_1, .., r_{L-1})) · ∏_{j >= L} (1 - r_j) over the circuit_size / 2 points y, and polynomials.eq
+        // stays empty. Otherwise polynomials.eq holds the full eq tables for the generic sumcheck.
+        bool eq_factored = false;
+        std::array<Polynomial, NUM_CLAIMS> eq_suffix_tables;
 
         ProvingKey() = default;
         explicit ProvingKey(std::vector<ProverClaim>&& claims);

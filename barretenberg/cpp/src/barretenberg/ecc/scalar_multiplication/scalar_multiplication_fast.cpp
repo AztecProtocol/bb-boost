@@ -646,6 +646,104 @@ void merge_overflow(ThreadScratch<Curve>& s, typename Curve::AffineElement* dst_
     s.overflow_len = 0;
 }
 
+#ifdef __wasm_simd128__
+/**
+ * @brief Gather the first reduction level directly into the existing packed affine-add queue.
+ *
+ * This is the WASM counterpart of the native IFMA first-level gather fusion: original and dedup
+ * points remain outside curr_pts, so a queue drain cannot overwrite a pending source. Pair order,
+ * queue boundaries and singleton positions match compacting all inputs before the first level.
+ */
+template <typename Curve>
+void reduce_chunk_packed_first_level(ThreadScratch<Curve>& s,
+                                     const uint32_t* schedule,
+                                     const size_t* bucket_start,
+                                     size_t chunk_lo,
+                                     size_t chunk_hi,
+                                     size_t& bucket_cursor,
+                                     size_t chunk_bucket_hi,
+                                     std::span<const typename Curve::AffineElement> points,
+                                     std::span<const typename Curve::AffineElement> dedup_extra_points) noexcept
+{
+    using AffineElement = typename Curve::AffineElement;
+    // Stage 6b reuses these spans and can leave nonzero cursors. Rewind before the first push,
+    // including chunks that eventually contain only singletons or skipped entries.
+    s.lhs.reset();
+    s.rhs.reset();
+    size_t next_len = 0;
+    size_t pair_count = 0;
+    bool made_pair = false;
+    size_t bucket = bucket_cursor;
+    size_t pos = chunk_lo;
+    while (bucket <= chunk_bucket_hi && pos < chunk_hi) {
+        const size_t run_lo = std::max(pos, bucket_start[bucket]);
+        const size_t run_hi = std::min(chunk_hi, bucket_start[bucket + 1]);
+        if (run_lo >= run_hi) {
+            ++bucket;
+            continue;
+        }
+
+        const uint32_t bucket_u32 = static_cast<uint32_t>(bucket);
+        const AffineElement* pending = nullptr;
+        bool pending_neg = false;
+        for (size_t i = run_lo; i < run_hi; ++i) {
+            if (i + GATHER_PREFETCH_DIST < chunk_hi) {
+                const size_t pf_idx =
+                    std::min<size_t>(schedule[i + GATHER_PREFETCH_DIST] & SCHEDULE_INDEX_MASK, points.size() - 1);
+                __builtin_prefetch(points.data() + pf_idx, 0, 3);
+            }
+            const uint32_t e = schedule[i];
+            if ((e & DEDUP_SKIP_BIT) != 0) {
+                continue;
+            }
+            const uint32_t raw_idx = e & SCHEDULE_INDEX_MASK;
+            const bool neg = (e & SCHEDULE_SIGN_BIT) != 0;
+            const auto& point = (e & DEDUP_REDIRECT_BIT) != 0 ? dedup_extra_points[raw_idx] : points[raw_idx];
+            if (pending == nullptr) {
+                pending = &point;
+                pending_neg = neg;
+                continue;
+            }
+
+            // push_point copies its arguments immediately, including a negated temporary.
+            // Keep the old lhs/rhs order and the same field negation before SIMD packing.
+            s.lhs.push_point(pending->x, pending_neg ? -pending->y : pending->y);
+            s.rhs.push_point(point.x, neg ? -point.y : point.y);
+            s.curr_buckets[next_len] = bucket_u32;
+            s.pair_dest[pair_count] = static_cast<uint32_t>(next_len);
+            ++next_len;
+            ++pair_count;
+            made_pair = true;
+            pending = nullptr;
+            if (pair_count >= BATCH_CAPACITY) {
+                drain_batch<Curve>(s, pair_count);
+                pair_count = 0;
+            }
+        }
+        if (pending != nullptr) {
+            auto& dst = s.curr_pts[next_len];
+            copy_affine64(dst, *pending);
+            if (pending_neg) {
+                dst.y = -dst.y;
+            }
+            s.curr_buckets[next_len] = bucket_u32;
+            ++next_len;
+        }
+        pos = run_hi;
+        if (pos < chunk_hi) {
+            ++bucket;
+        }
+    }
+    bucket_cursor = bucket;
+    drain_batch<Curve>(s, pair_count);
+    if (made_pair) {
+        tree_reduce_in_place<Curve>(s, next_len);
+    } else {
+        s.result_len = next_len;
+    }
+}
+#endif
+
 /**
  * @brief Tree-reduce one thread's bucket-aligned slice of the bucket-partitioned schedule into the
  *        deduplicated (point, digit) list in `curr_pts / curr_buckets`, which the caller scatters into
@@ -670,6 +768,14 @@ void reduce_chunk(ThreadScratch<Curve>& s,
 
     BB_ASSERT_LTE(chunk_len, s.curr_pts.size());
     static_assert(BATCH_CAPACITY <= 4096, "BATCH_CAPACITY must fit in pair_dest scratch");
+
+#ifdef __wasm_simd128__
+    if constexpr (bb::simd_available_v<typename Curve::BaseField::Params>) {
+        reduce_chunk_packed_first_level<Curve>(
+            s, schedule, bucket_start, chunk_lo, chunk_hi, bucket_cursor, chunk_bucket_hi, points, dedup_extra_points);
+        return;
+    }
+#endif
 
     // Compact entries while loading: dedup non-rep entries (DEDUP_SKIP_BIT set in the
     // schedule entry) carry no contribution — their points are already accumulated
@@ -1757,10 +1863,15 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
             round_parallel_detail::msm_parallel_for(hw_threads, [&](const ThreadChunk& chunk) {
                 auto& th_hist = per_thread_msb_hist[chunk.thread_index];
                 for (size_t i : chunk.range(n_input)) {
-                    const ScalarField canonical = input_scalars[i].from_montgomery_form_reduced();
-                    const auto split = ScalarField::split_into_endomorphism_scalars(canonical);
-                    const auto& k1 = split.first;
-                    const auto& k2 = split.second;
+                    // A zero scalar splits into two zero halves; skip its conversion and split.
+                    std::array<uint64_t, 2> k1{ 0, 0 };
+                    std::array<uint64_t, 2> k2{ 0, 0 };
+                    if (!input_scalars[i].is_zero()) {
+                        const ScalarField canonical = input_scalars[i].from_montgomery_form_reduced();
+                        const auto split = ScalarField::split_into_endomorphism_scalars(canonical);
+                        k1 = split.first;
+                        k2 = split.second;
+                    }
                     glv_scalars_storage[2 * i].data[0] = k1[0];
                     glv_scalars_storage[2 * i].data[1] = k1[1];
                     glv_scalars_storage[2 * i].data[2] = 0;
@@ -1788,7 +1899,13 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
             round_parallel_detail::msm_parallel_for(hw_threads, [&](const ThreadChunk& chunk) {
                 auto& th_hist = per_thread_msb_hist[chunk.thread_index];
                 for (size_t i : chunk.range(n_input)) {
-                    input_scalars[i].self_from_montgomery_form_reduced();
+                    // Both encodings of zero (0 and p) convert to the canonical 0, which the restore below maps
+                    // back to 0; write it directly instead of paying for two Montgomery multiplications.
+                    if (input_scalars[i].is_zero()) {
+                        input_scalars[i] = ScalarField::zero();
+                    } else {
+                        input_scalars[i].self_from_montgomery_form_reduced();
+                    }
                     round_parallel_detail::record_msb(
                         round_parallel_detail::msb_of_4limb(input_scalars[i].data), msb_per_scalar[i], th_hist);
                 }
@@ -2473,7 +2590,8 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
             // Pack the per-block filter into a uint64 bitmask. When every scalar in the block
             // is active (common in dense workloads), the inner scatter takes an all_included
             // fast path that drops the per-element predicate; mixed blocks bit-scan the mask.
-            auto compute_include_mask = [&](size_t block_start) noexcept -> uint64_t {
+            auto compute_include_mask = [&](size_t block_start,
+                                            [[maybe_unused]] uint16_t& block_bits) noexcept -> uint64_t {
                 uint64_t include_mask = 0;
                 for (size_t k = 0; k < SIMD_BATCH; ++k) {
                     const size_t scalar_idx = block_start + k;
@@ -2487,19 +2605,32 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
                         }
                     }
                     include_mask |= static_cast<uint64_t>(include) << k;
+#ifdef __wasm__
+                    if (include) {
+                        block_bits = std::max(block_bits, static_cast<uint16_t>(m + 1));
+                    }
+#endif
                 }
                 return include_mask;
             };
 
             size_t i = start;
             while (i + SIMD_BATCH <= end) {
-                const uint64_t include_mask = compute_include_mask(i);
+                [[maybe_unused]] uint16_t block_bits = 0;
+                const uint64_t include_mask = compute_include_mask(i, block_bits);
                 if (include_mask == 0) {
                     i += SIMD_BATCH;
                     continue;
                 }
                 const bool all_included = include_mask == ~uint64_t{ 0 };
                 for (size_t w = 0; w < windows_in_batch; ++w) {
+#ifdef __wasm__
+                    // Booth's lookback bit is bit_base - 1. Keep the equality case:
+                    // a scalar with that bit set can still produce a nonzero carry digit.
+                    if (round_parallel_detail::window_above_scalar_bits(block_bits, sched.bit_base[batch_start + w])) {
+                        continue;
+                    }
+#endif
                     fill_packed_digit_buffer(w, i, packed_buf.data());
                     uint32_t* my_counts = digit_cursors.data() + (((w * num_threads) + tid) * bucket_stride);
                     if (all_included) {
@@ -2534,6 +2665,11 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
                     }
                 }
                 for (size_t w = 0; w < windows_in_batch; ++w) {
+#ifdef __wasm__
+                    if (round_parallel_detail::window_above_scalar_bits(static_cast<uint16_t>(m + 1), sched.bit_base[batch_start + w])) {
+                        continue;
+                    }
+#endif
                     uint32_t* my_counts = digit_cursors.data() + (((w * num_threads) + tid) * bucket_stride);
                     const round_parallel_detail::ConstantineSliceParams sp = slice_params[w];
                     const uint32_t window_bits_w = static_cast<uint32_t>(per_window_bits[w]);
@@ -2656,11 +2792,22 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
             alignas(16) std::array<uint32_t, SIMD_BATCH> packed_buf{};
             constexpr size_t STAGE4_SCALAR_TILE = 2048;
             std::array<uint8_t, STAGE4_SCALAR_TILE> active_tile{};
+#ifdef __wasm__
+            // Reuse each block's inclusion mask across all windows in this scalar tile.
+            // Active membership is independent of the window being decoded.
+            static_assert(STAGE4_SCALAR_TILE % SIMD_BATCH == 0);
+            std::array<uint64_t, STAGE4_SCALAR_TILE / SIMD_BATCH> include_masks{};
+            std::array<uint16_t, STAGE4_SCALAR_TILE / SIMD_BATCH> block_bits{};
+#endif
             [[maybe_unused]] std::array<uint32_t, STAGE4_SCALAR_TILE> out_base_tile{};
 
             for (size_t tile_start = start; tile_start < end; tile_start += STAGE4_SCALAR_TILE) {
                 const size_t tile_end = std::min(end, tile_start + STAGE4_SCALAR_TILE);
                 const size_t tile_len = tile_end - tile_start;
+#ifdef __wasm__
+                include_masks.fill(0);
+                block_bits.fill(0);
+#endif
                 for (size_t j = 0; j < tile_len; ++j) {
                     const size_t scalar_idx = tile_start + j;
                     const uint8_t m = msb_per_scalar[scalar_idx];
@@ -2677,6 +2824,13 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
                         out_base_tile[j] = out_base;
                     }
                     active_tile[j] = static_cast<uint8_t>(include);
+#ifdef __wasm__
+                    include_masks[j / SIMD_BATCH] |= static_cast<uint64_t>(include) << (j % SIMD_BATCH);
+                    if (include) {
+                        block_bits[j / SIMD_BATCH] =
+                            std::max(block_bits[j / SIMD_BATCH], static_cast<uint16_t>(m + 1));
+                    }
+#endif
                 }
 
                 for (size_t w = 0; w < windows_in_batch; ++w) {
@@ -2686,10 +2840,18 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
                     size_t i = tile_start;
                     while (i + SIMD_BATCH <= tile_end) {
                         const size_t rel = i - tile_start;
+#ifdef __wasm__
+                        const uint64_t include_mask = include_masks[rel / SIMD_BATCH];
+                        if (round_parallel_detail::window_above_scalar_bits(block_bits[rel / SIMD_BATCH], sched.bit_base[batch_start + w])) {
+                            i += SIMD_BATCH;
+                            continue;
+                        }
+#else
                         uint64_t include_mask = 0;
                         for (size_t k = 0; k < SIMD_BATCH; ++k) {
                             include_mask |= static_cast<uint64_t>(active_tile[rel + k]) << k;
                         }
+#endif
                         if (include_mask == 0) {
                             i += SIMD_BATCH;
                             continue;
@@ -2721,6 +2883,11 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
                         if (active_tile[rel] == 0) {
                             continue;
                         }
+#ifdef __wasm__
+                        if (round_parallel_detail::window_above_scalar_bits(static_cast<uint16_t>(msb_per_scalar[i] + 1), sched.bit_base[batch_start + w])) {
+                            continue;
+                        }
+#endif
                         const round_parallel_detail::ConstantineSliceParams sp = slice_params[w];
                         const uint32_t packed = round_parallel_detail::get_constantine_packed_digit(
                             scalars[i].data,
@@ -3283,7 +3450,10 @@ typename Curve::Element pippenger_round_parallel(PolynomialSpan<const typename C
     if (!use_glv) {
         round_parallel_detail::msm_parallel_for(hw_threads, [&](const ThreadChunk& chunk) {
             for (size_t i : chunk.range(n_input)) {
-                input_scalars[i].self_to_montgomery_form();
+                // to_montgomery_form(0) == 0, so canonical zeros are already restored.
+                if (!input_scalars[i].is_zero()) {
+                    input_scalars[i].self_to_montgomery_form();
+                }
             }
         });
     }

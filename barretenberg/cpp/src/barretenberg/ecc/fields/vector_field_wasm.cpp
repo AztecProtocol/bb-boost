@@ -1,10 +1,10 @@
-// Out-of-line explicit specializations of `VectorField<Params>::operator*` for
-// WASM. Compiled as a separate TU so LLVM emits each per-Params specialization
-// as a standalone function (not inlined into callers), giving it the same
-// register-allocation scope the gist's hand-written WAT function gets —
-// inlining across ~2400 lines of carefully ordered ops lets LLVM's instruction
-// scheduler re-coalesce locals and recreate the stream-reorder problem the
-// asm barriers solve.
+// Out-of-line explicit specializations of `VectorField<Params>::operator*` and
+// `VectorField<Params>::sqr` for WASM. Compiled as a separate TU so LLVM emits
+// each per-Params specialization as a standalone function (not inlined into
+// callers), giving it the same register-allocation scope the gist's
+// hand-written WAT function gets — inlining across ~2400 lines of carefully
+// ordered ops lets LLVM's instruction scheduler re-coalesce locals and recreate
+// the stream-reorder problem the asm barriers solve.
 //
 // The kernel body is hand-maintained (no generator script) in
 // vector_field_mont_mul_body.inl.hpp and #included once per specialization
@@ -12,7 +12,8 @@
 // BB_VF_KARATSUBA_STAGES_1_4, BB_VF_RUN_STAGES_6_THROUGH_10) reference
 // unqualified R_INV_WASM, P_WASM, R_INV_MOD_2_29 — these resolve in the
 // enclosing class scope to whichever Params constants the specialization
-// was bound to.
+// was bound to. The squaring body, vector_field_mont_sqr_body.inl.hpp, swaps
+// the first two for BB_VF_LOAD_SQR_LIMBS and BB_VF_KARATSUBA_SQR_STAGES_1_4.
 
 #include "barretenberg/ecc/curves/bn254/fq.hpp"
 #include "barretenberg/ecc/curves/bn254/fr.hpp"
@@ -331,6 +332,233 @@ namespace bb {
     const v128_t qri0 = (RIGHT).quad_data[0], qri1 = (RIGHT).quad_data[1], qri2 = (RIGHT).quad_data[2],                \
                  qri3 = (RIGHT).quad_data[3], qri4 = (RIGHT).quad_data[4], qri5 = (RIGHT).quad_data[5],                \
                  qri6 = (RIGHT).quad_data[6], qri7 = (RIGHT).quad_data[7], qri8 = (RIGHT).quad_data[8]
+
+// Load the 9-scalar-limb + 9-quad-limb single operand used by
+// BB_VF_KARATSUBA_SQR_STAGES_1_4.
+#define BB_VF_LOAD_SQR_LIMBS(SRC)                                                                                      \
+    const uint64_t sl0 = (SRC).scalar_data[0], sl1 = (SRC).scalar_data[1], sl2 = (SRC).scalar_data[2],                 \
+                   sl3 = (SRC).scalar_data[3], sl4 = (SRC).scalar_data[4], sl5 = (SRC).scalar_data[5],                 \
+                   sl6 = (SRC).scalar_data[6], sl7 = (SRC).scalar_data[7], sl8 = (SRC).scalar_data[8];                 \
+    const v128_t ql0 = (SRC).quad_data[0], ql1 = (SRC).quad_data[1], ql2 = (SRC).quad_data[2],                         \
+                 ql3 = (SRC).quad_data[3], ql4 = (SRC).quad_data[4], ql5 = (SRC).quad_data[5],                         \
+                 ql6 = (SRC).quad_data[6], ql7 = (SRC).quad_data[7], ql8 = (SRC).quad_data[8]
+
+// =====================================================================
+// Squaring counterpart of BB_VF_KARATSUBA_STAGES_1_4 over the single operand
+// `sl0..sl8` / `ql0..ql8`, producing the same pl*, ph*, pc* columns that the
+// multiply produces for identical operands, in 39 muls per lane instead of 66.
+//
+// With the same 5 + 4 split, all three partial products are squares
+// (P_lo = a_lo^2, P_hi = a_hi^2, P_cross = s^2 with s = a_lo + a_hi), so each
+// off-diagonal pair is one product against a doubled limb: 15 + 10 + 15 muls.
+// Two P_cross columns are not needed as such: pc8 = s4^2 = a4^2 = pl8 cancels
+// in stage 5, and pc7 enters only as pc7 - pl7 = 2 a4 (s3 - a3) = a8 * 2 a4,
+// emitted directly as pm7. That leaves 39.
+//
+// Bit-identity with operator*: in Z/2^64, sum_{i+j=k} x_i x_j equals
+// sum_{i<j} x_i (2 x_j) + x_{k/2}^2, and every product here is exact provided
+// each doubled quad operand fits its u32 lane (2 a_i < 2^32, 2 s_i < 2^32).
+// So the columns, temp_0..temp_16 after stage 5, and the reduced output equal
+// the multiply's for identical operands, limb for limb, for any limbs below
+// 2^30.
+//
+// No accumulator wraps for stored limbs (below 2^29): s_i < 2^30, 2 a_i < 2^30
+// and 2 s_i < 2^31, so every P_cross column is below 2^62 (e.g. pc4 =
+// s0 (2 a4) + s1 (2 s3) + s2^2 < 2^60 + 2^61 + 2^60) and every P_lo / P_hi
+// column is smaller.
+//
+// Same macro form and barrier discipline as BB_VF_KARATSUBA_STAGES_1_4.
+// =====================================================================
+#define BB_VF_KARATSUBA_SQR_STAGES_1_4()                                                                               \
+    /* Doubled limbs: each off-diagonal pair a_i a_j + a_j a_i (i < j) is one product a_i * (2 a_j). */                \
+    const uint64_t dsl1 = sl1 << 1;                                                                                    \
+    const v128_t dql1 = wasm_i32x4_shl(ql1, 1);                                                                        \
+    const uint64_t dsl2 = sl2 << 1;                                                                                    \
+    const v128_t dql2 = wasm_i32x4_shl(ql2, 1);                                                                        \
+    const uint64_t dsl3 = sl3 << 1;                                                                                    \
+    const v128_t dql3 = wasm_i32x4_shl(ql3, 1);                                                                        \
+    const uint64_t dsl4 = sl4 << 1;                                                                                    \
+    const v128_t dql4 = wasm_i32x4_shl(ql4, 1);                                                                        \
+    const uint64_t dsl6 = sl6 << 1;                                                                                    \
+    const v128_t dql6 = wasm_i32x4_shl(ql6, 1);                                                                        \
+    const uint64_t dsl7 = sl7 << 1;                                                                                    \
+    const v128_t dql7 = wasm_i32x4_shl(ql7, 1);                                                                        \
+    const uint64_t dsl8 = sl8 << 1;                                                                                    \
+    const v128_t dql8 = wasm_i32x4_shl(ql8, 1);                                                                        \
+    /* Stage 3 (hoisted): cross sums s = a_lo + a_hi and their doubles; s4 = a4, doubled in dsl4 / dql4. */            \
+    const uint64_t ssl0 = sl0 + sl5;                                                                                   \
+    const v128_t qsl0 = wasm_i32x4_add(ql0, ql5);                                                                      \
+    const uint64_t ssl1 = sl1 + sl6;                                                                                   \
+    const v128_t qsl1 = wasm_i32x4_add(ql1, ql6);                                                                      \
+    const uint64_t ssl2 = sl2 + sl7;                                                                                   \
+    const v128_t qsl2 = wasm_i32x4_add(ql2, ql7);                                                                      \
+    const uint64_t ssl3 = sl3 + sl8;                                                                                   \
+    const v128_t qsl3 = wasm_i32x4_add(ql3, ql8);                                                                      \
+    const uint64_t dssl1 = ssl1 << 1;                                                                                  \
+    const v128_t dqsl1 = wasm_i32x4_shl(qsl1, 1);                                                                      \
+    const uint64_t dssl2 = ssl2 << 1;                                                                                  \
+    const v128_t dqsl2 = wasm_i32x4_shl(qsl2, 1);                                                                      \
+    const uint64_t dssl3 = ssl3 << 1;                                                                                  \
+    const v128_t dqsl3 = wasm_i32x4_shl(qsl3, 1);                                                                      \
+    /* Stage 1: P_lo = a_lo^2 (15 muls, pl0..pl8). */                                                                  \
+    uint64_t pl0 = sl0 * sl0;                                                                                          \
+    v128_t pl0_lo = wasm_u64x2_extmul_low_u32x4(ql0, ql0);                                                             \
+    v128_t pl0_hi = wasm_u64x2_extmul_high_u32x4(ql0, ql0);                                                            \
+    vector_field_detail::bb_vf_barrier_sqq(pl0, pl0_lo, pl0_hi);                                                       \
+    uint64_t pl1 = sl0 * dsl1;                                                                                         \
+    v128_t pl1_lo = wasm_u64x2_extmul_low_u32x4(ql0, dql1);                                                            \
+    v128_t pl1_hi = wasm_u64x2_extmul_high_u32x4(ql0, dql1);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl1, pl1_lo, pl1_hi);                                                       \
+    uint64_t pl2 = sl0 * dsl2;                                                                                         \
+    v128_t pl2_lo = wasm_u64x2_extmul_low_u32x4(ql0, dql2);                                                            \
+    v128_t pl2_hi = wasm_u64x2_extmul_high_u32x4(ql0, dql2);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl2, pl2_lo, pl2_hi);                                                       \
+    pl2 += sl1 * sl1;                                                                                                  \
+    pl2_lo = wasm_i64x2_add(pl2_lo, wasm_u64x2_extmul_low_u32x4(ql1, ql1));                                            \
+    pl2_hi = wasm_i64x2_add(pl2_hi, wasm_u64x2_extmul_high_u32x4(ql1, ql1));                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl2, pl2_lo, pl2_hi);                                                       \
+    uint64_t pl3 = sl0 * dsl3;                                                                                         \
+    v128_t pl3_lo = wasm_u64x2_extmul_low_u32x4(ql0, dql3);                                                            \
+    v128_t pl3_hi = wasm_u64x2_extmul_high_u32x4(ql0, dql3);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl3, pl3_lo, pl3_hi);                                                       \
+    pl3 += sl1 * dsl2;                                                                                                 \
+    pl3_lo = wasm_i64x2_add(pl3_lo, wasm_u64x2_extmul_low_u32x4(ql1, dql2));                                           \
+    pl3_hi = wasm_i64x2_add(pl3_hi, wasm_u64x2_extmul_high_u32x4(ql1, dql2));                                          \
+    vector_field_detail::bb_vf_barrier_sqq(pl3, pl3_lo, pl3_hi);                                                       \
+    uint64_t pl4 = sl0 * dsl4;                                                                                         \
+    v128_t pl4_lo = wasm_u64x2_extmul_low_u32x4(ql0, dql4);                                                            \
+    v128_t pl4_hi = wasm_u64x2_extmul_high_u32x4(ql0, dql4);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl4, pl4_lo, pl4_hi);                                                       \
+    pl4 += sl1 * dsl3;                                                                                                 \
+    pl4_lo = wasm_i64x2_add(pl4_lo, wasm_u64x2_extmul_low_u32x4(ql1, dql3));                                           \
+    pl4_hi = wasm_i64x2_add(pl4_hi, wasm_u64x2_extmul_high_u32x4(ql1, dql3));                                          \
+    vector_field_detail::bb_vf_barrier_sqq(pl4, pl4_lo, pl4_hi);                                                       \
+    pl4 += sl2 * sl2;                                                                                                  \
+    pl4_lo = wasm_i64x2_add(pl4_lo, wasm_u64x2_extmul_low_u32x4(ql2, ql2));                                            \
+    pl4_hi = wasm_i64x2_add(pl4_hi, wasm_u64x2_extmul_high_u32x4(ql2, ql2));                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl4, pl4_lo, pl4_hi);                                                       \
+    uint64_t pl5 = sl1 * dsl4;                                                                                         \
+    v128_t pl5_lo = wasm_u64x2_extmul_low_u32x4(ql1, dql4);                                                            \
+    v128_t pl5_hi = wasm_u64x2_extmul_high_u32x4(ql1, dql4);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl5, pl5_lo, pl5_hi);                                                       \
+    pl5 += sl2 * dsl3;                                                                                                 \
+    pl5_lo = wasm_i64x2_add(pl5_lo, wasm_u64x2_extmul_low_u32x4(ql2, dql3));                                           \
+    pl5_hi = wasm_i64x2_add(pl5_hi, wasm_u64x2_extmul_high_u32x4(ql2, dql3));                                          \
+    vector_field_detail::bb_vf_barrier_sqq(pl5, pl5_lo, pl5_hi);                                                       \
+    uint64_t pl6 = sl2 * dsl4;                                                                                         \
+    v128_t pl6_lo = wasm_u64x2_extmul_low_u32x4(ql2, dql4);                                                            \
+    v128_t pl6_hi = wasm_u64x2_extmul_high_u32x4(ql2, dql4);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl6, pl6_lo, pl6_hi);                                                       \
+    pl6 += sl3 * sl3;                                                                                                  \
+    pl6_lo = wasm_i64x2_add(pl6_lo, wasm_u64x2_extmul_low_u32x4(ql3, ql3));                                            \
+    pl6_hi = wasm_i64x2_add(pl6_hi, wasm_u64x2_extmul_high_u32x4(ql3, ql3));                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl6, pl6_lo, pl6_hi);                                                       \
+    uint64_t pl7 = sl3 * dsl4;                                                                                         \
+    v128_t pl7_lo = wasm_u64x2_extmul_low_u32x4(ql3, dql4);                                                            \
+    v128_t pl7_hi = wasm_u64x2_extmul_high_u32x4(ql3, dql4);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pl7, pl7_lo, pl7_hi);                                                       \
+    uint64_t pl8 = sl4 * sl4;                                                                                          \
+    v128_t pl8_lo = wasm_u64x2_extmul_low_u32x4(ql4, ql4);                                                             \
+    v128_t pl8_hi = wasm_u64x2_extmul_high_u32x4(ql4, ql4);                                                            \
+    vector_field_detail::bb_vf_barrier_sqq(pl8, pl8_lo, pl8_hi);                                                       \
+    /* Stage 2: P_hi = a_hi^2 (10 muls, ph0..ph6). */                                                                  \
+    uint64_t ph0 = sl5 * sl5;                                                                                          \
+    v128_t ph0_lo = wasm_u64x2_extmul_low_u32x4(ql5, ql5);                                                             \
+    v128_t ph0_hi = wasm_u64x2_extmul_high_u32x4(ql5, ql5);                                                            \
+    vector_field_detail::bb_vf_barrier_sqq(ph0, ph0_lo, ph0_hi);                                                       \
+    uint64_t ph1 = sl5 * dsl6;                                                                                         \
+    v128_t ph1_lo = wasm_u64x2_extmul_low_u32x4(ql5, dql6);                                                            \
+    v128_t ph1_hi = wasm_u64x2_extmul_high_u32x4(ql5, dql6);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(ph1, ph1_lo, ph1_hi);                                                       \
+    uint64_t ph2 = sl5 * dsl7;                                                                                         \
+    v128_t ph2_lo = wasm_u64x2_extmul_low_u32x4(ql5, dql7);                                                            \
+    v128_t ph2_hi = wasm_u64x2_extmul_high_u32x4(ql5, dql7);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(ph2, ph2_lo, ph2_hi);                                                       \
+    ph2 += sl6 * sl6;                                                                                                  \
+    ph2_lo = wasm_i64x2_add(ph2_lo, wasm_u64x2_extmul_low_u32x4(ql6, ql6));                                            \
+    ph2_hi = wasm_i64x2_add(ph2_hi, wasm_u64x2_extmul_high_u32x4(ql6, ql6));                                           \
+    vector_field_detail::bb_vf_barrier_sqq(ph2, ph2_lo, ph2_hi);                                                       \
+    uint64_t ph3 = sl5 * dsl8;                                                                                         \
+    v128_t ph3_lo = wasm_u64x2_extmul_low_u32x4(ql5, dql8);                                                            \
+    v128_t ph3_hi = wasm_u64x2_extmul_high_u32x4(ql5, dql8);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(ph3, ph3_lo, ph3_hi);                                                       \
+    ph3 += sl6 * dsl7;                                                                                                 \
+    ph3_lo = wasm_i64x2_add(ph3_lo, wasm_u64x2_extmul_low_u32x4(ql6, dql7));                                           \
+    ph3_hi = wasm_i64x2_add(ph3_hi, wasm_u64x2_extmul_high_u32x4(ql6, dql7));                                          \
+    vector_field_detail::bb_vf_barrier_sqq(ph3, ph3_lo, ph3_hi);                                                       \
+    uint64_t ph4 = sl6 * dsl8;                                                                                         \
+    v128_t ph4_lo = wasm_u64x2_extmul_low_u32x4(ql6, dql8);                                                            \
+    v128_t ph4_hi = wasm_u64x2_extmul_high_u32x4(ql6, dql8);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(ph4, ph4_lo, ph4_hi);                                                       \
+    ph4 += sl7 * sl7;                                                                                                  \
+    ph4_lo = wasm_i64x2_add(ph4_lo, wasm_u64x2_extmul_low_u32x4(ql7, ql7));                                            \
+    ph4_hi = wasm_i64x2_add(ph4_hi, wasm_u64x2_extmul_high_u32x4(ql7, ql7));                                           \
+    vector_field_detail::bb_vf_barrier_sqq(ph4, ph4_lo, ph4_hi);                                                       \
+    uint64_t ph5 = sl7 * dsl8;                                                                                         \
+    v128_t ph5_lo = wasm_u64x2_extmul_low_u32x4(ql7, dql8);                                                            \
+    v128_t ph5_hi = wasm_u64x2_extmul_high_u32x4(ql7, dql8);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(ph5, ph5_lo, ph5_hi);                                                       \
+    uint64_t ph6 = sl8 * sl8;                                                                                          \
+    v128_t ph6_lo = wasm_u64x2_extmul_low_u32x4(ql8, ql8);                                                             \
+    v128_t ph6_hi = wasm_u64x2_extmul_high_u32x4(ql8, ql8);                                                            \
+    vector_field_detail::bb_vf_barrier_sqq(ph6, ph6_lo, ph6_hi);                                                       \
+    /* Stage 4: P_cross = s^2 (14 muls, pc0..pc6 and pm7 = pc7 - pl7 = a8 * 2 a4; pc8 = pl8 is omitted). */            \
+    uint64_t pc0 = ssl0 * ssl0;                                                                                        \
+    v128_t pc0_lo = wasm_u64x2_extmul_low_u32x4(qsl0, qsl0);                                                           \
+    v128_t pc0_hi = wasm_u64x2_extmul_high_u32x4(qsl0, qsl0);                                                          \
+    vector_field_detail::bb_vf_barrier_sqq(pc0, pc0_lo, pc0_hi);                                                       \
+    uint64_t pc1 = ssl0 * dssl1;                                                                                       \
+    v128_t pc1_lo = wasm_u64x2_extmul_low_u32x4(qsl0, dqsl1);                                                          \
+    v128_t pc1_hi = wasm_u64x2_extmul_high_u32x4(qsl0, dqsl1);                                                         \
+    vector_field_detail::bb_vf_barrier_sqq(pc1, pc1_lo, pc1_hi);                                                       \
+    uint64_t pc2 = ssl0 * dssl2;                                                                                       \
+    v128_t pc2_lo = wasm_u64x2_extmul_low_u32x4(qsl0, dqsl2);                                                          \
+    v128_t pc2_hi = wasm_u64x2_extmul_high_u32x4(qsl0, dqsl2);                                                         \
+    vector_field_detail::bb_vf_barrier_sqq(pc2, pc2_lo, pc2_hi);                                                       \
+    pc2 += ssl1 * ssl1;                                                                                                \
+    pc2_lo = wasm_i64x2_add(pc2_lo, wasm_u64x2_extmul_low_u32x4(qsl1, qsl1));                                          \
+    pc2_hi = wasm_i64x2_add(pc2_hi, wasm_u64x2_extmul_high_u32x4(qsl1, qsl1));                                         \
+    vector_field_detail::bb_vf_barrier_sqq(pc2, pc2_lo, pc2_hi);                                                       \
+    uint64_t pc3 = ssl0 * dssl3;                                                                                       \
+    v128_t pc3_lo = wasm_u64x2_extmul_low_u32x4(qsl0, dqsl3);                                                          \
+    v128_t pc3_hi = wasm_u64x2_extmul_high_u32x4(qsl0, dqsl3);                                                         \
+    vector_field_detail::bb_vf_barrier_sqq(pc3, pc3_lo, pc3_hi);                                                       \
+    pc3 += ssl1 * dssl2;                                                                                               \
+    pc3_lo = wasm_i64x2_add(pc3_lo, wasm_u64x2_extmul_low_u32x4(qsl1, dqsl2));                                         \
+    pc3_hi = wasm_i64x2_add(pc3_hi, wasm_u64x2_extmul_high_u32x4(qsl1, dqsl2));                                        \
+    vector_field_detail::bb_vf_barrier_sqq(pc3, pc3_lo, pc3_hi);                                                       \
+    uint64_t pc4 = ssl0 * dsl4;                                                                                        \
+    v128_t pc4_lo = wasm_u64x2_extmul_low_u32x4(qsl0, dql4);                                                           \
+    v128_t pc4_hi = wasm_u64x2_extmul_high_u32x4(qsl0, dql4);                                                          \
+    vector_field_detail::bb_vf_barrier_sqq(pc4, pc4_lo, pc4_hi);                                                       \
+    pc4 += ssl1 * dssl3;                                                                                               \
+    pc4_lo = wasm_i64x2_add(pc4_lo, wasm_u64x2_extmul_low_u32x4(qsl1, dqsl3));                                         \
+    pc4_hi = wasm_i64x2_add(pc4_hi, wasm_u64x2_extmul_high_u32x4(qsl1, dqsl3));                                        \
+    vector_field_detail::bb_vf_barrier_sqq(pc4, pc4_lo, pc4_hi);                                                       \
+    pc4 += ssl2 * ssl2;                                                                                                \
+    pc4_lo = wasm_i64x2_add(pc4_lo, wasm_u64x2_extmul_low_u32x4(qsl2, qsl2));                                          \
+    pc4_hi = wasm_i64x2_add(pc4_hi, wasm_u64x2_extmul_high_u32x4(qsl2, qsl2));                                         \
+    vector_field_detail::bb_vf_barrier_sqq(pc4, pc4_lo, pc4_hi);                                                       \
+    uint64_t pc5 = ssl1 * dsl4;                                                                                        \
+    v128_t pc5_lo = wasm_u64x2_extmul_low_u32x4(qsl1, dql4);                                                           \
+    v128_t pc5_hi = wasm_u64x2_extmul_high_u32x4(qsl1, dql4);                                                          \
+    vector_field_detail::bb_vf_barrier_sqq(pc5, pc5_lo, pc5_hi);                                                       \
+    pc5 += ssl2 * dssl3;                                                                                               \
+    pc5_lo = wasm_i64x2_add(pc5_lo, wasm_u64x2_extmul_low_u32x4(qsl2, dqsl3));                                         \
+    pc5_hi = wasm_i64x2_add(pc5_hi, wasm_u64x2_extmul_high_u32x4(qsl2, dqsl3));                                        \
+    vector_field_detail::bb_vf_barrier_sqq(pc5, pc5_lo, pc5_hi);                                                       \
+    uint64_t pc6 = ssl2 * dsl4;                                                                                        \
+    v128_t pc6_lo = wasm_u64x2_extmul_low_u32x4(qsl2, dql4);                                                           \
+    v128_t pc6_hi = wasm_u64x2_extmul_high_u32x4(qsl2, dql4);                                                          \
+    vector_field_detail::bb_vf_barrier_sqq(pc6, pc6_lo, pc6_hi);                                                       \
+    pc6 += ssl3 * ssl3;                                                                                                \
+    pc6_lo = wasm_i64x2_add(pc6_lo, wasm_u64x2_extmul_low_u32x4(qsl3, qsl3));                                          \
+    pc6_hi = wasm_i64x2_add(pc6_hi, wasm_u64x2_extmul_high_u32x4(qsl3, qsl3));                                         \
+    vector_field_detail::bb_vf_barrier_sqq(pc6, pc6_lo, pc6_hi);                                                       \
+    uint64_t pm7 = sl8 * dsl4;                                                                                         \
+    v128_t pm7_lo = wasm_u64x2_extmul_low_u32x4(ql8, dql4);                                                            \
+    v128_t pm7_hi = wasm_u64x2_extmul_high_u32x4(ql8, dql4);                                                           \
+    vector_field_detail::bb_vf_barrier_sqq(pm7, pm7_lo, pm7_hi);
 // clang-format on
 
 // Body of Stages 6..10. Takes 17 `temp_m` accumulators (scalar + tlo + thi) by
@@ -570,8 +798,22 @@ VectorField<Bn254FqParams> VectorField<Bn254FqParams>::operator*(const VectorFie
 #include "barretenberg/ecc/fields/vector_field_mont_mul_body.inl.hpp"
 }
 
+// sqr specializations: same per-Params stamping as operator*, over the
+// squaring kernel in vector_field_mont_sqr_body.inl.hpp.
+template <> VectorField<Bn254FrParams> VectorField<Bn254FrParams>::sqr() const noexcept
+{
+#include "barretenberg/ecc/fields/vector_field_mont_sqr_body.inl.hpp"
+}
+
+template <> VectorField<Bn254FqParams> VectorField<Bn254FqParams>::sqr() const noexcept
+{
+#include "barretenberg/ecc/fields/vector_field_mont_sqr_body.inl.hpp"
+}
+
 #undef BB_VF_RUN_STAGES_6_THROUGH_10
+#undef BB_VF_KARATSUBA_SQR_STAGES_1_4
 #undef BB_VF_KARATSUBA_STAGES_1_4
+#undef BB_VF_LOAD_SQR_LIMBS
 #undef BB_VF_LOAD_LIMBS
 
 } // namespace bb

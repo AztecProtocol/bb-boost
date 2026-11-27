@@ -279,6 +279,9 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
     }
     const bool many_balanced_members =
         large_members.size() > CONCURRENT_MIN_MEMBERS && max_large_n <= total_large_n / pool_width;
+    // The rollup stack's evolution of the shared concurrent-chunk path (few_wide_members, chunks to whole pool
+    // rounds, one arena block per worker), kept in the merge over the AVM leader's earlier gate (many balanced
+    // members only). Measured on the merged build: AVM's proving was not slower with it.
     const bool few_wide_members = (3 * pool_width) >= (8 * large_members.size()) && min_chunks >= pool_width;
     const bool large_members_concurrent = pool_width >= CONCURRENT_MIN_POOL_WIDTH && !large_members.empty() &&
                                           (many_balanced_members || few_wide_members) && scalar_spans_disjoint();
@@ -488,37 +491,69 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
                                              ? std::max<size_t>(1, aggregate_arena_budget / small_arena_bytes)
                                              : std::numeric_limits<size_t>::max();
         const size_t num_workers = std::min({ pool_width, small_members.size(), workers_by_budget });
-        std::unique_ptr<std::byte[]> small_arena_owner; // NOLINT(cppcoreguidelines-avoid-c-arrays)
-        if (small_arena_bytes > 0) {
-            small_arena_owner = std::make_unique_for_overwrite<std::byte[]>(
-                num_workers * small_arena_bytes); // NOLINT(cppcoreguidelines-avoid-c-arrays)
+#ifdef __wasm__
+        // When the budget, not the member count, leaves at most half the pool busy, run the members one at a
+        // time across the whole pool instead. Only if every member's full-width arena fits in the block the
+        // pool would allocate, so the one arena allocated in its place is never larger.
+        bool run_full_width =
+            workers_by_budget < std::min(pool_width, small_members.size()) && 2 * workers_by_budget <= pool_width;
+        size_t full_width_arena_bytes = 0;
+        for (size_t s = 0; run_full_width && s < small_members.size(); ++s) {
+            const size_t m = small_members[s];
+            const bool ext_glv = !external_glv_for(m, n_input[m]).empty();
+            const size_t bytes = compute_arena_bytes_for_msm<Curve>(n_input[m], ext_glv, info_for(m));
+            run_full_width = bytes <= num_workers * small_arena_bytes;
+            full_width_arena_bytes = std::max(full_width_arena_bytes, bytes);
         }
-        // A block this large is normally mapped on its own, so its free unmaps every resident page on this thread. The
-        // workers discard their slices' interior pages first, which leaves that free little to unmap. glibc still
-        // serves the block from the heap when free heap space holds it; the next allocation there then faults the
-        // discarded pages back in. The floor is release_pages_in_parallel's.
-        const bool release_slices = num_workers * small_arena_bytes >= (size_t{ 64 } << 20);
-        std::atomic<size_t> next_member{ 0 };
-        bb::parallel_for(num_workers, [&](size_t tid) {
-            std::span<std::byte> worker_arena;
-            if (small_arena_bytes > 0) {
-                worker_arena = { small_arena_owner.get() + (tid * small_arena_bytes), small_arena_bytes };
+        if (run_full_width) {
+            std::unique_ptr<std::byte[]> full_width_arena_owner; // NOLINT(cppcoreguidelines-avoid-c-arrays)
+            std::span<std::byte> full_width_arena;
+            if (full_width_arena_bytes > 0) {
+                full_width_arena_owner = std::make_unique_for_overwrite<std::byte[]>(
+                    full_width_arena_bytes); // NOLINT(cppcoreguidelines-avoid-c-arrays)
+                full_width_arena = std::span<std::byte>(full_width_arena_owner.get(), full_width_arena_bytes);
             }
-            while (true) {
-                const size_t s = next_member.fetch_add(1, std::memory_order_relaxed);
-                if (s >= small_members.size()) {
-                    break;
-                }
-                const size_t m = small_members[s];
+            for (size_t m : small_members) {
                 const size_t n = n_input[m];
                 PolynomialSpan<const ScalarField> sp(0, std::span<const ScalarField>(scalar_arrays[m].data(), n));
                 out_results[m] = pippenger_round_parallel<Curve>(
-                    sp, point_arrays[m], info_for(m), external_glv_for(m, n), worker_arena, /*max_threads=*/1);
+                    sp, point_arrays[m], info_for(m), external_glv_for(m, n), full_width_arena);
             }
-            if (release_slices) {
-                round_parallel_detail::release_arena_slice(worker_arena);
+        } else
+#endif
+        {
+            std::unique_ptr<std::byte[]> small_arena_owner; // NOLINT(cppcoreguidelines-avoid-c-arrays)
+            if (small_arena_bytes > 0) {
+                small_arena_owner = std::make_unique_for_overwrite<std::byte[]>(
+                    num_workers * small_arena_bytes); // NOLINT(cppcoreguidelines-avoid-c-arrays)
             }
-        });
+            // A block this large is normally mapped on its own, so its free unmaps every resident page on this
+            // thread. The workers discard their slices' interior pages first, which leaves that free little to unmap.
+            // glibc still serves the block from the heap when free heap space holds it; the next allocation there
+            // then faults the discarded pages back in. The floor is release_pages_in_parallel's.
+            const bool release_slices = num_workers * small_arena_bytes >= (size_t{ 64 } << 20);
+            std::atomic<size_t> next_member{ 0 };
+            bb::parallel_for(num_workers, [&](size_t tid) {
+                std::span<std::byte> worker_arena;
+                if (small_arena_bytes > 0) {
+                    worker_arena = { small_arena_owner.get() + (tid * small_arena_bytes), small_arena_bytes };
+                }
+                while (true) {
+                    const size_t s = next_member.fetch_add(1, std::memory_order_relaxed);
+                    if (s >= small_members.size()) {
+                        break;
+                    }
+                    const size_t m = small_members[s];
+                    const size_t n = n_input[m];
+                    PolynomialSpan<const ScalarField> sp(0, std::span<const ScalarField>(scalar_arrays[m].data(), n));
+                    out_results[m] = pippenger_round_parallel<Curve>(
+                        sp, point_arrays[m], info_for(m), external_glv_for(m, n), worker_arena, /*max_threads=*/1);
+                }
+                if (release_slices) {
+                    round_parallel_detail::release_arena_slice(worker_arena);
+                }
+            });
+        }
     }
 
     if (large_members_concurrent) {

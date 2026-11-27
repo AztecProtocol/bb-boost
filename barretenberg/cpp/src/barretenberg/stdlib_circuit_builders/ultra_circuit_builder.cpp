@@ -32,6 +32,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "barretenberg/common/thread.hpp"
+
 namespace bb {
 
 namespace {

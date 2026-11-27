@@ -10,6 +10,47 @@
 #include <algorithm>
 
 namespace bb {
+namespace {
+// Range of the micro limbs held by the range-constraint wires, and of the sorted steps appended to them.
+constexpr size_t MICRO_LIMB_RANGE = size_t{ 1 } << TranslatorProvingKey::Flavor::MICRO_LIMB_BITS;
+
+/**
+ * @brief Writes a multiset given by its histogram into `polynomial` at positions [1, end): position `pos` receives
+ * element `pos` of the multiset's non-descending sequence, so its smallest element is dropped.
+ *
+ * @details Each distinct value is converted to a field element once, through `ValueType` as the sorting vectors store
+ * it. The histogram's counts must sum to at least `end`; it is consumed.
+ */
+template <typename ValueType>
+void write_sorted_values_from_histogram(std::vector<uint32_t>& histogram,
+                                        TranslatorProvingKey::Polynomial& polynomial,
+                                        size_t end)
+{
+    using FF = TranslatorProvingKey::FF;
+    size_t value = 0;
+    const auto advance_to_next_present_value = [&]() {
+        while (histogram[value] == 0) {
+            value++;
+            BB_ASSERT_LT(
+                value, histogram.size(), "Translator: histogram holds fewer values than the ordered polynomial");
+        }
+    };
+    advance_to_next_present_value();
+    histogram[value]--;
+    size_t converted_value = value;
+    FF value_as_field = FF(static_cast<ValueType>(value));
+    for (size_t pos = 1; pos < end; pos++) {
+        advance_to_next_present_value();
+        if (value != converted_value) {
+            converted_value = value;
+            value_as_field = FF(static_cast<ValueType>(value));
+        }
+        polynomial.at(pos) = value_as_field;
+        histogram[value]--;
+    }
+}
+} // namespace
+
 /**
  * @brief Construct a set of polynomials that are the result of concatenating a group of polynomials into one.
  * Used in translator to reduce the number of commitments while preserving PCS compatibility.
@@ -83,24 +124,72 @@ void TranslatorProvingKey::compute_translator_range_constraint_ordered_polynomia
     const auto sorted_elements = get_sorted_steps();
     auto to_be_concatenated_groups = proving_key->polynomials.get_groups_to_be_concatenated();
     const size_t circuit_size = proving_key->polynomials.get_polynomial_size();
+    const size_t sorted_values_end = circuit_size - Flavor::MAX_RANDOM_VALUES_PER_ORDERED;
+
+    // Calculate how much space there is for values from the group polynomials given we also need to append the
+    // additional steps
+    const size_t free_space_before_runway = dyadic_circuit_size_without_masking - sorted_elements.size();
+
+    // Number of real values per lane: MINI_CIRCUIT_SIZE positions minus the virtual zero at index 0
+    // minus NUM_MASKED_ROWS_END masking rows at the end of each block
+    static constexpr size_t values_per_lane = Flavor::MINI_CIRCUIT_SIZE - 1 - Flavor::NUM_MASKED_ROWS_END;
+
+    // Sorts group_i by counting: its sorting vector would hold, below the runway, one value per slot, then the steps,
+    // so a histogram of those values determines the sorted sequence. Applies when the lanes fill every slot below the
+    // runway exactly once with values below MICRO_LIMB_RANGE; otherwise returns false having written only the
+    // overflow entries, which the comparison sort rewrites with the same values.
+    auto order_group_by_counting = [&](size_t i) -> bool {
+        const auto& group = to_be_concatenated_groups[i];
+        std::vector<uint32_t> histogram(MICRO_LIMB_RANGE, 0);
+        size_t num_counted = 0;
+        size_t extra_denominator_offset = i * sorted_elements.size();
+
+        for (size_t j = 0; j < Flavor::CONCATENATION_GROUP_SIZE; j++) {
+            const size_t start = group[j].start_index();
+            const size_t end = group[j].end_index() - Flavor::NUM_MASKED_ROWS_END;
+            // A lane longer than values_per_lane would overwrite the next lane's first slots.
+            if (end > start && end - start > values_per_lane) {
+                return false;
+            }
+            const size_t current_offset = j * values_per_lane;
+            for (size_t k = start; k < end; k++) {
+                const size_t vec_idx = current_offset + (k - start);
+                const auto value = static_cast<uint32_t>(uint256_t(group[j][k]).data[0]);
+                if (vec_idx < free_space_before_runway) {
+                    if (value >= MICRO_LIMB_RANGE) {
+                        return false;
+                    }
+                    histogram[value]++;
+                    num_counted++;
+                } else {
+                    extra_denominator_uint[extra_denominator_offset] = value;
+                    extra_denominator_offset++;
+                }
+            }
+        }
+
+        BB_ASSERT(extra_denominator_offset <= (i + 1) * Flavor::SORTED_STEPS_COUNT,
+                  "Translator: overflow entries exceed reserved space in ordered polynomial");
+        if (num_counted != free_space_before_runway) {
+            return false;
+        }
+        for (const size_t step : sorted_elements) {
+            BB_ASSERT_LT(step, MICRO_LIMB_RANGE);
+            histogram[step]++;
+        }
+        write_sorted_values_from_histogram<uint32_t>(histogram, ordered_constraint_polynomials[i], sorted_values_end);
+        return true;
+    };
 
     // Given the polynomials in group_i, transfer their elements, sorted in non-descending order, into the corresponding
     // ordered_range_constraint_i up to the given capacity and the remaining elements to the last range constraint.
     // Sorting is done by converting the elements to uint for efficiency.
-    auto ordering_function = [&](size_t i) {
+    auto order_group_by_comparison = [&](size_t i) {
         const auto& group = to_be_concatenated_groups[i];
         std::vector<uint32_t> ordered_vectors_uint(dyadic_circuit_size_without_masking);
 
-        // Calculate how much space there is for values from the group polynomials given we also need to append the
-        // additional steps
-        auto free_space_before_runway = dyadic_circuit_size_without_masking - sorted_elements.size();
-
         // Calculate the starting index of this group's overflowing elements in the extra denominator polynomial
         size_t extra_denominator_offset = i * sorted_elements.size();
-
-        // Number of real values per lane: MINI_CIRCUIT_SIZE positions minus the virtual zero at index 0
-        // minus NUM_MASKED_ROWS_END masking rows at the end of each block
-        static constexpr size_t values_per_lane = Flavor::MINI_CIRCUIT_SIZE - 1 - Flavor::NUM_MASKED_ROWS_END;
 
         // Go through each polynomial in the concatenated group
         for (size_t j = 0; j < Flavor::CONCATENATION_GROUP_SIZE; j++) {
@@ -148,15 +237,20 @@ void TranslatorProvingKey::compute_translator_range_constraint_ordered_polynomia
         // Place sorted values contiguously from position 1 to circuit_size - MAX_RANDOM_VALUES_PER_ORDERED
         // Position 0 remains 0 (virtual zero). Last MAX_RANDOM_VALUES_PER_ORDERED positions reserved for random values.
         size_t sorted_idx = 1; // Skip vec[0] (virtual zero at position 0)
-        for (size_t pos = 1; pos < circuit_size - Flavor::MAX_RANDOM_VALUES_PER_ORDERED; pos++) {
+        for (size_t pos = 1; pos < sorted_values_end; pos++) {
             ordered_constraint_polynomials[i].at(pos) = FF(ordered_vectors_uint[sorted_idx]);
             sorted_idx++;
         }
     };
 
-    // Construct the first NUM_CONCATENATED_POLYS - 1 polynomials (range constraint groups only)
+    // Construct the first NUM_CONCATENATED_POLYS - 1 polynomials (range constraint groups only). The counting attempt
+    // releases its histogram before the comparison sort allocates its vector.
     constexpr size_t NUM_RANGE_CONSTRAINT_GROUPS = Flavor::NUM_CONCATENATED_POLYS - 1;
-    parallel_for(NUM_RANGE_CONSTRAINT_GROUPS, ordering_function);
+    parallel_for(NUM_RANGE_CONSTRAINT_GROUPS, [&](size_t i) {
+        if (!order_group_by_counting(i)) {
+            order_group_by_comparison(i);
+        }
+    });
 
     // Advance the iterator into the extra range constraint past the last written element
     auto extra_denominator_it = extra_denominator_uint.begin();
@@ -164,18 +258,29 @@ void TranslatorProvingKey::compute_translator_range_constraint_ordered_polynomia
 
     // Add steps to the extra denominator polynomial to fill it
     std::copy(sorted_elements.cbegin(), sorted_elements.cend(), extra_denominator_it);
-    // Sort it
-#ifdef NO_PAR_ALGOS
-    std::sort(extra_denominator_uint.begin(), extra_denominator_uint.end());
-#else
-    std::sort(std::execution::par_unseq, extra_denominator_uint.begin(), extra_denominator_uint.end());
-#endif
 
-    // Place sorted values for the 5th polynomial
+    // Place sorted values for the 5th polynomial, by counting when every value is below MICRO_LIMB_RANGE
     // All polynomials reserve the same amount of space at the end
-    {
+    auto order_extra_by_counting = [&]() -> bool {
+        std::vector<uint32_t> histogram(MICRO_LIMB_RANGE, 0);
+        for (const size_t value : extra_denominator_uint) {
+            if (value >= MICRO_LIMB_RANGE) {
+                return false;
+            }
+            histogram[value]++;
+        }
+        write_sorted_values_from_histogram<size_t>(
+            histogram, proving_key->polynomials.ordered_range_constraints_4, sorted_values_end);
+        return true;
+    };
+    if (!order_extra_by_counting()) {
+#ifdef NO_PAR_ALGOS
+        std::sort(extra_denominator_uint.begin(), extra_denominator_uint.end());
+#else
+        std::sort(std::execution::par_unseq, extra_denominator_uint.begin(), extra_denominator_uint.end());
+#endif
         size_t sorted_idx = 1; // Skip vec[0] (virtual zero at position 0)
-        for (size_t pos = 1; pos < circuit_size - Flavor::MAX_RANDOM_VALUES_PER_ORDERED; pos++) {
+        for (size_t pos = 1; pos < sorted_values_end; pos++) {
             proving_key->polynomials.ordered_range_constraints_4.at(pos) = FF(extra_denominator_uint[sorted_idx]);
             sorted_idx++;
         }

@@ -76,6 +76,10 @@ template <typename FF_> class Poseidon2QuadInternalRelationImpl {
     static constexpr fr B3_U0_COEF = SIGMA_PLUS_2 * D1 - QuadParams::SIGMA - fr(3); // (Σ+2) D_1 - Σ - 3
     static constexpr fr D1_MINUS_3 = D1 - fr(3);                                    // D_1 - 3
 
+    // A permutation's rows of each Poseidon2 gate kind are interleaved in one trace block, so this selector is live
+    // on few edges of a SIMD sumcheck group (see HasSparseSelector).
+    static constexpr bool SPARSE_SELECTOR = true;
+
     /**
      * @brief Skip when the selector is identically zero on this row.
      */
@@ -234,7 +238,7 @@ template <typename FF_> class Poseidon2QuadInternalRelationImpl {
                                                      const AllEntities& in,
                                                      const Parameters& /*params*/,
                                                      const FF& scaling_factor,
-                                                     const SubrelationBatchingConstants& constants)
+                                                     const auto& constants)
     {
         using Accumulator = std::tuple_element_t<0, ContainerOverSubrelations>;
         using CoeffAcc = typename Accumulator::CoefficientAccumulator;

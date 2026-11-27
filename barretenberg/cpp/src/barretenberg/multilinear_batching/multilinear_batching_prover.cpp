@@ -8,7 +8,11 @@
 #include "barretenberg/common/bb_bench.hpp"
 #include "barretenberg/common/constexpr_utils.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
+#include "barretenberg/multilinear_batching/multilinear_batching_sumcheck.hpp"
 #include "barretenberg/sumcheck/sumcheck.hpp"
+
+#include <algorithm>
+#include <span>
 
 namespace bb {
 
@@ -24,6 +28,13 @@ MultilinearBatchingFlavor_<NumClaims>::ProvingKey::ProvingKey(std::vector<Prover
     const size_t virtual_circuit_size = 1 << MultilinearBatchingFlavor_<NumClaims>::VIRTUAL_LOG_N;
     const size_t log_circuit_size = bb::numeric::get_msb(circuit_size);
 
+    // The factored sumcheck divides by every 1 - r_j and needs at least two real rounds. Any other input builds the
+    // full eq tables as the generic sumcheck expects, including its handling of r_j = 1.
+    eq_factored = log_circuit_size >= 2 && std::ranges::all_of(claims, [&](const ProverClaim& claim) {
+                      return claim.challenge.size() >= log_circuit_size &&
+                             std::ranges::none_of(claim.challenge, [](const FF& r) { return r == FF(1); });
+                  });
+
     for (size_t idx = 0; idx < NUM_CLAIMS; ++idx) {
         auto& claim = claims[idx];
 
@@ -31,7 +42,12 @@ MultilinearBatchingFlavor_<NumClaims>::ProvingKey::ProvingKey(std::vector<Prover
         preshifted_polynomials[idx] = std::move(claim.shifted_polynomial);
         polynomials.shifted(idx) = preshifted_polynomials[idx].shifted();
 
-        polynomials.eq(idx) = ProverEqPolynomial<FF>::construct(claim.challenge, log_circuit_size);
+        if (eq_factored) {
+            eq_suffix_tables[idx] = ProverEqPolynomial<FF>::construct(std::span<const FF>(claim.challenge).subspan(1),
+                                                                      log_circuit_size - 1);
+        } else {
+            polynomials.eq(idx) = ProverEqPolynomial<FF>::construct(claim.challenge, log_circuit_size);
+        }
         polynomials.claim_challenges[idx] = std::move(claim.challenge);
 
         non_shifted_evaluations[idx] = claim.non_shifted_evaluation;
@@ -58,14 +74,20 @@ template <typename Flavor> void MultilinearBatchingProverInternal<Flavor>::execu
     const FF alpha = transcript->template get_challenge<FF>("Sumcheck:alpha");
     RelationParameters<FF> relation_parameters;
     relation_parameters.compute_multilinear_batching_challenges(claim_batching_challenge, Flavor::NUM_CLAIMS);
-    Sumcheck sumcheck(key.circuit_size,
-                      key.polynomials,
-                      transcript,
-                      alpha,
-                      /*gate_challenges=*/{}, // No need for gate challenges, all the relations are linearly dependent
-                      relation_parameters,
-                      Flavor::VIRTUAL_LOG_N);
-    sumcheck_output = sumcheck.prove();
+    if (key.eq_factored) {
+        MultilinearBatchingSumcheckProver<Flavor> sumcheck(key, transcript, alpha, relation_parameters);
+        sumcheck_output = sumcheck.prove();
+    } else {
+        Sumcheck sumcheck(
+            key.circuit_size,
+            key.polynomials,
+            transcript,
+            alpha,
+            /*gate_challenges=*/{}, // No need for gate challenges, all the relations are linearly dependent
+            relation_parameters,
+            Flavor::VIRTUAL_LOG_N);
+        sumcheck_output = sumcheck.prove();
+    }
 
     // Draw the merge challenge after the sumcheck's claimed evaluations are bound to the transcript, so that
     // the single opening of the combined accumulator commitment binds each P_i(r) individually.

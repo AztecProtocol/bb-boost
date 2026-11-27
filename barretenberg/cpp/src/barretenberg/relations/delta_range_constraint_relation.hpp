@@ -128,7 +128,7 @@ template <typename FF_> class DeltaRangeConstraintRelationImpl {
                                                      const AllEntities& in,
                                                      const Parameters& /*params*/,
                                                      const FF& scaling_factor,
-                                                     const SubrelationBatchingConstants& constants)
+                                                     const auto& constants)
     {
         using Accumulator = std::tuple_element_t<0, ContainerOverSubrelations>;
         using CoefficientAccumulator = typename Accumulator::CoefficientAccumulator;

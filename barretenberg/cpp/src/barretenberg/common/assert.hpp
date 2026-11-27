@@ -17,6 +17,17 @@ enum class AssertMode : std::uint8_t { ABORT, WARN };
 AssertMode& get_assert_mode();
 void assert_failure(std::string const& err);
 
+namespace detail {
+// Builds and reports a failed assertion's message out of line, so an assertion site costs its comparison and a call.
+// Formatting the message inline puts a std::ostringstream in every function that asserts, which inflates hot code
+// and the inliner's cost estimate for it. The message arguments are evaluated inside a lambda that captures by
+// reference: `__func__` there names the lambda, and a structured binding to a bit-field cannot appear in a message.
+template <typename MakeMessage> [[gnu::cold, gnu::noinline]] void assert_failed(MakeMessage make_message)
+{
+    assert_failure(make_message());
+}
+} // namespace detail
+
 // NOTE do not use in threaded contexts!
 struct AssertGuard {
     AssertGuard(AssertMode mode)
@@ -60,10 +71,12 @@ struct AssertGuard {
     do {                                                                                                               \
         BB_BENCH_ASSERT("BB_ASSERT" #expression);                                                                      \
         if (!(BB_LIKELY(expression))) {                                                                                \
-            std::ostringstream oss;                                                                                    \
-            oss << "Assertion failed: (" #expression ")";                                                              \
-            __VA_OPT__(oss << "\nReason   : " << __VA_ARGS__;)                                                         \
-            bb::assert_failure(oss.str());                                                                             \
+            bb::detail::assert_failed([&]() {                                                                          \
+                std::ostringstream oss;                                                                                \
+                oss << "Assertion failed: (" #expression ")";                                                          \
+                __VA_OPT__(oss << "\nReason   : " << __VA_ARGS__;)                                                     \
+                return oss.str();                                                                                      \
+            });                                                                                                        \
         }                                                                                                              \
     } while (0)
 #else
@@ -71,11 +84,13 @@ struct AssertGuard {
     do {                                                                                                               \
         BB_BENCH_ASSERT("BB_ASSERT" #expression);                                                                      \
         if (!(BB_LIKELY(expression))) {                                                                                \
-            std::ostringstream oss;                                                                                    \
-            oss << "Assertion failed: (" #expression ")";                                                              \
-            __VA_OPT__(oss << "\nReason   : " << __VA_ARGS__;)                                                         \
-            info(oss.str());                                                                                           \
-            bb::assert_failure(oss.str());                                                                             \
+            bb::detail::assert_failed([&]() {                                                                          \
+                std::ostringstream oss;                                                                                \
+                oss << "Assertion failed: (" #expression ")";                                                          \
+                __VA_OPT__(oss << "\nReason   : " << __VA_ARGS__;)                                                     \
+                info(oss.str());                                                                                       \
+                return oss.str();                                                                                      \
+            });                                                                                                        \
         }                                                                                                              \
     } while (0)
 #endif
@@ -86,12 +101,14 @@ struct AssertGuard {
         const auto& _actual = (actual);                                                                                \
         const auto& _expected = (expected);                                                                            \
         if (!(BB_LIKELY(_actual == _expected))) {                                                                      \
-            std::ostringstream oss;                                                                                    \
-            oss << "Assertion failed: (" #actual " == " #expected ")\n";                                               \
-            oss << "  Actual  : " << _actual << "\n";                                                                  \
-            oss << "  Expected: " << _expected;                                                                        \
-            __VA_OPT__(oss << "\n  Reason  : " << __VA_ARGS__;)                                                        \
-            bb::assert_failure(oss.str());                                                                             \
+            bb::detail::assert_failed([&]() {                                                                          \
+                std::ostringstream oss;                                                                                \
+                oss << "Assertion failed: (" #actual " == " #expected ")\n";                                           \
+                oss << "  Actual  : " << _actual << "\n";                                                              \
+                oss << "  Expected: " << _expected;                                                                    \
+                __VA_OPT__(oss << "\n  Reason  : " << __VA_ARGS__;)                                                    \
+                return oss.str();                                                                                      \
+            });                                                                                                        \
         }                                                                                                              \
     } while (0)
 
@@ -101,12 +118,14 @@ struct AssertGuard {
         const auto& _actual = (actual);                                                                                \
         const auto& _expected = (expected);                                                                            \
         if (!(BB_LIKELY(_actual != _expected))) {                                                                      \
-            std::ostringstream oss;                                                                                    \
-            oss << "Assertion failed: (" #actual " != " #expected ")\n";                                               \
-            oss << "  Actual  : " << _actual << "\n";                                                                  \
-            oss << "  Not expected: " << _expected;                                                                    \
-            __VA_OPT__(oss << "\n  Reason  : " << __VA_ARGS__;)                                                        \
-            bb::assert_failure(oss.str());                                                                             \
+            bb::detail::assert_failed([&]() {                                                                          \
+                std::ostringstream oss;                                                                                \
+                oss << "Assertion failed: (" #actual " != " #expected ")\n";                                           \
+                oss << "  Actual  : " << _actual << "\n";                                                              \
+                oss << "  Not expected: " << _expected;                                                                \
+                __VA_OPT__(oss << "\n  Reason  : " << __VA_ARGS__;)                                                    \
+                return oss.str();                                                                                      \
+            });                                                                                                        \
         }                                                                                                              \
     } while (0)
 
@@ -116,12 +135,14 @@ struct AssertGuard {
         const auto& _left = (left);                                                                                    \
         const auto& _right = (right);                                                                                  \
         if (!(BB_LIKELY(_left > _right))) {                                                                            \
-            std::ostringstream oss;                                                                                    \
-            oss << "Assertion failed: (" #left " > " #right ")\n";                                                     \
-            oss << "  Left   : " << _left << "\n";                                                                     \
-            oss << "  Right  : " << _right;                                                                            \
-            __VA_OPT__(oss << "\n  Reason : " << __VA_ARGS__;)                                                         \
-            bb::assert_failure(oss.str());                                                                             \
+            bb::detail::assert_failed([&]() {                                                                          \
+                std::ostringstream oss;                                                                                \
+                oss << "Assertion failed: (" #left " > " #right ")\n";                                                 \
+                oss << "  Left   : " << _left << "\n";                                                                 \
+                oss << "  Right  : " << _right;                                                                        \
+                __VA_OPT__(oss << "\n  Reason : " << __VA_ARGS__;)                                                     \
+                return oss.str();                                                                                      \
+            });                                                                                                        \
         }                                                                                                              \
     } while (0)
 
@@ -131,12 +152,14 @@ struct AssertGuard {
         const auto& _left = (left);                                                                                    \
         const auto& _right = (right);                                                                                  \
         if (!(BB_LIKELY(_left >= _right))) {                                                                           \
-            std::ostringstream oss;                                                                                    \
-            oss << "Assertion failed: (" #left " >= " #right ")\n";                                                    \
-            oss << "  Left   : " << _left << "\n";                                                                     \
-            oss << "  Right  : " << _right;                                                                            \
-            __VA_OPT__(oss << "\n  Reason : " << __VA_ARGS__;)                                                         \
-            bb::assert_failure(oss.str());                                                                             \
+            bb::detail::assert_failed([&]() {                                                                          \
+                std::ostringstream oss;                                                                                \
+                oss << "Assertion failed: (" #left " >= " #right ")\n";                                                \
+                oss << "  Left   : " << _left << "\n";                                                                 \
+                oss << "  Right  : " << _right;                                                                        \
+                __VA_OPT__(oss << "\n  Reason : " << __VA_ARGS__;)                                                     \
+                return oss.str();                                                                                      \
+            });                                                                                                        \
         }                                                                                                              \
     } while (0)
 
@@ -146,12 +169,14 @@ struct AssertGuard {
         const auto& _left = (left);                                                                                    \
         const auto& _right = (right);                                                                                  \
         if (!(BB_LIKELY(_left < _right))) {                                                                            \
-            std::ostringstream oss;                                                                                    \
-            oss << "Assertion failed: (" #left " < " #right ")\n";                                                     \
-            oss << "  Left   : " << _left << "\n";                                                                     \
-            oss << "  Right  : " << _right;                                                                            \
-            __VA_OPT__(oss << "\n  Reason : " << __VA_ARGS__;)                                                         \
-            bb::assert_failure(oss.str());                                                                             \
+            bb::detail::assert_failed([&]() {                                                                          \
+                std::ostringstream oss;                                                                                \
+                oss << "Assertion failed: (" #left " < " #right ")\n";                                                 \
+                oss << "  Left   : " << _left << "\n";                                                                 \
+                oss << "  Right  : " << _right;                                                                        \
+                __VA_OPT__(oss << "\n  Reason : " << __VA_ARGS__;)                                                     \
+                return oss.str();                                                                                      \
+            });                                                                                                        \
         }                                                                                                              \
     } while (0)
 
@@ -161,12 +186,14 @@ struct AssertGuard {
         const auto& _left = (left);                                                                                    \
         const auto& _right = (right);                                                                                  \
         if (!(BB_LIKELY(_left <= _right))) {                                                                           \
-            std::ostringstream oss;                                                                                    \
-            oss << "Assertion failed: (" #left " <= " #right ")\n";                                                    \
-            oss << "  Left   : " << _left << "\n";                                                                     \
-            oss << "  Right  : " << _right;                                                                            \
-            __VA_OPT__(oss << "\n  Reason : " << __VA_ARGS__;)                                                         \
-            bb::assert_failure(oss.str());                                                                             \
+            bb::detail::assert_failed([&]() {                                                                          \
+                std::ostringstream oss;                                                                                \
+                oss << "Assertion failed: (" #left " <= " #right ")\n";                                                \
+                oss << "  Left   : " << _left << "\n";                                                                 \
+                oss << "  Right  : " << _right;                                                                        \
+                __VA_OPT__(oss << "\n  Reason : " << __VA_ARGS__;)                                                     \
+                return oss.str();                                                                                      \
+            });                                                                                                        \
         }                                                                                                              \
     } while (0)
 

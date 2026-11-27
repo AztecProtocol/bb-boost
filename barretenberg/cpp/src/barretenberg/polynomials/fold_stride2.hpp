@@ -159,7 +159,59 @@ void fold_stride4_backed_range(const Polynomial<Fr>& src,
                                const Fr& first_challenge,
                                const Fr& second_challenge)
 {
-    for (size_t k = k_begin; k < k_end; ++k) {
+    size_t k = k_begin;
+#if defined(__wasm_simd128__)
+    if constexpr (simd_supported_v<Fr>) {
+        using Vec = VectorField<typename Fr::Params>;
+        constexpr size_t WIDTH = Vec::SIZE;
+        const Vec first = Vec::broadcast(first_challenge);
+        const Vec second = Vec::broadcast(second_challenge);
+        const auto same = [](const Fr& a, const Fr& b) {
+            return a.data[0] == b.data[0] && a.data[1] == b.data[1] && a.data[2] == b.data[2] && a.data[3] == b.data[3];
+        };
+        // The first output can straddle a virtual-zero prefix. Preserve its scalar path.
+        for (; k < k_end && 4 * k < src.start_index(); ++k) {
+            const Fr even = fold_pair(src[4 * k], src[(4 * k) + 1], first_challenge);
+            const Fr odd = fold_pair(src[(4 * k) + 2], src[(4 * k) + 3], first_challenge);
+            dst[ScalarIndex{ k }] = fold_pair(even, odd, second_challenge);
+        }
+        for (; k + WIDTH <= k_end && 4 * (k + WIDTH) <= src.end_index(); k += WIDTH) {
+            const Fr* values = src.data() + (4 * k - src.start_index());
+            bool constant_block = true;
+            bool dense_block = true;
+            for (size_t lane = 0; lane < WIDTH; ++lane) {
+                const bool left_equal = same(values[4 * lane], values[4 * lane + 1]);
+                const bool right_equal = same(values[4 * lane + 2], values[4 * lane + 3]);
+                constant_block = constant_block && left_equal && right_equal &&
+                                 same(values[4 * lane], values[4 * lane + 2]);
+                dense_block = dense_block && !left_equal && !right_equal;
+            }
+            if (constant_block) {
+                // Preserve bit-identical constant/zero runs without packing or multiplying.
+                for (size_t lane = 0; lane < WIDTH; ++lane) {
+                    dst[ScalarIndex{ k + lane }] = values[4 * lane];
+                }
+            } else if (dense_block) {
+                const auto fold_lanes = [&](size_t offset) {
+                    const Vec even = Vec::from_lanes([&](size_t lane) { return values[4 * lane + offset]; });
+                    const Vec odd = Vec::from_lanes([&](size_t lane) { return values[4 * lane + offset + 1]; });
+                    return even + first * (odd - even);
+                };
+                const Vec even = fold_lanes(0);
+                const Vec odd = fold_lanes(2);
+                dst[ContiguousVectorIndex<WIDTH>{ k }] = even + second * (odd - even);
+            } else {
+                // Mixed sparse groups retain each scalar equality shortcut.
+                for (size_t lane = 0; lane < WIDTH; ++lane) {
+                    const Fr even = fold_pair(values[4 * lane], values[4 * lane + 1], first_challenge);
+                    const Fr odd = fold_pair(values[4 * lane + 2], values[4 * lane + 3], first_challenge);
+                    dst[ScalarIndex{ k + lane }] = fold_pair(even, odd, second_challenge);
+                }
+            }
+        }
+    }
+#endif
+    for (; k < k_end; ++k) {
         const Fr even = fold_pair(src[4 * k], src[(4 * k) + 1], first_challenge);
         const Fr odd = fold_pair(src[(4 * k) + 2], src[(4 * k) + 3], first_challenge);
         dst[ScalarIndex{ k }] = fold_pair(even, odd, second_challenge);
@@ -242,6 +294,38 @@ template <typename Fr> class FoldedPolynomialView {
     {}
 
     Fr operator[](const size_t k) const { return fold_pair((*source)[2 * k], (*source)[(2 * k) + 1], challenge); }
+#if defined(__wasm_simd128__)
+    // Load strided folded values for a SIMD edge. Constant/mixed groups keep the scalar shortcuts;
+    // only a group with no bit-identical source pair replaces all scalar multiplies by one packed multiply.
+    template <typename Element> Element gather_folded(const size_t begin, const size_t stride) const
+    {
+        constexpr size_t WIDTH = Element::SIZE;
+        static_assert(WIDTH <= 32);
+        std::array<const Fr*, WIDTH> evens;
+        std::array<const Fr*, WIDTH> odds;
+        uint32_t equal_mask = 0;
+        for (size_t lane = 0; lane < WIDTH; ++lane) {
+            const size_t k = begin + stride * lane;
+            evens[lane] = &(*source)[2 * k];
+            odds[lane] = &(*source)[2 * k + 1];
+            const auto& a = *evens[lane];
+            const auto& b = *odds[lane];
+            if (a.data[0] == b.data[0] && a.data[1] == b.data[1] && a.data[2] == b.data[2] && a.data[3] == b.data[3]) {
+                equal_mask |= uint32_t{ 1 } << lane;
+            }
+        }
+        if (equal_mask != 0) {
+            return Element::from_lanes([&](size_t lane) {
+                return (equal_mask & (uint32_t{ 1 } << lane)) != 0
+                           ? *evens[lane]
+                           : *evens[lane] + challenge * (*odds[lane] - *evens[lane]);
+            });
+        }
+        const Element even = Element::from_lanes([&](size_t lane) { return *evens[lane]; });
+        const Element odd = Element::from_lanes([&](size_t lane) { return *odds[lane]; });
+        return even + Element::broadcast(challenge) * (odd - even);
+    }
+#endif
     size_t start_index() const { return range.first; }
     size_t end_index() const { return range.second; }
     size_t size() const { return range.second - range.first; }
