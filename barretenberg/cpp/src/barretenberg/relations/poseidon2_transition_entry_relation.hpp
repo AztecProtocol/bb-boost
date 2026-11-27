@@ -66,6 +66,10 @@ template <typename FF_> class Poseidon2TransitionEntryRelationImpl {
     static constexpr auto& A2_one = QuadParams::A2_one;
     static constexpr fr sum_A_one = QuadParams::sum_A_one;
 
+    // A permutation's rows of each Poseidon2 gate kind are interleaved in one trace block, so this selector is live
+    // on few edges of a SIMD sumcheck group (see HasSparseSelector).
+    static constexpr bool SPARSE_SELECTOR = true;
+
     template <typename AllEntities> inline static bool skip(const AllEntities& in)
     {
         return in[AllEntities::EntityId::q_poseidon2_transition_entry].is_zero();
@@ -161,7 +165,7 @@ template <typename FF_> class Poseidon2TransitionEntryRelationImpl {
                                                      const AllEntities& in,
                                                      const Parameters& /*params*/,
                                                      const FF& scaling_factor,
-                                                     const SubrelationBatchingConstants& constants)
+                                                     const auto& constants)
     {
         using Accumulator = std::tuple_element_t<0, ContainerOverSubrelations>;
         using CoeffAcc = typename Accumulator::CoefficientAccumulator;

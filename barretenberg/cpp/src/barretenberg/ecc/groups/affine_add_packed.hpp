@@ -11,6 +11,27 @@
 
 namespace bb::group_elements {
 
+#if BB_VECTOR_FIELD_SIMD
+namespace detail {
+// Keep scalar tails and Fr packed arithmetic on the original multiply.
+template <typename Value>
+[[gnu::always_inline]] inline Value affine_add_square(const Value& value) noexcept
+{
+    return value * value;
+}
+
+template <typename Params>
+[[gnu::always_inline]] inline VectorField<Params> affine_add_square(const VectorField<Params>& value) noexcept
+{
+    if constexpr (std::is_same_v<Params, Bn254FqParams>) {
+        return value.sqr_for_affine();
+    } else {
+        return value * value;
+    }
+}
+} // namespace detail
+#endif
+
 // Scratch buffers for batch_affine_add, one VectorFieldPushSpan each: the per-element denominators
 // dx = x2 - x1, numerators dy = y2 - y1, coordinate sums xsum = x1 + x2, and inverted denominators
 // inv. All four must be distinct from one another and from the point spans, and inv must not alias dx
@@ -62,7 +83,11 @@ inline void batch_affine_add(const VectorAffineElementPushSpan<Params>& lhs,
         out.y,
         [](const auto& x1, const auto& y1, const auto& dy, const auto& inv, const auto& xsum, auto& ox, auto& oy) {
             auto slope = dy * inv;
+#if BB_VECTOR_FIELD_SIMD
+            auto x3 = detail::affine_add_square(slope) - xsum;
+#else
             auto x3 = slope * slope - xsum;
+#endif
             auto y3 = slope * (x1 - x3) - y1;
             ox = x3;
             oy = y3;

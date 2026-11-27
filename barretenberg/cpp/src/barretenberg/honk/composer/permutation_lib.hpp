@@ -148,7 +148,14 @@ void compute_permutation_argument_polynomials(const typename Flavor::CircuitBuil
                 for (size_t node_idx = 0; node_idx + 1 < cycle_size; ++node_idx) {
                     const cycle_node& current = cycle[node_idx];
                     const cycle_node& next = cycle[node_idx + 1];
+#ifdef __wasm__
+                    // Phase 1 already constructed this exact identity. Only first nodes receive
+                    // id tags below; next is a non-first node in this disjoint cycle, so no worker
+                    // can modify its identity during this phase.
+                    sigmas[current.wire_idx].at(current.gate_idx) = ids[next.wire_idx].at(next.gate_idx);
+#else
                     sigmas[current.wire_idx].at(current.gate_idx) = FF(next.gate_idx + (SEPARATOR * next.wire_idx));
+#endif
                 }
 
                 const uint32_t var_tag = real_variable_tags[cycle_idx];

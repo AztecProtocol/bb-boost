@@ -37,9 +37,15 @@ constexpr size_t CACHE_LINE_SIZE = 64;
 // How long an idle thread busy-waits for the next job (workers) or for the job to finish (caller) before blocking on a
 // condition variable. Provers issue thousands of short parallel_for calls back to back (sumcheck rounds, MSM stages,
 // per-polynomial loops); waking a blocked thread costs tens of microseconds, which is comparable to the work itself.
+#ifdef __wasm__
+// On WASM the spin is bounded by a poll count, not the clock: steady_clock::now() is a call out to the host's WASI
+// clock_time_get, which bb.js answers in whole milliseconds, so a 100 us deadline would last until the next tick.
+constexpr size_t SPIN_POLLS = size_t{ 1 } << 19;
+#else
 constexpr auto SPIN_DURATION = std::chrono::microseconds(100);
 // The clock is only read once every SPIN_CLOCK_INTERVAL spins.
 constexpr size_t SPIN_CLOCK_INTERVAL = 64;
+#endif
 
 inline void cpu_relax()
 {
@@ -51,11 +57,20 @@ inline void cpu_relax()
 }
 
 /**
- * @brief Busy-waits until `done()` holds or SPIN_DURATION elapses.
+ * @brief Busy-waits until `done()` holds or the spin bound (SPIN_POLLS, or SPIN_DURATION off WASM) is reached.
  * @return true if `done()` holds.
  */
 template <typename Done> bool spin_until(const Done& done)
 {
+#ifdef __wasm__
+    for (size_t polls = 0; polls < SPIN_POLLS; ++polls) {
+        if (done()) {
+            return true;
+        }
+        cpu_relax();
+    }
+    return done();
+#else
     auto deadline = std::chrono::steady_clock::now() + SPIN_DURATION;
     for (size_t spins = 1;; ++spins) {
         if (done()) {
@@ -66,6 +81,7 @@ template <typename Done> bool spin_until(const Done& done)
         }
         cpu_relax();
     }
+#endif
 }
 
 /**

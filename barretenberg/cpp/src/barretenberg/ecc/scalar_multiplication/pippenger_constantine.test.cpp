@@ -446,3 +446,9 @@ TEST(PippengerConstantine, ParamClassifierU64U32Consistency)
         }
     }
 }
+
+#include "pippenger_window_skip.test.hpp"
+TEST(PippengerConstantine, WindowBlockSkipPreservesNonzeroDigits)
+{
+    EXPECT_EQ((bb::test::check_msm_window_skip<true>()), 0U);
+}

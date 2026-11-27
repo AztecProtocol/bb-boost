@@ -44,6 +44,9 @@ void construct_lookup_table_polynomials(const RefArray<typename Flavor::Polynomi
  * @details Read counts are needed for the log derivative lookup argument. The table polynomials are constructed as a
  * concatenation of basic 3-column tables. Similarly, the read counts polynomial is constructed as the concatenation of
  * read counts for the individual tables.
+ *
+ * The counts are accumulated per table as integers, then each read entry gets one field addition (instead of one
+ * field increment per lookup).
  */
 template <typename Flavor>
 void construct_lookup_read_counts(typename Flavor::Polynomial& read_counts,

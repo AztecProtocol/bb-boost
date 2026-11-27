@@ -66,6 +66,15 @@ template <IsVectorField T> inline constexpr size_t lane_count<T> = T::SIZE;
 template <typename Relation>
 concept HasProverSubrelationBatching = requires { typename Relation::SubrelationBatchingConstants; };
 
+/**
+ * @brief Relations whose gate rows are interleaved with other gate kinds in their trace block, so their selector is
+ * live on few edges of a SIMD group (`SPARSE_SELECTOR = true`).
+ * @details The SIMD sumcheck evaluates such a relation lane by lane when it does not skip a group: a group in which a
+ * single edge is live is accumulated on the scalar path, one edge instead of `lane_count` lanes.
+ */
+template <typename Relation>
+concept HasSparseSelector = requires { requires Relation::SPARSE_SELECTOR; };
+
 template <typename Relation> struct SubrelationBatchingSlot {
     using type = std::monostate;
 };
@@ -317,9 +326,20 @@ template <typename Flavor> class SumcheckProverRound {
                 // Gather each lane's edge pair: `Element::from_lanes` reads `(current_edge + 2j, +1)` for lane
                 // j -- `lane_count` strided pairs for `VectorField`, just `(current_edge, current_edge + 1)`
                 // for scalar `FF`.
-                cache[index] = bb::Univariate<Element, 2>(
-                    { Element::from_lanes([&](size_t lane) { return multivariate[current_edge + (2 * lane)]; }),
-                      Element::from_lanes([&](size_t lane) { return multivariate[current_edge + (2 * lane) + 1]; }) });
+#if defined(__wasm_simd128__)
+                if constexpr (IsVectorField<Element> && requires {
+                                  multivariate.template gather_folded<Element>(current_edge, size_t{ 2 });
+                              }) {
+                    cache[index] = bb::Univariate<Element, 2>(
+                        { multivariate.template gather_folded<Element>(current_edge, 2),
+                          multivariate.template gather_folded<Element>(current_edge + 1, 2) });
+                } else
+#endif
+                {
+                    cache[index] = bb::Univariate<Element, 2>(
+                        { Element::from_lanes([&](size_t lane) { return multivariate[current_edge + (2 * lane)]; }),
+                          Element::from_lanes([&](size_t lane) { return multivariate[current_edge + (2 * lane) + 1]; }) });
+                }
                 materialized.set(index);
             }
             return cache[index];
@@ -635,26 +655,47 @@ template <typename Flavor> class SumcheckProverRound {
         }
     }
 
+    // No scalar evaluation of single live lanes (scalar element, or callers outside the SIMD main loop).
+    struct NoLaneFallback {};
+
+    // The scalar tail's state, through which a SIMD group's `HasSparseSelector` relations are evaluated edge by edge:
+    // its edge container, its `FF` accumulators (into which the wide accumulator is reduced at slot end), the scalar
+    // parameters, and the group's first edge.
+    template <typename ScalarEdges, typename Multivariates> struct LaneFallback {
+        ScalarEdges& edges;
+        SumcheckTupleOfTuplesOfUnivariates& accumulators;
+        const Multivariates& polynomials;
+        const bb::RelationParameters<FF>& parameters;
+        const bb::GateSeparatorPolynomial<FF>& gate_separators;
+        size_t group_begin;
+    };
+
     // Fold one edge's relation contributions into `accumulator`: position `edge_container` at `edge_idx`,
     // then run the relation set (in the element type `Element`, deduced from `params`) scaled by the
     // gate-separator factor. Both `accumulate_edge_chunks` passes share this body -- the full-group pass
     // calls it with the wide `VectorField` element (`edges` / `wide_accumulator`), the leftover-pair pass
     // with the scalar `FF` element (`tail_edges` / `result`); they differ only in which element they pass.
-    template <typename Accumulators, typename Edges, typename Multivariates, typename Element>
+    template <typename Accumulators,
+              typename Edges,
+              typename Multivariates,
+              typename Element,
+              typename Fallback = NoLaneFallback>
     void accumulate_edge(Accumulators& accumulator,
                          Edges& edge_container,
                          const Multivariates& polynomials,
                          const bb::RelationParameters<Element>& params,
                          const bb::GateSeparatorPolynomial<FF>& gate_separators,
                          const size_t edge_idx,
-                         const SubrelationBatching* subrelation_batching)
+                         const SubrelationBatching* subrelation_batching,
+                         const Fallback& lane_fallback = {})
     {
         SumcheckProverRound::load_edge(edge_container, polynomials, edge_idx);
         accumulate_relation_univariates<RelationTupleFor<Element>>(accumulator,
                                                                    edge_container,
                                                                    params,
                                                                    element_scaling<Element>(gate_separators, edge_idx),
-                                                                   subrelation_batching);
+                                                                   subrelation_batching,
+                                                                   lane_fallback);
     }
 
     // Accumulate the round univariate over `chunks` in element type `Element`. Each work-stealing slot owns a
@@ -688,13 +729,26 @@ template <typename Flavor> class SumcheckProverRound {
                     chunk->end,
                     EDGE_STRIDE,
                     [&](const size_t edge_idx) {
-                        accumulate_edge(wide_accumulator,
-                                        edges,
-                                        polynomials,
-                                        element_parameters,
-                                        gate_separators,
-                                        edge_idx,
-                                        subrelation_batching);
+                        if constexpr (IsVectorField<Element>) {
+                            accumulate_edge(
+                                wide_accumulator,
+                                edges,
+                                polynomials,
+                                element_parameters,
+                                gate_separators,
+                                edge_idx,
+                                subrelation_batching,
+                                LaneFallback<decltype(tail_edges), std::decay_t<decltype(polynomials)>>{
+                                    tail_edges, result, polynomials, relation_parameters, gate_separators, edge_idx });
+                        } else {
+                            accumulate_edge(wide_accumulator,
+                                            edges,
+                                            polynomials,
+                                            element_parameters,
+                                            gate_separators,
+                                            edge_idx,
+                                            subrelation_batching);
+                        }
                     },
                     [&](const size_t edge_idx) {
                         accumulate_edge(result,
@@ -1266,50 +1320,112 @@ template <typename Flavor> class SumcheckProverRound {
      * @result #univariate_accumulators are updated with the contribution from the current group of edges.  For each
      * relation, a univariate of some degree is computed by accumulating the contributions of each group of edges.
      */
-    template <typename RelationTuple = Relations, typename Accumulators, typename Edges, typename Element>
+    template <typename RelationTuple = Relations,
+              typename Accumulators,
+              typename Edges,
+              typename Element,
+              typename Fallback = NoLaneFallback>
     void accumulate_relation_univariates(Accumulators& univariate_accumulators,
                                          const Edges& extended_edges,
                                          const bb::RelationParameters<Element>& relation_parameters,
                                          const Element& scaling_factor,
-                                         const SubrelationBatching* subrelation_batching = nullptr)
+                                         const SubrelationBatching* subrelation_batching = nullptr,
+                                         const Fallback& lane_fallback = {})
     {
         // `RelationTuple` is `Relations` or `Flavor::Relations_<Element>` -- the same relation set over
         // different fields, so its size is always NUM_RELATIONS.
         static_assert(std::tuple_size_v<RelationTuple> == NUM_RELATIONS);
         constexpr_for<0, NUM_RELATIONS, 1>([&]<size_t relation_idx>() {
             using Relation = std::tuple_element_t<relation_idx, RelationTuple>;
-            auto accumulate_relation = [&]() {
-                // Subrelation batching is wired for the scalar element only; `RelationTuple` is then `Relations`.
-                if constexpr (HasProverSubrelationBatching<Relation> && std::same_as<Element, FF>) {
-                    if (subrelation_batching != nullptr) {
-                        const auto& constants = std::get<relation_idx>(*subrelation_batching);
-                        if (constants.has_value()) {
-                            Relation::accumulate_with_subrelation_batching(
-                                std::get<relation_idx>(univariate_accumulators),
-                                extended_edges,
-                                relation_parameters,
-                                scaling_factor,
-                                *constants);
-                            return;
-                        }
+            // Check if the relation is skippable to speed up accumulation
+            if constexpr (isSkippable<Relation, decltype(extended_edges)>) {
+                // If so, only compute the contribution if the relation is active
+                if (Relation::skip(extended_edges)) {
+                    return;
+                }
+                if constexpr (!std::same_as<Fallback, NoLaneFallback> && HasSparseSelector<Relation>) {
+                    if (accumulate_sparse_lanes<relation_idx, lane_count<Element>>(lane_fallback,
+                                                                                   subrelation_batching)) {
+                        return;
                     }
                 }
-                Relation::accumulate(std::get<relation_idx>(univariate_accumulators),
-                                     extended_edges,
-                                     relation_parameters,
-                                     scaling_factor);
-            };
-            // Check if the relation is skippable to speed up accumulation
-            if constexpr (!isSkippable<Relation, decltype(extended_edges)>) {
-                // If not, accumulate normally
-                accumulate_relation();
-            } else {
-                // If so, only compute the contribution if the relation is active
-                if (!Relation::skip(extended_edges)) {
-                    accumulate_relation();
+            }
+            accumulate_relation<relation_idx, Relation>(std::get<relation_idx>(univariate_accumulators),
+                                                        extended_edges,
+                                                        relation_parameters,
+                                                        scaling_factor,
+                                                        subrelation_batching);
+        });
+    }
+
+    // Accumulate one relation's contribution for the current edge (or SIMD group), through the prover-only
+    // subrelation batching when the relation has it and its constants are set.
+    template <size_t relation_idx, typename Relation, typename RelationAccumulator, typename Edges, typename Element>
+    static void accumulate_relation(RelationAccumulator& relation_accumulator,
+                                    const Edges& extended_edges,
+                                    const bb::RelationParameters<Element>& relation_parameters,
+                                    const Element& scaling_factor,
+                                    const SubrelationBatching* subrelation_batching)
+    {
+        // Packed WASM lanes share the scalar separators. The batching hooks broadcast their scalar
+        // constants while retaining the same separator-weighted formulas as the scalar prover.
+#if defined(__wasm__) && defined(__wasm_simd128__)
+        constexpr bool can_batch =
+            HasProverSubrelationBatching<Relation> && (std::same_as<Element, FF> || IsVectorField<Element>);
+#else
+        constexpr bool can_batch = HasProverSubrelationBatching<Relation> && std::same_as<Element, FF>;
+#endif
+        if constexpr (can_batch) {
+            if (subrelation_batching != nullptr) {
+                const auto& constants = std::get<relation_idx>(*subrelation_batching);
+                if (constants.has_value()) {
+                    Relation::accumulate_with_subrelation_batching(
+                        relation_accumulator, extended_edges, relation_parameters, scaling_factor, *constants);
+                    return;
                 }
             }
-        });
+        }
+        Relation::accumulate(relation_accumulator, extended_edges, relation_parameters, scaling_factor);
+    }
+
+    /**
+     * @brief Evaluate a `HasSparseSelector` relation that does not skip the SIMD group starting at
+     * `fallback.group_begin` lane by lane, if at most one of the group's `LANES` edges is live.
+     * @details Edge `group_begin + 2j` is lane j of the group. Each is tested with the relation's scalar `skip()`, the
+     * test the scalar path applies to every edge. With no live edge the group contributes nothing; with one, that
+     * edge is accumulated into the scalar accumulators exactly as the scalar tail would accumulate it. Both are
+     * exact field sums of the same per-edge contributions, so the round univariate is unchanged.
+     * @return false if two or more edges are live, in which case the caller evaluates the whole group.
+     */
+    template <size_t relation_idx, size_t LANES, typename Fallback>
+    static bool accumulate_sparse_lanes(const Fallback& fallback, const SubrelationBatching* subrelation_batching)
+    {
+        using ScalarRelation = std::tuple_element_t<relation_idx, RelationTupleFor<FF>>;
+        size_t live_edge = 0;
+        size_t num_live = 0;
+        size_t loaded_edge = 0;
+        for (size_t lane = 0; lane < LANES; ++lane) {
+            loaded_edge = fallback.group_begin + (2 * lane);
+            load_edge(fallback.edges, fallback.polynomials, loaded_edge);
+            if (!ScalarRelation::skip(fallback.edges)) {
+                if (++num_live > 1) {
+                    return false;
+                }
+                live_edge = loaded_edge;
+            }
+        }
+        if (num_live == 0) {
+            return true;
+        }
+        if (loaded_edge != live_edge) {
+            load_edge(fallback.edges, fallback.polynomials, live_edge);
+        }
+        accumulate_relation<relation_idx, ScalarRelation>(std::get<relation_idx>(fallback.accumulators),
+                                                          fallback.edges,
+                                                          fallback.parameters,
+                                                          element_scaling<FF>(fallback.gate_separators, live_edge),
+                                                          subrelation_batching);
+        return true;
     }
 
     /**

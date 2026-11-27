@@ -16,6 +16,8 @@
 //    in the product phase, NOT 81. Combined with 9 Yuval reductions × 9
 //    madConst = 81, total is 66+81 = 147. Schoolbook would have been 81+81 =
 //    162. The gist: "it's ~25% of the total runtime."
+//    sqr() keeps the split but squares each part, doubling the off-diagonal
+//    terms: 39 muls in the product phase (see vector_field_wasm.cpp).
 //
 // 2. Op-by-op interleaving.
 //    Scalar statement, then equivalent quad statement, then next scalar, etc.
@@ -103,12 +105,12 @@ template <class Params> inline constexpr std::array<uint64_t, 9> compute_tnm_was
     return tnm;
 }
 
-// Marker trait: specialized to true for each Params whose VectorField has a
-// SIMD operator* body (an explicit specialization defined in
+// Marker trait: specialized to true for each Params whose VectorField has
+// SIMD operator* and sqr bodies (explicit specializations defined in
 // vector_field_wasm.cpp). vectorized_for / vectorized_for_if read this to
 // decide whether to take the bulk path. Add a new specialization (below)
-// when adding the corresponding operator* body so the gate and the body
-// stay in lockstep.
+// when adding the corresponding operator* and sqr bodies so the gate and the
+// bodies stay in lockstep.
 template <class Params> struct has_simd_mont_mul : std::false_type {};
 template <class Params> inline constexpr bool has_simd_mont_mul_v = has_simd_mont_mul<Params>::value;
 
@@ -192,8 +194,17 @@ template <class Params> struct alignas(32) VectorField {
     static VectorField zero() noexcept { return broadcast(Field::zero()); }
     static VectorField one() noexcept { return broadcast(Field::one()); }
 
+#if BB_VECTOR_FIELD_SIMD
+    // Under WASM SIMD, sqr has explicit specializations for Bn254FrParams and Bn254FqParams next to operator*
+    // (see vector_field_wasm.cpp), with the same link-time contract. Their output limbs equal (*this) * (*this).
+    VectorField sqr() const noexcept;
+    // Square entry point for the packed affine addition.
+    VectorField sqr_for_affine() const noexcept { return sqr(); }
+    void self_sqr() noexcept { *this = sqr(); }
+#else
     VectorField sqr() const noexcept { return (*this) * (*this); }
     void self_sqr() noexcept { *this = (*this) * (*this); }
+#endif
     VectorField operator-() const noexcept { return zero() - *this; }
     // Per-lane scalar invert. Slow path -- for static-init constants and rare relation use. For batched
     // inversions of independent values use the K=5 batch-inversion pattern in ecc/groups/element_impl.hpp.
@@ -291,18 +302,20 @@ template <class Params> struct alignas(32) VectorField {
                                   base[idx[2] - offset],
                                   base[idx[3] - offset],
                                   base[idx[4] - offset] };
-        return VectorField(tmp);
+        return VectorField(tmp.data());
     }
 
     // Counterpart to `gather` for sources that aren't a flat `Field*` -- e.g. a polynomial's `operator[]`,
     // which handles virtual-zero and start-index translation. lane L is set to value_at(L).
+    // The lanes are staged contiguously, so they pack through the transpose constructor rather than the per-lane
+    // scalar pack of the std::array constructor (the limbs are identical).
     template <typename Fn> static VectorField from_lanes(const Fn& value_at) noexcept
     {
         std::array<Field, SIZE> lanes;
         for (size_t lane = 0; lane < SIZE; ++lane) {
             lanes[lane] = value_at(lane);
         }
-        return VectorField(lanes);
+        return VectorField(lanes.data());
     }
 
     // SLOW PATH — see gather. Writes base[idx[L] - offset] = this->get(L) for L in 0..4.

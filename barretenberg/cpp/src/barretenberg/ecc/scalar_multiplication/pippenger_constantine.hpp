@@ -36,6 +36,14 @@
 
 namespace bb::scalar_multiplication::round_parallel_detail {
 
+// A Booth window starts reading at bit_base - 1. Equality must remain live:
+// a scalar whose highest bit is that lookback bit can produce a carry digit.
+// maximum_bit_length excludes inactive/zero scalars and is at most 254 (128 for GLV).
+[[nodiscard]] constexpr bool window_above_scalar_bits(uint16_t maximum_bit_length, size_t bit_base) noexcept
+{
+    return maximum_bit_length < bit_base;
+}
+
 // Bring the shared signed-Booth slice primitive (from ecc/groups/booth_recode.hpp) into
 // this namespace so the MSM-specific readers below can call it unqualified. The same
 // primitive is also used by the GLV-endo straus path in element_impl.hpp; only the
