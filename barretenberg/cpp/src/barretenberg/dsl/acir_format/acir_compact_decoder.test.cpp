@@ -213,5 +213,6 @@ TEST(AcirCompactDecoder, RejectsTruncatedAssertMessages)
     std::vector<uint8_t> buf = serialize_program(test_circuit());
     // The assert messages are the last field of the circuit; the empty unconstrained function list follows them.
     buf.resize(buf.size() - 2);
-    EXPECT_THROW_WITH_MESSAGE(circuit_buf_to_acir_format(std::move(buf), /*is_mega=*/true), "malformed msgpack data");
+    EXPECT_THROW_WITH_MESSAGE(circuit_buf_to_acir_format(std::move(buf), /*is_mega=*/true),
+                              "malformed msgpack while reading Circuit::assert_messages element");
 }
