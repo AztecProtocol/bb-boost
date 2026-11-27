@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bb-boost benchmarks</title>
+<style>
+  :root {
+    --page: #f9f9f9; --surface: #ffffff; --ink: #191919; --ink-2: #666666; --grid: #e7e7e7; --axis: #c2c2c2;
+    --series: #257de0; --good: #006c10; --bad: #c62a2b; --warn-bg: #fff4d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #0b0b0b; --surface: #191919; --ink: #efefef; --ink-2: #9c9c9c; --grid: #303030; --axis: #474747;
+      --series: #338ced; --good: #53c556; --bad: #eb6263; --warn-bg: #3a2f10;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 2px; }
+  p { margin: 6px 0; }
+  .muted { color: var(--ink-2); }
+  a { color: var(--series); }
+  .points { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 6px; padding: 0; list-style: none; }
+  .points li { background: var(--surface); border: 1px solid var(--grid); border-radius: 6px; padding: 6px 10px; }
+  .points b { display: block; }
+  .controls { margin: 18px 0 8px; display: flex; gap: 6px; align-items: center; }
+  .controls button { font: inherit; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--axis);
+                     background: var(--surface); color: var(--ink); cursor: pointer; }
+  .controls button[aria-pressed="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+  section { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 16px;
+            margin: 16px 0; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 12px 0; }
+  .chart h3 { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
+  .chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .chart text { fill: var(--ink-2); font-size: 11px; }
+  .chart .value { fill: var(--ink); font-weight: 600; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 5px 8px; border-bottom: 1px solid var(--grid); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink-2); font-weight: 600; }
+  tr.summary td { font-weight: 600; }
+  .good { color: var(--good); }
+  .bad { color: var(--bad); }
+  .flag { color: var(--bad); font-weight: 600; }
+  .note { background: var(--warn-bg); border-radius: 6px; padding: 6px 10px; }
+  #tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--surface); padding: 4px 8px;
+         border-radius: 4px; font-size: 12px; display: none; white-space: pre; z-index: 2; }
+</style>
+</head>
+<body>
+<main>
+  <h1>bb-boost benchmarks</h1>
+  <p class="muted" id="intro">Loading…</p>
+  <ul class="points" id="points"></ul>
+  <p class="muted">Each column was timed on its own GitHub-hosted runner, with every point taking turns on the same
+    machine: time is the fastest of the runs, memory the highest peak RSS. Compare points within a column; hosted
+    runners are small (4 CPUs, 16 GB), so absolute times are far from a many-core prover machine's. Changes are
+    against the first point; the column's summary is the geometric mean over its inputs.</p>
+  <div class="controls" role="group" aria-label="Table metric">
+    <span class="muted">Tables show</span>
+    <button type="button" data-metric="ms" aria-pressed="true">Time</button>
+    <button type="button" data-metric="mb" aria-pressed="false">Peak memory</button>
+  </div>
+  <div id="columns"></div>
+  <p class="muted">Raw data: <a href="data.json">data.json</a>, and per point in aztec-packages' bench format
+    (<code>[{name, value, unit}]</code>): <span id="raw"></span>. Each run's data stays under <code>runs/&lt;run id&gt;/</code>.</p>
+</main>
+<div id="tip" role="tooltip"></div>
+<script>
+"use strict";
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  for (const k of kids) e.append(k);
+  return e;
+};
+const svgEl = (tag, attrs = {}) => {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+};
+const pct = r => r == null ? "–" : `${r >= 1 ? "+" : "−"}${Math.abs((r - 1) * 100).toFixed(1)}%`;
+const fmt = (v, metric) => metric === "ms" ? `${(v / 1000).toFixed(2)} s` : `${(v / 1000).toFixed(2)} GB`;
+const tone = r => r == null || Math.abs(r - 1) < 0.005 ? "" : r < 1 ? "good" : "bad";
+const tip = document.getElementById("tip");
+let data, metric = "ms";
+
+function chart(title, points, ratios) {
+  // One series: the change against the first point, at each point. Zero line at the base.
+  const W = 340, H = 170, L = 44, R = 16, T = 14, B = 34;
+  const vals = ratios.map(r => r == null ? null : (r - 1) * 100);
+  const known = vals.filter(v => v != null);
+  let lo = Math.min(0, ...known), hi = Math.max(0, ...known);
+  const pad = Math.max(5, (hi - lo) * 0.12); lo -= pad; hi += pad;
+  const x = i => L + (points.length === 1 ? 0 : i * (W - L - R) / (points.length - 1));
+  const y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title });
+  const step = niceStep((hi - lo) / 4);
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) {
+    svg.append(svgEl("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: v === 0 ? "var(--axis)" : "var(--grid)",
+                               "stroke-width": 1 }));
+    const t = svgEl("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end" });
+    t.textContent = `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(Math.round(v))}%`;
+    svg.append(t);
+  }
+  points.forEach((p, i) => {
+    const t = svgEl("text", { x: x(i), y: H - 12, "text-anchor": i === 0 ? "start" : i === points.length - 1 ? "end" : "middle" });
+    t.textContent = p.pr ? `+#${p.pr}` : p.label;  // the point cards above give the full labels
+    svg.append(t);
+  });
+  const seg = [];
+  vals.forEach((v, i) => { if (v != null) seg.push(`${seg.length ? "L" : "M"}${x(i)},${y(v)}`); });
+  svg.append(svgEl("path", { d: seg.join(""), fill: "none", stroke: "var(--series)", "stroke-width": 2,
+                             "stroke-linejoin": "round" }));
+  vals.forEach((v, i) => {
+    if (v == null) return;
+    svg.append(svgEl("circle", { cx: x(i), cy: y(v), r: 4, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2 }));
+    const hit = svgEl("circle", { cx: x(i), cy: y(v), r: 14, fill: "transparent" });
+    hit.addEventListener("pointermove", e => showTip(e, `${points[i].label}\n${pct(ratios[i])} vs ${points[0].label}`));
+    hit.addEventListener("pointerleave", hideTip);
+    svg.append(hit);
+  });
+  const last = vals.length - 1;
+  if (vals[last] != null) {
+    const t = svgEl("text", { x: x(last), y: y(vals[last]) + (vals[last] < 0 ? 16 : -9), "text-anchor": "end", class: "value" });
+    t.textContent = pct(ratios[last]);
+    svg.append(t);
+  }
+  return el("div", { class: "chart" }, el("h3", {}, title), svg);
+}
+
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= raw) return m * p;
+  return 10 * p;
+}
+function showTip(e, text) {
+  tip.textContent = text; tip.style.display = "block";
+  tip.style.left = `${e.clientX + 12}px`; tip.style.top = `${e.clientY + 12}px`;
+}
+function hideTip() { tip.style.display = "none"; }
+
+function table(col, points) {
+  const head = el("tr", {}, el("th", {}, "Input"), ...points.map(p => el("th", {}, p.label)));
+  const rows = [];
+  const s = col.summary;
+  const key = metric === "ms" ? "time_ratio" : "memory_ratio";
+  rows.push(el("tr", { class: "summary" }, el("td", {}, `All inputs (geomean vs ${points[0].label})`),
+    ...points.map(p => {
+      const r = s[p.id][key];
+      return el("td", { class: tone(r), title: `${s[p.id].n} inputs` }, pct(r));
+    })));
+  for (const c of col.cases) {
+    const base = c.values[points[0].id] || {};
+    rows.push(el("tr", {}, el("td", {}, c.id.split("/").slice(1).join("/")), ...points.map((p, i) => {
+      const v = c.values[p.id] || {};
+      if (!(metric in v)) {
+        const td = el("td", { class: "flag" }, v.error ? "failed" : "–");
+        if (v.error) td.title = v.error;
+        return td;
+      }
+      const td = el("td", {}, fmt(v[metric], metric));
+      if (i > 0 && metric in base) {
+        const r = v[metric] / base[metric];
+        td.append(" ", el("span", { class: tone(r) }, pct(r)));
+      }
+      if ((c.verified || {})[p.id] === false) td.append(" ", el("span", { class: "flag", title: "The original bb rejects this point's proof" }, "✗ proof"));
+      if (v.swapped) td.append(" ", el("span", { class: "muted", title: "The machine swapped during a run" }, "(swapped)"));
+      return td;
+    })));
+  }
+  return el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, ...rows)));
+}
+
+function render() {
+  const pts = data.points, root = document.getElementById("columns");
+  root.replaceChildren();
+  for (const col of data.columns) {
+    const m = col.machine || {};
+    const sec = el("section", {}, el("h2", {}, col.title),
+      el("p", { class: "muted" }, `${m.cpus ?? "?"} CPUs (${m.cpu ?? "unknown CPU"}), ${m.memory_gb ?? "?"} GB; ` +
+        `HARDWARE_CONCURRENCY=${col.threads}; fastest of ${col.repeats} runs, highest peak RSS.`));
+    const notes = [];
+    if (col.skipped.length) notes.push(`Left out: ${col.skipped.join(", ")}.`);
+    if (col.stopped_early) notes.push("Stopped at the time limit: some inputs have fewer runs.");
+    for (const n of notes) sec.append(el("p", { class: "note" }, n));
+    sec.append(el("div", { class: "charts" },
+      chart("Time vs " + pts[0].label + " (geomean over inputs)", pts, pts.map(p => col.summary[p.id].time_ratio)),
+      chart("Peak memory vs " + pts[0].label + " (geomean over inputs)", pts, pts.map(p => col.summary[p.id].memory_ratio))));
+    sec.append(table(col, pts));
+    root.append(sec);
+  }
+}
+
+fetch("data.json", { cache: "no-cache" }).then(r => r.json()).then(d => {
+  data = d;
+  const intro = document.getElementById("intro");
+  intro.textContent = `bb at each step of bb-boost's main branch, measured ${d.generated.replace("T", " ").replace("Z", " UTC")}. `;
+  if (d.run_url) intro.append(el("a", { href: d.run_url }, "The workflow run"), ".");
+  const ul = document.getElementById("points");
+  const repo = "https://github.com/AztecProtocol/bb-boost";
+  for (const p of d.points) {
+    const link = el("a", { href: p.pr ? `${repo}/pull/${p.pr}` : `${repo}/commit/${p.ref}` }, p.pr ? `#${p.pr}` : p.ref.slice(0, 10));
+    ul.append(el("li", {}, el("b", {}, p.label), p.title, " (", link, ")"));
+  }
+  const raw = document.getElementById("raw");
+  d.points.forEach((p, i) => { if (i) raw.append(", "); raw.append(el("a", { href: `${p.id}.bench.json` }, `${p.id}.bench.json`)); });
+  render();
+}).catch(e => { document.getElementById("intro").textContent = `Couldn't load data.json: ${e}`; });
+
+for (const b of document.querySelectorAll("[data-metric]")) {
+  b.addEventListener("click", () => {
+    metric = b.dataset.metric;
+    for (const o of document.querySelectorAll("[data-metric]")) o.setAttribute("aria-pressed", String(o === b));
+    if (data) render();
+  });
+}
+</script>
+</body>
+</html>

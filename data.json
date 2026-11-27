@@ -1,0 +1,1194 @@
+{
+ "generated": "2026-11-27T18:29:02Z",
+ "run_url": "https://github.com/AztecProtocol/bb-boost/actions/runs/46034354424",
+ "points": [
+  {
+   "id": "base",
+   "label": "v6.1.0",
+   "title": "bb v6.1.0, as released by aztec-packages",
+   "ref": "806d6ca51baf4e5eeafd7d54691d59176dce249b",
+   "pr": null
+  },
+  {
+   "id": "pr1",
+   "label": "+ #1 AVM",
+   "title": "Season 2 leaders (1/3): the AVM leader's stack",
+   "ref": "fd15e950e66ab081e2c01078f30c15d923d034d6",
+   "pr": 1
+  },
+  {
+   "id": "pr2",
+   "label": "+ #2 rollup",
+   "title": "Season 2 leaders (2/3): the rollup leader's stack",
+   "ref": "812cd13d50bfb8cb25a17b7723bfbb163d5ea2fd",
+   "pr": 2
+  },
+  {
+   "id": "pr3",
+   "label": "+ #3 client-WASM",
+   "title": "Season 2 leaders (3/3): the client-WASM leader's stack",
+   "ref": "eb054124f0c70937d5db3401fad980a09f640d8f",
+   "pr": 3
+  }
+ ],
+ "columns": [
+  {
+   "column": "client",
+   "title": "Client: aztec-packages' pinned Chonk flows (native)",
+   "machine": {
+    "cpus": 4,
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "memory_gb": 15.6,
+    "runner": "GitHub Actions 1002595926"
+   },
+   "threads": 4,
+   "repeats": 3,
+   "skipped": [],
+   "stopped_early": false,
+   "cases": [
+    {
+     "id": "client/deploy_ecdsar1+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/deploy_ecdsar1+sponsored_fpc/native",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 6475.998376000007,
+       "mb": 256.732
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 3212.3891749999984,
+       "mb": 234.616
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 3163.679762000015,
+       "mb": 234.308
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 3066.8355860000247,
+       "mb": 235.54
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/deploy_schnorr+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/deploy_schnorr+sponsored_fpc/native",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 2960.638802999938,
+       "mb": 230.788
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 2910.6783029999406,
+       "mb": 230.164
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 2811.8134939999777,
+       "mb": 231.024
+      },
+      "base": {
+       "runs": 3,
+       "ms": 6075.330804999965,
+       "mb": 252.488
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/ecdsar1+amm_add_liquidity_1_recursions+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/ecdsar1+amm_add_liquidity_1_recursions+sponsored_fpc/native",
+     "values": {
+      "pr2": {
+       "runs": 3,
+       "ms": 4920.343578000029,
+       "mb": 221.748
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 4723.8830790000175,
+       "mb": 222.892
+      },
+      "base": {
+       "runs": 3,
+       "ms": 9642.659521000041,
+       "mb": 261.3
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 5023.033036000001,
+       "mb": 224.936
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/ecdsar1+deploy_tokenContract_with_registration+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/ecdsar1+deploy_tokenContract_with_registration+sponsored_fpc/native",
+     "values": {
+      "pr3": {
+       "runs": 3,
+       "ms": 3515.2254829999947,
+       "mb": 244.428
+      },
+      "base": {
+       "runs": 3,
+       "ms": 7480.053171999998,
+       "mb": 268.108
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 3862.9261690000476,
+       "mb": 234.34
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 3764.062943000056,
+       "mb": 230.912
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/ecdsar1+storage_proof_7_layers+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/ecdsar1+storage_proof_7_layers+sponsored_fpc/native",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 20177.943483999912,
+       "mb": 650.76
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 9440.762023000047,
+       "mb": 504.436
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 9136.567313,
+       "mb": 504.416
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 8580.229892000034,
+       "mb": 506.504
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/ecdsar1+token_bridge_claim_private+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/ecdsar1+token_bridge_claim_private+sponsored_fpc/native",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 3263.3121740000206,
+       "mb": 226.944
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 3211.889360999976,
+       "mb": 222.776
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 3063.2534979999946,
+       "mb": 224.984
+      },
+      "base": {
+       "runs": 3,
+       "ms": 6535.990613000024,
+       "mb": 260.508
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/ecdsar1+transfer_0_recursions+private_fpc",
+     "prefix": "aztec-packages/app-proving/ecdsar1+transfer_0_recursions+private_fpc/native",
+     "values": {
+      "pr2": {
+       "runs": 3,
+       "ms": 4167.993659999979,
+       "mb": 230.116
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 3965.385212000001,
+       "mb": 231.152
+      },
+      "base": {
+       "runs": 3,
+       "ms": 8382.876580000015,
+       "mb": 261.048
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 4265.769303000014,
+       "mb": 229.388
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/ecdsar1+transfer_0_recursions+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/ecdsar1+transfer_0_recursions+sponsored_fpc/native",
+     "values": {
+      "pr3": {
+       "runs": 3,
+       "ms": 2658.537983000002,
+       "mb": 234.38
+      },
+      "base": {
+       "runs": 3,
+       "ms": 5675.933365999981,
+       "mb": 255.728
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 2812.2015449999935,
+       "mb": 233.844
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 2761.6394599999694,
+       "mb": 233.484
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/ecdsar1+transfer_1_recursions+private_fpc",
+     "prefix": "aztec-packages/app-proving/ecdsar1+transfer_1_recursions+private_fpc/native",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 8840.71481999996,
+       "mb": 260.832
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 4522.498393000006,
+       "mb": 230.332
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 4470.479503999996,
+       "mb": 230.256
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 4270.8645839999235,
+       "mb": 231.384
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/ecdsar1+transfer_1_recursions+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/ecdsar1+transfer_1_recursions+sponsored_fpc/native",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 3114.9290870000073,
+       "mb": 234.908
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 3060.880146000045,
+       "mb": 234.352
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 2910.5477140000175,
+       "mb": 235.376
+      },
+      "base": {
+       "runs": 3,
+       "ms": 6278.777479999917,
+       "mb": 256.732
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "client/schnorr+deploy_tokenContract_with_registration+sponsored_fpc",
+     "prefix": "aztec-packages/app-proving/schnorr+deploy_tokenContract_with_registration+sponsored_fpc/native",
+     "values": {
+      "pr2": {
+       "runs": 3,
+       "ms": 3465.162554000017,
+       "mb": 233.584
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 3314.822062000019,
+       "mb": 234.76
+      },
+      "base": {
+       "runs": 3,
+       "ms": 7125.469579999958,
+       "mb": 268.548
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 3567.0717099999933,
+       "mb": 240.576
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    }
+   ],
+   "summary": {
+    "base": {
+     "time_ratio": 1.0,
+     "memory_ratio": 1.0,
+     "n": 11
+    },
+    "pr1": {
+     "time_ratio": 0.4998431405918178,
+     "memory_ratio": 0.8805748475927728,
+     "n": 11
+    },
+    "pr2": {
+     "time_ratio": 0.48963816893804596,
+     "memory_ratio": 0.8740211462120759,
+     "n": 11
+    },
+    "pr3": {
+     "time_ratio": 0.46731602060019856,
+     "memory_ratio": 0.882611653942012,
+     "n": 11
+    }
+   }
+  },
+  {
+   "column": "micro",
+   "title": "Micro-benchmark: aztec-packages' UltraHonk proof of 2^20 gates",
+   "machine": {
+    "cpus": 4,
+    "cpu": "AMD EPYC 9V45 96-Core Processor",
+    "memory_gb": 15.6,
+    "runner": "GitHub Actions 1002595927"
+   },
+   "threads": 4,
+   "repeats": 3,
+   "skipped": [],
+   "stopped_early": false,
+   "cases": [
+    {
+     "id": "micro/ultra_honk",
+     "prefix": "aztec-packages/bb-micro-bench/native/ultra_honk",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 8511.540726000007,
+       "mb": 1351.344
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 3700.761201999995,
+       "mb": 1037.476
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 3649.9405359999882,
+       "mb": 1062.44
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 3703.6860049999805,
+       "mb": 1062.268
+      }
+     },
+     "verified": {}
+    },
+    {
+     "id": "micro/ultra_honk_zk",
+     "prefix": "aztec-packages/bb-micro-bench/native/ultra_honk_zk",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 3542.7483870000033,
+       "mb": 1278.556
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 3649.6125360000065,
+       "mb": 1264.496
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 3546.2286280000085,
+       "mb": 1280.864
+      },
+      "base": {
+       "runs": 3,
+       "ms": 8603.350113000004,
+       "mb": 1417.62
+      }
+     },
+     "verified": {}
+    }
+   ],
+   "summary": {
+    "base": {
+     "time_ratio": 1.0,
+     "memory_ratio": 1.0,
+     "n": 2
+    },
+    "pr1": {
+     "time_ratio": 0.4231338762630815,
+     "memory_ratio": 0.8321201373572507,
+     "n": 2
+    },
+    "pr2": {
+     "time_ratio": 0.4265091820007914,
+     "memory_ratio": 0.8374291262644172,
+     "n": 2
+    },
+    "pr3": {
+     "time_ratio": 0.4235089149947971,
+     "memory_ratio": 0.842763434848256,
+     "n": 2
+    }
+   }
+  },
+  {
+   "column": "rollup",
+   "title": "Rollup: aztec-golf's season 2 inputs",
+   "machine": {
+    "cpus": 4,
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "memory_gb": 15.6,
+    "runner": "GitHub Actions 1002595928"
+   },
+   "threads": 4,
+   "repeats": 3,
+   "skipped": [
+    "rollup/Root"
+   ],
+   "stopped_early": false,
+   "cases": [
+    {
+     "id": "rollup/BlockMerge",
+     "prefix": "golf-inputs/rollup/BlockMerge",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 21688.608982000005,
+       "mb": 1953.156
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 17163.430124999875,
+       "mb": 1532.456
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 15106.218135999825,
+       "mb": 1509.816
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 15104.952995000076,
+       "mb": 1512.348
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/BlockRootNoTxs",
+     "prefix": "golf-inputs/rollup/BlockRootNoTxs",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 1504.4543539999893,
+       "mb": 115.008
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 1408.6467459999312,
+       "mb": 124.72
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 1410.2840509999908,
+       "mb": 125.376
+      },
+      "base": {
+       "runs": 3,
+       "ms": 1809.0745829999832,
+       "mb": 124.724
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/BlockRoot",
+     "prefix": "golf-inputs/rollup/BlockRoot",
+     "values": {
+      "pr2": {
+       "runs": 3,
+       "ms": 15720.559027999996,
+       "mb": 1565.124
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 15659.815453999983,
+       "mb": 1565.668
+      },
+      "base": {
+       "runs": 3,
+       "ms": 22482.599409999693,
+       "mb": 2007.936
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 17873.416688999896,
+       "mb": 1625.436
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/BlockRootSingleTx",
+     "prefix": "golf-inputs/rollup/BlockRootSingleTx",
+     "values": {
+      "pr3": {
+       "runs": 3,
+       "ms": 8485.974449000196,
+       "mb": 793.536
+      },
+      "base": {
+       "runs": 3,
+       "ms": 11635.093980999984,
+       "mb": 1008.528
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 9289.196871999991,
+       "mb": 792.708
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 8482.757905000199,
+       "mb": 792.748
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/CheckpointMerge",
+     "prefix": "golf-inputs/rollup/CheckpointMerge",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 21540.56667900022,
+       "mb": 1944.184
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 17164.31092699986,
+       "mb": 1509.348
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 15015.684405999991,
+       "mb": 1486.356
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 15061.259315999905,
+       "mb": 1489.264
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/CheckpointPadding",
+     "prefix": "golf-inputs/rollup/CheckpointPadding",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 652.551098999993,
+       "mb": 45.516
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 603.7419009999212,
+       "mb": 60.284
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 603.462111999761,
+       "mb": 60.472
+      },
+      "base": {
+       "runs": 3,
+       "ms": 802.9654669999218,
+       "mb": 57.492
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/CheckpointRoot",
+     "prefix": "golf-inputs/rollup/CheckpointRoot",
+     "values": {
+      "pr2": {
+       "runs": 3,
+       "ms": 58725.43163499995,
+       "mb": 6072.48
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 58649.0725120002,
+       "mb": 6073.036
+      },
+      "base": {
+       "runs": 3,
+       "ms": 79600.26173900002,
+       "mb": 7846.524
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 63800.54932300004,
+       "mb": 5992.052
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/CheckpointRootSingleBlock",
+     "prefix": "golf-inputs/rollup/CheckpointRootSingleBlock",
+     "values": {
+      "pr3": {
+       "runs": 3,
+       "ms": 51110.73026999998,
+       "mb": 5344.548
+      },
+      "base": {
+       "runs": 3,
+       "ms": 69176.52633800003,
+       "mb": 6905.22
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 55469.94543300025,
+       "mb": 5324.136
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 51364.09298899992,
+       "mb": 5342.988
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/InboxParity256",
+     "prefix": "golf-inputs/rollup/InboxParity256",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 33285.308782000015,
+       "mb": 3091.892
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 25280.008012000053,
+       "mb": 2356.644
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 23591.936863999763,
+       "mb": 2361.98
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 23433.254243000192,
+       "mb": 2362.5
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/InboxParity4",
+     "prefix": "golf-inputs/rollup/InboxParity4",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 602.0788249998077,
+       "mb": 85.132
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 552.0841769998697,
+       "mb": 81.068
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 553.6971929999481,
+       "mb": 81.612
+      },
+      "base": {
+       "runs": 3,
+       "ms": 752.7250560001448,
+       "mb": 86.796
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/PrivateTxBase",
+     "prefix": "golf-inputs/rollup/PrivateTxBase",
+     "values": {
+      "pr2": {
+       "runs": 3,
+       "ms": 29114.861819999987,
+       "mb": 2726.536
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 29054.640493999956,
+       "mb": 2726.152
+      },
+      "base": {
+       "runs": 3,
+       "ms": 38323.15563700013,
+       "mb": 3479.764
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 30352.834556999824,
+       "mb": 2769.748
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/PublicChonkVerifier",
+     "prefix": "golf-inputs/rollup/PublicChonkVerifier",
+     "values": {
+      "pr3": {
+       "runs": 3,
+       "ms": 16310.116531999938,
+       "mb": 1597.648
+      },
+      "base": {
+       "runs": 3,
+       "ms": 21184.14553799994,
+       "mb": 2027.096
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 16959.218040999986,
+       "mb": 1674.104
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 16308.534514000257,
+       "mb": 1596.94
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/PublicTxBase",
+     "prefix": "golf-inputs/rollup/PublicTxBase",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 77433.8949009998,
+       "mb": 5795.416
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 61168.95274999979,
+       "mb": 4538.4
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 58231.620587999714,
+       "mb": 4589.448
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 58044.26411899977,
+       "mb": 4589.404
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "rollup/TxMerge",
+     "prefix": "golf-inputs/rollup/TxMerge",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 17218.297239000094,
+       "mb": 1519.48
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 15065.870073000042,
+       "mb": 1509.0
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 15082.41491300032,
+       "mb": 1509.68
+      },
+      "base": {
+       "runs": 3,
+       "ms": 21577.448404000053,
+       "mb": 1938.936
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    }
+   ],
+   "summary": {
+    "base": {
+     "time_ratio": 1.0,
+     "memory_ratio": 1.0,
+     "n": 14
+    },
+    "pr1": {
+     "time_ratio": 0.7976567458258056,
+     "memory_ratio": 0.8076419303415896,
+     "n": 14
+    },
+    "pr2": {
+     "time_ratio": 0.7319659933898536,
+     "memory_ratio": 0.8195927897221648,
+     "n": 14
+    },
+    "pr3": {
+     "time_ratio": 0.7312331682791606,
+     "memory_ratio": 0.8208445533869556,
+     "n": 14
+    }
+   }
+  },
+  {
+   "column": "avm",
+   "title": "AVM: aztec-golf's season 2 inputs",
+   "machine": {
+    "cpus": 4,
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "memory_gb": 15.6,
+    "runner": "GitHub Actions 1002595925"
+   },
+   "threads": 4,
+   "repeats": 3,
+   "skipped": [],
+   "stopped_early": false,
+   "cases": [
+    {
+     "id": "avm/amm",
+     "prefix": "golf-inputs/avm/amm",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 8289.276528999948,
+       "mb": 781.092
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 5620.306909999954,
+       "mb": 593.936
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 5575.905736999971,
+       "mb": 577.728
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 5522.305559000074,
+       "mb": 559.828
+      }
+     },
+     "verified": {}
+    },
+    {
+     "id": "avm/bulk",
+     "prefix": "golf-inputs/avm/bulk",
+     "values": {
+      "pr1": {
+       "runs": 3,
+       "ms": 27056.03956999994,
+       "mb": 2859.856
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 26848.632996999982,
+       "mb": 2832.636
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 26588.800105000017,
+       "mb": 2864.2
+      },
+      "base": {
+       "runs": 3,
+       "ms": 37185.474634,
+       "mb": 3134.496
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "avm/e2e",
+     "prefix": "golf-inputs/avm/e2e",
+     "values": {
+      "pr2": {
+       "runs": 3,
+       "ms": 2709.6434240000917,
+       "mb": 387.668
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 2663.75633200002,
+       "mb": 385.888
+      },
+      "base": {
+       "runs": 3,
+       "ms": 4219.667460000011,
+       "mb": 588.028
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 2759.9895809999853,
+       "mb": 390.832
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "avm/megabulk",
+     "prefix": "golf-inputs/avm/megabulk",
+     "values": {
+      "pr3": {
+       "runs": 3,
+       "ms": 50588.01673799996,
+       "mb": 5630.636
+      },
+      "base": {
+       "runs": 3,
+       "ms": 71975.03170200002,
+       "mb": 6226.148
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 52010.557196999915,
+       "mb": 5815.552
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 51285.06641299998,
+       "mb": 5630.972
+      }
+     },
+     "verified": {
+      "base": true,
+      "pr1": true,
+      "pr2": true,
+      "pr3": true
+     }
+    },
+    {
+     "id": "avm/token",
+     "prefix": "golf-inputs/avm/token",
+     "values": {
+      "base": {
+       "runs": 3,
+       "ms": 4119.255363999969,
+       "mb": 581.644
+      },
+      "pr1": {
+       "runs": 3,
+       "ms": 2660.2384120000124,
+       "mb": 380.796
+      },
+      "pr2": {
+       "runs": 3,
+       "ms": 2615.272058999949,
+       "mb": 382.256
+      },
+      "pr3": {
+       "runs": 3,
+       "ms": 2609.912500000064,
+       "mb": 379.892
+      }
+     },
+     "verified": {}
+    }
+   ],
+   "summary": {
+    "base": {
+     "time_ratio": 1.0,
+     "memory_ratio": 1.0,
+     "n": 5
+    },
+    "pr1": {
+     "time_ratio": 0.6847862010016514,
+     "memory_ratio": 0.7763231351127443,
+     "n": 5
+    },
+    "pr2": {
+     "time_ratio": 0.6759238259509456,
+     "memory_ratio": 0.764950692566686,
+     "n": 5
+    },
+    "pr3": {
+     "time_ratio": 0.6689038578960803,
+     "memory_ratio": 0.7601835097483771,
+     "n": 5
+    }
+   }
+  }
+ ]
+}

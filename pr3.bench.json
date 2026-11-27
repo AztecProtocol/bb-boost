@@ -1,0 +1,322 @@
+[
+ {
+  "name": "aztec-packages/app-proving/deploy_ecdsar1+sponsored_fpc/native/seconds",
+  "value": 3066.836,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/deploy_ecdsar1+sponsored_fpc/native/memory",
+  "value": 235.5,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/deploy_schnorr+sponsored_fpc/native/seconds",
+  "value": 2811.813,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/deploy_schnorr+sponsored_fpc/native/memory",
+  "value": 231.0,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+amm_add_liquidity_1_recursions+sponsored_fpc/native/seconds",
+  "value": 4723.883,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+amm_add_liquidity_1_recursions+sponsored_fpc/native/memory",
+  "value": 222.9,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+deploy_tokenContract_with_registration+sponsored_fpc/native/seconds",
+  "value": 3515.225,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+deploy_tokenContract_with_registration+sponsored_fpc/native/memory",
+  "value": 244.4,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+storage_proof_7_layers+sponsored_fpc/native/seconds",
+  "value": 8580.23,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+storage_proof_7_layers+sponsored_fpc/native/memory",
+  "value": 506.5,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+token_bridge_claim_private+sponsored_fpc/native/seconds",
+  "value": 3063.253,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+token_bridge_claim_private+sponsored_fpc/native/memory",
+  "value": 225.0,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+transfer_0_recursions+private_fpc/native/seconds",
+  "value": 3965.385,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+transfer_0_recursions+private_fpc/native/memory",
+  "value": 231.2,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+transfer_0_recursions+sponsored_fpc/native/seconds",
+  "value": 2658.538,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+transfer_0_recursions+sponsored_fpc/native/memory",
+  "value": 234.4,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+transfer_1_recursions+private_fpc/native/seconds",
+  "value": 4270.865,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+transfer_1_recursions+private_fpc/native/memory",
+  "value": 231.4,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+transfer_1_recursions+sponsored_fpc/native/seconds",
+  "value": 2910.548,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/ecdsar1+transfer_1_recursions+sponsored_fpc/native/memory",
+  "value": 235.4,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/app-proving/schnorr+deploy_tokenContract_with_registration+sponsored_fpc/native/seconds",
+  "value": 3314.822,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/app-proving/schnorr+deploy_tokenContract_with_registration+sponsored_fpc/native/memory",
+  "value": 234.8,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/bb-micro-bench/native/ultra_honk/seconds",
+  "value": 3703.686,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/bb-micro-bench/native/ultra_honk/memory",
+  "value": 1062.3,
+  "unit": "MB"
+ },
+ {
+  "name": "aztec-packages/bb-micro-bench/native/ultra_honk_zk/seconds",
+  "value": 3546.229,
+  "unit": "ms"
+ },
+ {
+  "name": "aztec-packages/bb-micro-bench/native/ultra_honk_zk/memory",
+  "value": 1280.9,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/BlockMerge/seconds",
+  "value": 15104.953,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/BlockMerge/memory",
+  "value": 1512.3,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/BlockRootNoTxs/seconds",
+  "value": 1410.284,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/BlockRootNoTxs/memory",
+  "value": 125.4,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/BlockRoot/seconds",
+  "value": 15659.815,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/BlockRoot/memory",
+  "value": 1565.7,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/BlockRootSingleTx/seconds",
+  "value": 8485.974,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/BlockRootSingleTx/memory",
+  "value": 793.5,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/CheckpointMerge/seconds",
+  "value": 15061.259,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/CheckpointMerge/memory",
+  "value": 1489.3,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/CheckpointPadding/seconds",
+  "value": 603.462,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/CheckpointPadding/memory",
+  "value": 60.5,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/CheckpointRoot/seconds",
+  "value": 58649.073,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/CheckpointRoot/memory",
+  "value": 6073.0,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/CheckpointRootSingleBlock/seconds",
+  "value": 51110.73,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/CheckpointRootSingleBlock/memory",
+  "value": 5344.5,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/InboxParity256/seconds",
+  "value": 23433.254,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/InboxParity256/memory",
+  "value": 2362.5,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/InboxParity4/seconds",
+  "value": 553.697,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/InboxParity4/memory",
+  "value": 81.6,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/PrivateTxBase/seconds",
+  "value": 29054.64,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/PrivateTxBase/memory",
+  "value": 2726.2,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/PublicChonkVerifier/seconds",
+  "value": 16310.117,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/PublicChonkVerifier/memory",
+  "value": 1597.6,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/PublicTxBase/seconds",
+  "value": 58044.264,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/PublicTxBase/memory",
+  "value": 4589.4,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/rollup/TxMerge/seconds",
+  "value": 15082.415,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/rollup/TxMerge/memory",
+  "value": 1509.7,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/avm/amm/seconds",
+  "value": 5522.306,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/avm/amm/memory",
+  "value": 559.8,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/avm/bulk/seconds",
+  "value": 26588.8,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/avm/bulk/memory",
+  "value": 2864.2,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/avm/e2e/seconds",
+  "value": 2663.756,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/avm/e2e/memory",
+  "value": 385.9,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/avm/megabulk/seconds",
+  "value": 50588.017,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/avm/megabulk/memory",
+  "value": 5630.6,
+  "unit": "MB"
+ },
+ {
+  "name": "golf-inputs/avm/token/seconds",
+  "value": 2609.913,
+  "unit": "ms"
+ },
+ {
+  "name": "golf-inputs/avm/token/memory",
+  "value": 379.9,
+  "unit": "MB"
+ }
+]
