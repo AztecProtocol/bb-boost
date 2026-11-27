@@ -348,3 +348,33 @@ TEST(uintx, BarrettReductionRegression)
     EXPECT_EQ(quotient_result, quotient_expected);
     EXPECT_EQ(remainder_result, remainder_expected);
 }
+
+TEST(uintx, Bn254ReciprocalDivisionBoundaries)
+{
+    const uint1024_t modulus(uint256_t{ "0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47" });
+    const auto check = [&](const uint1024_t& value) { EXPECT_EQ(value.divmod(modulus), value.divmod_base(modulus)); };
+    check(0);
+    check(1);
+    check(modulus - 1);
+    check(modulus);
+    check(modulus + 1);
+    check(~uint1024_t(0));
+    for (size_t bit = 1; bit < 1024; ++bit) {
+        const uint1024_t boundary = uint1024_t(1) << bit;
+        check(boundary - 1);
+        check(boundary);
+        check(boundary + 1);
+    }
+    for (size_t i = 0; i < 512; ++i) {
+        const auto value = engine.get_random_uint1024();
+        check(value);
+        check(value >> (1024 - 576));
+        check(value >> (1024 - 544));
+        check(value >> 512);
+        const auto quotient = value >> 704;
+        const auto multiple = quotient * modulus;
+        check(multiple - 1);
+        check(multiple);
+        check(multiple + 1);
+    }
+}

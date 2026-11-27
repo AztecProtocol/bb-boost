@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -419,4 +422,72 @@ TEST(MemoryTraceGenTest, SingleEntry)
 }
 
 } // namespace
+} // namespace bb::avm2::tracegen
+
+namespace bb::avm2::tracegen {
+TEST(MemoryTraceGenTest, PackedKeysMatchFullComparatorDomain)
+{
+    using simulation::MemoryEvent;
+    using simulation::MemoryMode;
+    std::vector<MemoryEvent> events;
+    for (const uint16_t space : std::array<uint16_t, 3>{ 0, 1, UINT16_MAX }) {
+        for (const uint32_t address : std::array<uint32_t, 3>{ 0, 1, UINT32_MAX }) {
+            for (const uint32_t clock : std::array<uint32_t, 3>{ 0, 1, UINT32_MAX }) {
+                for (const int32_t mode : std::array<int32_t, 7>{ INT32_MIN, -7, -1, 0, 1, 2, INT32_MAX }) {
+                    events.push_back({ .execution_clk = clock,
+                                       .mode = static_cast<MemoryMode>(mode),
+                                       .addr = address,
+                                       .space_id = space });
+                }
+            }
+        }
+    }
+    for (const auto& lhs : events) {
+        for (const auto& rhs : events) {
+            EXPECT_EQ(MemoryTraceBuilder::get_event_sort_key(lhs) < MemoryTraceBuilder::get_event_sort_key(rhs),
+                      lhs.operator<(rhs));
+        }
+    }
+}
+
+TEST(MemoryTraceGenTest, CachedKeysPreserveExactTiedEventOrder)
+{
+#ifdef _LIBCPP_DEBUG_RANDOMIZE_UNSPECIFIED_STABILITY
+    GTEST_SKIP() << "Exact tie permutation requires the stock non-randomized Release sort.";
+#else
+    using simulation::MemoryEvent;
+    using simulation::MemoryMode;
+    // Threshold-adjacent sizes and many equal keys expose changes in the pinned
+    // generic sort's equal-key permutation, not merely the final sorted keys.
+    for (const size_t n : std::array<size_t, 17>{ 0, 1, 2, 15, 16, 17, 23, 24, 25, 31, 32, 33, 127, 128, 129, 257, 513 }) {
+        std::vector<MemoryEvent> events;
+        events.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            events.push_back({ .execution_clk = static_cast<uint32_t>((i * 11) % 3),
+                               .mode = MemoryMode::READ,
+                               .addr = static_cast<uint32_t>((i * 17) % 5),
+                               .value = MemoryValue::from_tag(MemoryTag::FF, FF(i + 1)),
+                               .space_id = static_cast<uint16_t>((i * 7) % 4) });
+        }
+        if (n % 2 == 0) {
+            std::ranges::reverse(events);
+        }
+        std::vector<const MemoryEvent*> expected;
+        expected.reserve(n);
+        for (const auto& event : events) {
+            expected.push_back(&event);
+        }
+        // Exact original production algorithm, with unique payload IDs on ties.
+        std::ranges::sort(expected, [](const auto* lhs, const auto* rhs) { return lhs->operator<(*rhs); });
+        TestTraceContainer trace;
+        MemoryTraceBuilder builder;
+        builder.process(events, trace);
+        for (size_t i = 0; i < n; ++i) {
+            EXPECT_EQ(trace.get(Column::memory_value, static_cast<uint32_t>(i + 1)).to_buffer(),
+                      expected[i]->value.as_ff().to_buffer()) << n << " " << i;
+        }
+        EXPECT_EQ(trace.get_column_rows(Column::memory_sel), static_cast<uint32_t>(n == 0 ? 0 : n + 1));
+    }
+#endif
+}
 } // namespace bb::avm2::tracegen

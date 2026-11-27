@@ -11,6 +11,14 @@
 #include <cstdlib>
 #include <limits>
 #include <string>
+#if !defined(__wasm__) && !defined(_WIN32) && !defined(NO_MULTITHREADING) && !defined(BB_NO_EXCEPTIONS)
+#include "barretenberg/common/thread.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <sys/mman.h>
+#include <unistd.h>
+#define BB_POLYNOMIAL_MEMORY_RELEASE 1
+#endif
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 bool slow_low_memory =
@@ -97,3 +105,105 @@ size_t storage_budget = parse_storage_budget();
 std::atomic<size_t> current_storage_usage{ 0 };
 
 #endif // !defined(__wasm__) || defined(ENABLE_WASM_BENCH)
+
+namespace bb {
+#ifdef BB_POLYNOMIAL_MEMORY_RELEASE
+namespace {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+thread_local PolynomialMemoryRelease* active_release = nullptr;
+
+// Splits the whole pages of all ranges evenly over the tasks; each task walks the ranges its share overlaps.
+void release_in_parallel(const std::vector<std::pair<uintptr_t, size_t>>& ranges, size_t page)
+{
+    constexpr size_t BYTES_PER_TASK = size_t{ 16 } << 20;
+    constexpr size_t MAX_TASKS = 16;
+    std::vector<size_t> first_page(ranges.size());
+    size_t total_pages = 0;
+    for (size_t r = 0; r < ranges.size(); ++r) {
+        first_page[r] = total_pages;
+        total_pages += ranges[r].second;
+    }
+    const size_t num_tasks = std::min((total_pages * page) / BYTES_PER_TASK, MAX_TASKS);
+    if (num_tasks < 2) {
+        return;
+    }
+    parallel_for(num_tasks, [&](size_t t) {
+        size_t lo = (total_pages * t) / num_tasks;
+        const size_t hi = (total_pages * (t + 1)) / num_tasks;
+        auto r =
+            static_cast<size_t>(std::upper_bound(first_page.begin(), first_page.end(), lo) - first_page.begin()) - 1;
+        while (lo < hi) {
+            const size_t offset = lo - first_page[r];
+            const size_t count = std::min(hi - lo, ranges[r].second - offset);
+            // NOLINTNEXTLINE(performance-no-int-to-ptr)
+            static_cast<void>(
+                madvise(reinterpret_cast<void*>(ranges[r].first + (offset * page)), count * page, MADV_DONTNEED));
+            lo += count;
+            ++r;
+        }
+    });
+}
+} // namespace
+#endif
+
+bool PolynomialMemoryRelease::defer_free([[maybe_unused]] void* ptr,
+                                         [[maybe_unused]] size_t bytes,
+                                         [[maybe_unused]] void (*free_block)(void*)) noexcept
+{
+#ifdef BB_POLYNOMIAL_MEMORY_RELEASE
+    PolynomialMemoryRelease* scope = active_release;
+    if (scope == nullptr) {
+        return false;
+    }
+    try {
+        scope->blocks_.push_back({ ptr, bytes, free_block });
+    } catch (...) {
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+void PolynomialMemoryRelease::activate()
+{
+#ifdef BB_POLYNOMIAL_MEMORY_RELEASE
+    if (!active_) {
+        previous_ = active_release;
+        active_release = this;
+        active_ = true;
+    }
+#endif
+}
+
+PolynomialMemoryRelease::~PolynomialMemoryRelease()
+{
+#ifdef BB_POLYNOMIAL_MEMORY_RELEASE
+    if (!active_) {
+        return;
+    }
+    active_release = previous_;
+    // Only whole pages strictly inside each block, so the allocator's chunk headers next to it stay intact.
+    try {
+        const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+        std::vector<std::pair<uintptr_t, size_t>> ranges;
+        ranges.reserve(blocks_.size());
+        for (const auto& block : blocks_) {
+            const auto start = reinterpret_cast<uintptr_t>(block.ptr);
+            const uintptr_t begin = (start + page - 1) & ~(page - 1);
+            const uintptr_t end = (start + block.bytes) & ~(page - 1);
+            if (end > begin) {
+                ranges.emplace_back(begin, (end - begin) / page);
+            }
+        }
+        release_in_parallel(ranges, page);
+    } catch (...) {
+        // Without the release the blocks are simply freed below.
+    }
+    for (const auto& block : blocks_) {
+        block.free_block(block.ptr);
+    }
+#endif
+}
+} // namespace bb

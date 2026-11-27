@@ -1,10 +1,12 @@
 #include "barretenberg/vm2/constraining/polynomials.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
 #include "barretenberg/common/thread.hpp"
 #include "barretenberg/flavor/flavor_concepts.hpp"
+#include "barretenberg/numeric/bitop/get_msb.hpp"
 #include "barretenberg/vm2/common/constants.hpp"
 #include "barretenberg/vm2/generated/columns.hpp"
 #include "barretenberg/vm2/tooling/stats.hpp"
@@ -107,9 +109,24 @@ void resize_inverses(AvmFlavor::ProverPolynomials& prover_polynomials,
                  "Inverse polynomial size mismatch");
 }
 
-std::shared_ptr<AvmProver::ProvingKey> proving_key_from_polynomials(AvmProver::ProverPolynomials& polynomials)
+size_t commitment_key_size(size_t num_rows)
 {
-    auto proving_key = std::make_shared<AvmProver::ProvingKey>();
+    return numeric::round_up_power_2(std::max<size_t>(num_rows, 1));
+}
+
+std::shared_ptr<AvmProver::ProvingKey> proving_key_from_polynomials(AvmProver::ProverPolynomials& polynomials,
+                                                                    AvmFlavor::CommitmentKey commitment_key)
+{
+    // The inverses are still empty here; resize_inverses later ends each within its selectors.
+    size_t num_rows = 0;
+    for (const auto& poly : polynomials.get_unshifted()) {
+        num_rows = std::max(num_rows, poly.end_index());
+    }
+    const size_t needed_points = commitment_key_size(num_rows);
+    if (!commitment_key.initialized() || commitment_key.get_monomial_size() < needed_points) {
+        commitment_key = AvmFlavor::CommitmentKey(needed_points);
+    }
+    auto proving_key = std::make_shared<AvmProver::ProvingKey>(std::move(commitment_key));
 
     for (auto [key_poly, prover_poly] : zip_view(proving_key->get_all(), polynomials.get_unshifted())) {
         BB_ASSERT_EQ(flavor_get_label(*proving_key, key_poly), flavor_get_label(polynomials, prover_poly));

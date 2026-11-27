@@ -1,12 +1,15 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "barretenberg/common/log.hpp"
+#include "barretenberg/common/thread.hpp"
 #include "barretenberg/common/utils.hpp"
 #include "barretenberg/vm2/common/field.hpp"
 #include "barretenberg/vm2/common/map.hpp"
@@ -100,6 +103,45 @@ class SharedIndexCache {
             }
             throw;
         }
+    }
+
+    /**
+     * @brief Frees every cached index on the thread pool and empties the cache.
+     * @details An index holds one row list per destination tuple, millions on a large transaction. The lists of all
+     * indices are freed in chunks across the pool. Call it only when no reference returned by get_or_build is used
+     * any more.
+     */
+    void release_in_parallel()
+    {
+        using RowLists = decltype(std::declval<DstIndex&&>().extract());
+        std::vector<RowLists> lists;
+        {
+            std::unique_lock lock(mutex_);
+            lists.reserve(cache_.size());
+            for (auto& entry : cache_) {
+                // Every remaining entry is ready: a failed build evicts its entry before it throws.
+                lists.push_back(std::move(*entry.second.get()).extract());
+            }
+            cache_.clear();
+        }
+        constexpr size_t LISTS_PER_CHUNK = 1 << 14;
+        struct Chunk {
+            size_t index;
+            size_t begin;
+            size_t end;
+        };
+        std::vector<Chunk> chunks;
+        for (size_t i = 0; i < lists.size(); ++i) {
+            for (size_t begin = 0; begin < lists[i].size(); begin += LISTS_PER_CHUNK) {
+                chunks.push_back({ i, begin, std::min(lists[i].size(), begin + LISTS_PER_CHUNK) });
+            }
+        }
+        bb::parallel_for(chunks.size(), [&](size_t c) {
+            auto& list = lists[chunks[c].index];
+            for (size_t k = chunks[c].begin; k < chunks[c].end; ++k) {
+                std::vector<uint32_t>().swap(list[k].second);
+            }
+        });
     }
 
   private:

@@ -1,12 +1,16 @@
 #include "get_grumpkin_crs.hpp"
 #include "barretenberg/api/file_io.hpp"
 #include "barretenberg/common/flock.hpp"
+#include "barretenberg/common/thread.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include "barretenberg/common/try_catch_shim.hpp"
 #include "barretenberg/crypto/sha256/sha256.hpp"
 #include "barretenberg/ecc/curves/grumpkin/grumpkin.hpp"
 #include "grumpkin_crs_data.hpp"
 #include "grumpkin_srs_gen.hpp"
+#include "pread.hpp"
+#include <memory>
+#include <span>
 
 namespace bb {
 
@@ -47,16 +51,28 @@ std::vector<curve::Grumpkin::AffineElement> get_grumpkin_g1_data(const std::file
     // A short cache cannot authenticate even a smaller requested prefix against the chunk pins.
     if (get_file_size(g1_path) >= verify_bytes) {
         vinfo("using cached grumpkin crs with num points ", num_points, " at: ", g1_path);
+#if !defined(__wasm__) && !defined(_WIN32)
+        // Uninitialised: the reads write every byte.
+        const std::unique_ptr<uint8_t[]> storage(new uint8_t[verify_bytes]);
+        if (!srs::pread_prefix_in_parallel(g1_path, storage.get(), verify_bytes)) {
+            throw_or_abort("Truncated Grumpkin CRS");
+        }
+        const std::span<const uint8_t> data(storage.get(), verify_bytes);
+#else
         const auto data = read_file(g1_path, verify_bytes);
         if (data.size() != verify_bytes) {
             throw_or_abort("Truncated Grumpkin CRS");
         }
+#endif
         // Not hashed here: the CRS constructor checks every point against the pinned chunk hashes, and accepts only
         // whole chunks.
         std::vector<curve::Grumpkin::AffineElement> points(verify_points);
-        for (size_t i = 0; i < verify_points; ++i) {
-            points[i] = from_buffer<curve::Grumpkin::AffineElement>(data, i * sizeof(curve::Grumpkin::AffineElement));
-        }
+        parallel_for([&](ThreadChunk chunk) {
+            for (auto i : chunk.range(verify_points)) {
+                points[i] =
+                    from_buffer<curve::Grumpkin::AffineElement>(data, i * sizeof(curve::Grumpkin::AffineElement));
+            }
+        });
         return points;
     }
 

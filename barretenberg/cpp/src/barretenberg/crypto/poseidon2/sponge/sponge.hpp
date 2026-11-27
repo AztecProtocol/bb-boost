@@ -12,6 +12,7 @@
 #include <span>
 #include <tuple>
 
+#include "barretenberg/common/assert.hpp"
 #include "barretenberg/numeric/uint256/uint256.hpp"
 
 namespace bb::crypto {
@@ -136,5 +137,46 @@ template <typename FF, size_t rate, size_t capacity, size_t t, typename Permutat
 
         return sponge.squeeze();
     }
+
+    /**
+     * @brief The hash of an input of known length whose first elements are already absorbed.
+     * @details Lets a caller absorb the start of an input before the rest exists. `finish(rest)` returns exactly
+     * `hash_internal(prefix ++ rest)`, raw limbs included, because it runs the same absorb and squeeze steps on the
+     * same sponge.
+     */
+    class AbsorbedPrefix;
+};
+
+template <typename FF, size_t rate, size_t capacity, size_t t, typename Permutation>
+class FieldSponge<FF, rate, capacity, t, Permutation>::AbsorbedPrefix {
+  public:
+    AbsorbedPrefix(size_t input_length, std::span<const FF> prefix)
+        : sponge(FF(static_cast<uint256_t>(input_length) << 64))
+        , remaining(input_length - prefix.size())
+    {
+        BB_ASSERT_LTE(prefix.size(), input_length, "the prefix is longer than the input");
+        for (const FF& element : prefix) {
+            sponge.absorb(element);
+        }
+    }
+
+    /**
+     * @brief Absorbs the rest of the input, which must complete its length, and returns the hash.
+     */
+    FF finish(std::span<const FF> rest) const
+    {
+        BB_ASSERT_EQ(rest.size(), remaining, "the rest does not complete the input");
+        FieldSponge completed = sponge;
+        for (const FF& element : rest) {
+            completed.absorb(element);
+        }
+        return completed.squeeze();
+    }
+
+    size_t remaining_length() const { return remaining; }
+
+  private:
+    FieldSponge sponge;
+    size_t remaining;
 };
 } // namespace bb::crypto

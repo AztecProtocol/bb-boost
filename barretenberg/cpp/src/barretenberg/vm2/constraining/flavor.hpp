@@ -6,7 +6,12 @@
 #pragma once
 
 #include <array>
+#include <concepts>
+#include <bitset>
+#include <memory>
+#include <vector>
 #include <span>
+#include <type_traits>
 
 #include "barretenberg/commitment_schemes/kzg/kzg.hpp"
 #include "barretenberg/common/tuple.hpp"
@@ -80,6 +85,10 @@ class AvmFlavor {
     using Relations = Relations_<FF>;
 
     static constexpr size_t NUM_SUBRELATIONS = compute_number_of_subrelations<Relations>();
+
+    // Hundreds of relations make the per-round batching a serial cost that does not shrink with the trace, so AVM
+    // opts into parallel relation batching (see ParallelizesRelationBatching).
+    static constexpr bool PARALLELIZE_RELATION_BATCHING = true;
 
     static constexpr size_t MAX_PARTIAL_RELATION_LENGTH = compute_max_partial_relation_length<Relations>();
 
@@ -192,7 +201,7 @@ class AvmFlavor {
         static constexpr size_t circuit_size = MAX_AVM_TRACE_SIZE; // Fixed size
         static constexpr size_t log_circuit_size = MAX_AVM_TRACE_LOG_SIZE;
 
-        ProvingKey();
+        explicit ProvingKey(CommitmentKey key);
 
         std::span<Polynomial> get_all() { return AllEntities<Polynomial>::get_unshifted(); }
         std::span<const Polynomial> get_all() const { return AllEntities<Polynomial>::get_unshifted(); }
@@ -259,19 +268,80 @@ class AvmFlavor {
      * @brief A container for univariates used during sumcheck.
      * @details During sumcheck, the prover evaluates the relations on these univariates.
      */
-    class LazilyExtendedProverUnivariates
-        : private AllEntities<std::unique_ptr<bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>>> {
+    class LazilyExtendedProverUnivariates {
       public:
         LazilyExtendedProverUnivariates(const ProverPolynomials& multivariates)
             : multivariates(multivariates)
         {}
 
         void set_current_edge(size_t edge_idx);
+
+        // This container only exposes linear extensions of source row pairs. Such an
+        // edge is identically zero exactly when both source evaluations are zero.
+        // Checking endpoints avoids materializing an inverse edge solely to skip it.
+        bool edge_is_zero(ColumnAndShifts c) const
+        {
+            const auto& polynomial = multivariates.get(c);
+            return polynomial.is_empty() || polynomial.end_index() < current_edge ||
+                   (polynomial[current_edge].is_zero() && polynomial[current_edge + 1].is_zero());
+        }
+
         const bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>& get(ColumnAndShifts c) const;
+#ifndef __wasm__
+        // Only the exact AVM lookup adapter promises these selector/count mappings.
+        // Linear edges are zero everywhere exactly when both endpoints are zero.
+        template <typename Settings>
+        bool lookup_accumulation_is_zero(std::type_identity<lookup_settings<Settings>>) const
+        {
+            if (!edge_is_zero(static_cast<ColumnAndShifts>(Settings::SRC_SELECTOR))) {
+                return false;
+            }
+            return edge_is_zero(static_cast<ColumnAndShifts>(Settings::DST_SELECTOR)) ||
+                   edge_is_zero(static_cast<ColumnAndShifts>(Settings::COUNTS));
+        }
+#endif
+
+
+        // Both compressed lookup tuples remain linear in the edge variable. Pack
+        // their endpoints together to keep the native four-lane multiplication
+        // path, then extend only the two compressed results.
+        template <typename Accumulator, typename Settings, typename Parameters>
+        std::array<Accumulator, 2> compress_lookup_pair(const Parameters& params) const
+            requires requires {
+                requires (Accumulator::LENGTH >= 4);
+                requires std::same_as<Accumulator, bb::Univariate<FF, Accumulator::LENGTH>>;
+                requires (Settings::SRC_COLUMNS.size() >= 2);
+                requires (Settings::SRC_COLUMNS.size() == Settings::DST_COLUMNS.size());
+            }
+        {
+            bb::Univariate<FF, 4> packed(FF(0));
+            bb::constexpr_for<0, Settings::SRC_COLUMNS.size(), 1>([&]<size_t i>() {
+                const auto& source = get(Settings::SRC_COLUMNS[i]);
+                const auto& destination = get(Settings::DST_COLUMNS[i]);
+                packed *= params.beta;
+                packed.value_at(0) += source.value_at(0);
+                packed.value_at(1) += source.value_at(1);
+                packed.value_at(2) += destination.value_at(0);
+                packed.value_at(3) += destination.value_at(1);
+            });
+            packed += params.gamma;
+            return { bb::Univariate<FF, 2>({ packed.value_at(0), packed.value_at(1) })
+                         .template extend_to<Accumulator::LENGTH>(),
+                     bb::Univariate<FF, 2>({ packed.value_at(2), packed.value_at(3) })
+                         .template extend_to<Accumulator::LENGTH>() };
+        }
+
 
       private:
         size_t current_edge = 0;
-        mutable bool dirty = false;
+        using ExtendedUnivariate = bb::Univariate<FF, MAX_PARTIAL_RELATION_LENGTH>;
+        // References returned by get remain valid until set_current_edge. Reuse storage by
+        // access order, so the pool retains only the largest number of nonzero edges needed
+        // at one row pair, rather than the union of all columns visited by this worker.
+        mutable std::array<const ExtendedUnivariate*, NUM_ALL_ENTITIES> cached{};
+        mutable std::bitset<NUM_ALL_ENTITIES> valid{};
+        mutable std::vector<std::unique_ptr<ExtendedUnivariate>> pool;
+        mutable size_t used = 0;
         const ProverPolynomials& multivariates;
     };
 

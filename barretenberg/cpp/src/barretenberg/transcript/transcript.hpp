@@ -21,6 +21,11 @@
 #include "transcript_manifest.hpp"
 #include <atomic>
 #include <concepts>
+#include <cstring>
+#include <optional>
+#include <span>
+#include <utility>
+#include <variant>
 
 namespace bb {
 
@@ -33,6 +38,43 @@ concept InCircuit = !IsAnyOf<T, bb::fr, grumpkin::fr, uint256_t>;
 
 // 'inline' (since C++17) ensures a single shared definition with external linkage.
 inline std::atomic<size_t> unique_transcript_index{ 0 };
+
+using NativePoseidon2 = bb::crypto::Poseidon2<bb::crypto::Poseidon2Bn254ScalarFieldParams>;
+
+/**
+ * @brief The start of a native Poseidon2 challenge's hash input, absorbed ahead of time.
+ * @details A prover that knows the beginning and the total length of a challenge's hash input before the rest of it
+ * exists can absorb the beginning on another thread. The transcript uses it for the next challenge only if that
+ * challenge's hash input has exactly this length and starts with exactly these elements, raw limbs included.
+ */
+class ChallengeHashPrefix {
+  public:
+    using FF = bb::fr;
+
+    ChallengeHashPrefix(std::vector<FF> prefix, size_t input_length)
+        : prefix(std::move(prefix))
+        , absorbed(input_length, this->prefix)
+        , input_length(input_length)
+    {}
+
+    /**
+     * @brief The hash of `input`, if `input` is the input this prefix was absorbed for.
+     */
+    std::optional<FF> hash_if_extended_by(std::span<const FF> input) const
+    {
+        // memcmp needs non-null pointers even for a zero count, and an empty vector's data() may be null.
+        if (input.size() != input_length ||
+            (!prefix.empty() && std::memcmp(prefix.data(), input.data(), prefix.size() * sizeof(FF)) != 0)) {
+            return std::nullopt;
+        }
+        return absorbed.finish(input.subspan(prefix.size()));
+    }
+
+  private:
+    std::vector<FF> prefix;
+    NativePoseidon2::Sponge::AbsorbedPrefix absorbed;
+    size_t input_length;
+};
 
 /**
  * @brief Common transcript class for both parties. Stores the data for the current round, as well as the
@@ -74,6 +116,11 @@ template <typename Codec_, typename HashFunction_> class BaseTranscript {
     bool is_first_challenge = true;           // Indicates if this is the first challenge this transcript is generating
     DataType previous_challenge{};            // Previous challenge buffer (default-initialized to zeros)
     std::vector<DataType> current_round_data; // Data for the current round that will be hashed to generate challenges
+
+    static constexpr bool HASHES_WITH_NATIVE_POSEIDON2 = std::is_same_v<HashFunction, NativePoseidon2>;
+    // Used by (and cleared at) the next challenge; see set_next_challenge_prefix.
+    std::conditional_t<HASHES_WITH_NATIVE_POSEIDON2, std::optional<ChallengeHashPrefix>, std::monostate>
+        next_challenge_prefix;
 
     // Proof parsing state
     std::ptrdiff_t proof_start = 0;
@@ -118,7 +165,14 @@ template <typename Codec_, typename HashFunction_> class BaseTranscript {
         current_round_data.clear();
 
         // Hash the full buffer
-        DataType new_challenge = HashFunction::hash(full_buffer);
+        DataType new_challenge;
+        if constexpr (HASHES_WITH_NATIVE_POSEIDON2) {
+            const std::optional<ChallengeHashPrefix> prefix = std::exchange(next_challenge_prefix, std::nullopt);
+            const std::optional<DataType> prefixed = prefix ? prefix->hash_if_extended_by(full_buffer) : std::nullopt;
+            new_challenge = prefixed ? *prefixed : HashFunction::hash(full_buffer);
+        } else {
+            new_challenge = HashFunction::hash(full_buffer);
+        }
         // update previous challenge buffer for next time we call this function
         previous_challenge = new_challenge;
         return new_challenge;
@@ -132,6 +186,34 @@ template <typename Codec_, typename HashFunction_> class BaseTranscript {
     [[nodiscard]] std::array<DataType, CHALLENGE_BUFFER_SIZE> get_next_duplex_challenge_buffer()
     {
         return Codec::split_challenge(get_next_challenge_hash());
+    }
+
+  public:
+    /**
+     * @brief What the next challenge will hash, as far as it is known now: the previous challenge, unless the next
+     * challenge is the first, followed by the data added to the current round.
+     */
+    std::vector<DataType> next_challenge_input_so_far() const
+        requires HASHES_WITH_NATIVE_POSEIDON2
+    {
+        std::vector<DataType> input;
+        input.reserve(current_round_data.size() + 1);
+        if (!is_first_challenge) {
+            input.push_back(previous_challenge);
+        }
+        input.insert(input.end(), current_round_data.begin(), current_round_data.end());
+        return input;
+    }
+
+    /**
+     * @brief Offers the next challenge a hash prefix absorbed ahead of time (see ChallengeHashPrefix).
+     * @details The next challenge uses it only if it matches that challenge's hash input exactly, and otherwise hashes
+     * from scratch; either way the next challenge clears it. The challenge value is the same in both cases.
+     */
+    void set_next_challenge_prefix(ChallengeHashPrefix prefix)
+        requires HASHES_WITH_NATIVE_POSEIDON2
+    {
+        next_challenge_prefix = std::move(prefix);
     }
 
   protected:

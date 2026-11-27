@@ -122,6 +122,8 @@ struct GlobalBenchStatsContainer {
     void print_stats_recursive(const OperationKey& key, const TimeStats* stats, const std::string& indent) const;
     void print_aggregate_counts(std::ostream&, size_t) const;
     void print_aggregate_counts_hierarchical(std::ostream&) const;
+    // The report written at exit when BB_BENCH is set (by the destructor, or by an exit that skips destructors).
+    void print_exit_report_if_requested() const;
     void serialize_aggregate_data_json(std::ostream&) const;
     // Chrome Trace Event Format output for Perfetto / chrome://tracing.
     // serialize_trace_events_json emits every captured per-call event (requires

@@ -192,9 +192,18 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
 {
     // We process the events in parallel. Ideally the jobs should access disjoint column sets.
     {
+        // The longest builder: its sort is a job below, its rows are written once the jobs are done.
+        MemoryTraceBuilder memory_trace_builder;
+        // The decomposition of every bytecode is the longest builder on some transactions: it runs as parts.
+        auto bytecode_decomposition_jobs = BytecodeTraceBuilder::decomposition_jobs(
+            events.bytecode_decomposition, trace, [&]() { clear_events(events.bytecode_decomposition); });
+        for (auto& job : bytecode_decomposition_jobs) {
+            job = [part = std::move(job)]() { AVM_TRACK_TIME("tracegen/bytecode_decomposition", part()); };
+        }
         auto jobs = concatenate(
             // Precomputed column jobs.
             build_precomputed_columns_jobs(trace),
+            bytecode_decomposition_jobs,
             // Public inputs column jobs.
             build_public_inputs_columns_jobs(trace, public_inputs),
             // Subtrace jobs.
@@ -203,11 +212,6 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
                     TxTraceBuilder tx_builder;
                     AVM_TRACK_TIME("tracegen/tx", tx_builder.process(events.tx, trace));
                     clear_events(events.tx);
-                },
-                [&]() {
-                    ExecutionTraceBuilder exec_builder;
-                    AVM_TRACK_TIME("tracegen/execution", exec_builder.process(events.execution, trace));
-                    clear_events(events.execution);
                 },
                 [&]() {
                     AddressDerivationTraceBuilder address_derivation_builder;
@@ -219,12 +223,6 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
                     AluTraceBuilder alu_builder;
                     AVM_TRACK_TIME("tracegen/alu", alu_builder.process(events.alu, trace));
                     clear_events(events.alu);
-                },
-                [&]() {
-                    BytecodeTraceBuilder bytecode_builder;
-                    AVM_TRACK_TIME("tracegen/bytecode_decomposition",
-                                   bytecode_builder.process_decomposition(events.bytecode_decomposition, trace));
-                    clear_events(events.bytecode_decomposition);
                 },
                 [&]() {
                     BytecodeTraceBuilder bytecode_builder;
@@ -343,11 +341,7 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
                                    indexed_tree_check_trace_builder.process(events.indexed_tree_check_events, trace));
                     clear_events(events.indexed_tree_check_events);
                 },
-                [&]() {
-                    MemoryTraceBuilder memory_trace_builder;
-                    AVM_TRACK_TIME("tracegen/memory", memory_trace_builder.process(events.memory, trace));
-                    clear_events(events.memory);
-                },
+                [&]() { AVM_TRACK_TIME("tracegen/memory_sort", memory_trace_builder.sort_events(events.memory)); },
                 [&]() {
                     DataCopyTraceBuilder data_copy_trace_builder;
                     AVM_TRACK_TIME("tracegen/data_copy",
@@ -418,7 +412,18 @@ void AvmTraceGenHelper::fill_trace_columns(TraceContainer& trace,
                     clear_events(events.emit_public_log_events);
                 } });
 
-        AVM_TRACK_TIME("tracegen/traces", execute_jobs(jobs));
+        AVM_TRACK_TIME("tracegen/traces", {
+            // Execution fills independent row chunks in parallel. Run it outside the
+            // other job group so it can use the existing top-level thread pool.
+            ExecutionTraceBuilder exec_builder;
+            AVM_TRACK_TIME("tracegen/execution", exec_builder.process(events.execution, trace));
+            // Freeing the execution events takes tens of ms on a large transaction, and no job of the group reads
+            // them: free them as one of its jobs, so the pool is not idle meanwhile.
+            jobs.emplace_back([&]() { clear_events(events.execution); });
+            execute_jobs(jobs);
+            AVM_TRACK_TIME("tracegen/memory", memory_trace_builder.write_rows(trace));
+            clear_events(events.memory);
+        });
     }
 }
 
@@ -463,9 +468,18 @@ void AvmTraceGenHelper::fill_trace_interactions(TraceContainer& trace)
         // Jobs with unique destination columns come first, then jobs that share destinations with earlier ones.
         AVM_TRACK_TIME("tracegen/order_jobs_by_destination_columns",
                        order_jobs_by_destination_columns(jobs_interactions));
+        split_jobs(jobs_interactions, trace);
 
         AVM_TRACK_TIME("tracegen/interactions",
                        parallel_for(jobs_interactions.size(), [&](size_t i) { jobs_interactions[i]->process(trace); }));
+        for (auto& job : jobs_interactions) {
+            job->finish();
+        }
+
+        // On a large transaction the jobs and the shared indices hold millions of row lists: free them on the pool,
+        // the jobs first, since they point into the indices.
+        bb::parallel_for(jobs_interactions.size(), [&](size_t i) { jobs_interactions[i].reset(); });
+        index_cache.release_in_parallel();
     }
 }
 

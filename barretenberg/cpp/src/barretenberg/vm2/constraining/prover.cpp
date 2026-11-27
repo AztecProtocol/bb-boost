@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <future>
 
 #include "barretenberg/commitment_schemes/claim.hpp"
 #include "barretenberg/commitment_schemes/commitment_key.hpp"
@@ -16,6 +17,7 @@
 #include "barretenberg/honk/library/grand_product_library.hpp"
 #include "barretenberg/honk/proof_system/logderivative_library.hpp"
 #include "barretenberg/numeric/bitop/get_msb.hpp"
+#include "barretenberg/polynomials/polynomial.hpp"
 #include "barretenberg/relations/permutation_relation.hpp"
 #include "barretenberg/sumcheck/sumcheck.hpp"
 #include "barretenberg/vm2/common/constants.hpp"
@@ -25,6 +27,30 @@
 namespace bb::avm2 {
 
 using Flavor = AvmFlavor;
+
+namespace {
+template <typename Relation> inline constexpr bool CAN_CACHE_VIRTUAL_ZERO_TERMS = false;
+#ifndef __wasm__
+template <typename FF, typename Settings>
+inline constexpr bool CAN_CACHE_VIRTUAL_ZERO_TERMS<lookup_relation_base<FF, lookup_settings<Settings>>> = true;
+template <typename FF, typename Settings>
+inline constexpr bool CAN_CACHE_VIRTUAL_ZERO_TERMS<permutation_relation_base<FF, permutation_settings<Settings>>> =
+    true;
+// The generated list begins with a lookup and ends with a permutation. Untagged/custom families stay disabled.
+static_assert(CAN_CACHE_VIRTUAL_ZERO_TERMS<std::tuple_element_t<0, Flavor::LookupRelations>>);
+static_assert(CAN_CACHE_VIRTUAL_ZERO_TERMS<
+              std::tuple_element_t<std::tuple_size_v<Flavor::LookupRelations> - 1, Flavor::LookupRelations>>);
+#endif
+struct CustomOrAggregateInverseRelation {};
+static_assert(!CAN_CACHE_VIRTUAL_ZERO_TERMS<CustomOrAggregateInverseRelation>);
+
+#ifdef NO_MULTITHREADING
+constexpr auto PREFIX_LAUNCH_POLICY = std::launch::deferred;
+#else
+// Runs deferred, at get(), if the thread cannot be created.
+constexpr auto PREFIX_LAUNCH_POLICY = std::launch::async | std::launch::deferred;
+#endif
+} // namespace
 using FF = Flavor::FF;
 
 /**
@@ -89,6 +115,17 @@ void AvmProver::execute_public_inputs_round()
                                            j < public_input_col_size ? public_input_col.at(j) : FF(0));
         }
     }
+
+    // The next challenge hashes what the transcript holds now and then every wire commitment, so the length of its
+    // input is known here and most of the input too: absorb that part while the wire commitments are computed.
+    const size_t num_wire_fields =
+        prover_polynomials.get_wires().size() * Transcript::Codec::template calc_num_fields<Flavor::Commitment>();
+    first_challenge_prefix =
+        std::async(bb::get_num_cpus() > 1 ? PREFIX_LAUNCH_POLICY : std::launch::deferred,
+                   [prefix = transcript->next_challenge_input_so_far(), num_wire_fields]() mutable {
+                       const size_t input_length = prefix.size() + num_wire_fields;
+                       return ChallengeHashPrefix(std::move(prefix), input_length);
+                   });
 }
 /**
  * @brief Compute commitments to all of the witness wires (apart from the logderivative inverse wires)
@@ -101,40 +138,98 @@ void AvmProver::execute_wire_commitments_round()
     // logderivative phase)
     auto batch = commitment_key.start_batch();
     for (const auto& [poly, label] : zip_view(prover_polynomials.get_wires(), prover_polynomials.get_wires_labels())) {
-        batch.add_to_batch(poly, label);
+        batch.add_to_batch(poly, label, /*has_duplicates_hint=*/true);
     }
-    batch.commit_and_send_to_verifier(transcript);
+    batch.commit_and_send_to_verifier(transcript, scalar_multiplication::SmallMsmSchedule::SPLIT_BY_COST);
 }
 
 void AvmProver::execute_log_derivative_inverse_round()
 {
     BB_BENCH_NAME("AvmProver::execute_log_derivative_inverse_round");
 
+    if (first_challenge_prefix.valid()) {
+        transcript->set_next_challenge_prefix(first_challenge_prefix.get());
+    }
     auto [beta, gamma] = transcript->template get_challenges<FF>(std::array<std::string, 2>{ "beta", "gamma" });
     relation_parameters.beta = beta;
     relation_parameters.gamma = gamma;
-    std::vector<std::function<void()>> tasks;
+    struct InverseJob {
+        size_t end_index;
+        size_t lookup_zero_from;
+        size_t table_zero_from;
+        std::function<void()> initialize;
+        std::function<void(size_t, size_t, size_t, size_t)> compute;
+    };
+    std::vector<InverseJob> jobs;
+    jobs.reserve(std::tuple_size_v<Flavor::LookupRelations>);
 
-    // Iterate over all LookupRelations and for each relation create a task that:
-    // 1. Resizes the inverse polynomial based on the max end_index() of the source and destination selector
-    // 2. Computes the logderivative inverse
     bb::constexpr_for<0, std::tuple_size_v<Flavor::LookupRelations>, 1>([&]<size_t relation_idx>() {
         using Relation = std::tuple_element_t<relation_idx, Flavor::LookupRelations>;
-        tasks.push_back([&]() {
-            // We need to resize the inverse polynomials for the relation, now that the selectors have been computed.
-            constraining::resize_inverses(prover_polynomials,
-                                          Relation::Settings::INVERSES,
-                                          Relation::Settings::SRC_SELECTOR,
-                                          Relation::Settings::DST_SELECTOR);
-
-            AVM_TRACK_TIME(std::string("prove/log_derivative_inverse_round/") + std::string(Relation::NAME),
-                           (compute_logderivative_inverse<FF, Relation, Flavor::ProverPolynomials, false>(
-                               prover_polynomials, relation_parameters)));
+        const auto& src_selector =
+            prover_polynomials.get(static_cast<ColumnAndShifts>(Relation::Settings::SRC_SELECTOR));
+        const auto& dst_selector =
+            prover_polynomials.get(static_cast<ColumnAndShifts>(Relation::Settings::DST_SELECTOR));
+        size_t lookup_zero_from = 0;
+        size_t table_zero_from = 0;
+        if constexpr (CAN_CACHE_VIRTUAL_ZERO_TERMS<Relation>) {
+            for (const auto column : Relation::Settings::SRC_COLUMNS) {
+                lookup_zero_from = std::max(lookup_zero_from, prover_polynomials.get(column).end_index());
+            }
+            for (const auto column : Relation::Settings::DST_COLUMNS) {
+                table_zero_from = std::max(table_zero_from, prover_polynomials.get(column).end_index());
+            }
+        }
+        jobs.push_back({
+            std::max(src_selector.end_index(), dst_selector.end_index()),
+            lookup_zero_from,
+            table_zero_from,
+            [&]() {
+                constraining::resize_inverses(prover_polynomials,
+                                              Relation::Settings::INVERSES,
+                                              Relation::Settings::SRC_SELECTOR,
+                                              Relation::Settings::DST_SELECTOR);
+            },
+            [&](size_t start, size_t end, size_t source_end, size_t destination_end) {
+                AVM_TRACK_TIME(std::string("prove/log_derivative_inverse_round/") + std::string(Relation::NAME),
+                               (compute_logderivative_inverse<FF,
+                                                              Relation,
+                                                              Flavor::ProverPolynomials,
+                                                              false,
+                                                              CAN_CACHE_VIRTUAL_ZERO_TERMS<Relation>>(
+                                   prover_polynomials, relation_parameters, start, end, source_end, destination_end)));
+            },
         });
     });
 
-    // Execute all the tasks in parallel
-    bb::parallel_for(tasks.size(), [&](size_t i) { tasks[i](); });
+    // Allocate each relation's destination once before publishing disjoint row ranges.
+    bb::parallel_for(jobs.size(), [&](size_t i) { jobs[i].initialize(); });
+
+    struct InverseChunk {
+        size_t job_index;
+        size_t start;
+        size_t end;
+    };
+    std::vector<InverseChunk> chunks;
+    // A row of the costliest lookups takes several times a typical row, so a larger chunk of one of them is left
+    // running alone at the end of the round.
+    constexpr size_t MAX_ROWS_PER_CHUNK = 1 << 12;
+    const bool split_rows = bb::get_num_cpus() > 1;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const size_t end = jobs[i].end_index;
+        const size_t chunk_size = split_rows ? MAX_ROWS_PER_CHUNK : std::max(size_t{ 1 }, end);
+        for (size_t start = 0; start < end;) {
+            const size_t chunk_end = start + std::min(chunk_size, end - start);
+            chunks.push_back({ i, start, chunk_end });
+            start = chunk_end;
+        }
+    }
+
+    // Each task computes and inverts only its own rows. No task starts a nested pool.
+    bb::parallel_for(chunks.size(), [&](size_t i) {
+        const auto& chunk = chunks[i];
+        const auto& job = jobs[chunk.job_index];
+        job.compute(chunk.start, chunk.end, job.lookup_zero_from, job.table_zero_from);
+    });
 }
 
 void AvmProver::execute_log_derivative_inverse_commitments_round()
@@ -147,7 +242,7 @@ void AvmProver::execute_log_derivative_inverse_commitments_round()
 
         batch.add_to_batch(derived_poly, label);
     }
-    batch.commit_and_send_to_verifier(transcript);
+    batch.commit_and_send_to_verifier(transcript, scalar_multiplication::SmallMsmSchedule::SPLIT_BY_COST);
 }
 
 /**
@@ -216,40 +311,27 @@ void AvmProver::execute_pcs_rounds()
         return static_cast<size_t>(std::distance(polys.begin(), it));
     };
 
-    auto add_scaled_batched =
+    // Partition by destination coefficients instead of allocating one full-size accumulator per CPU.
+    // The cumulative helper balances source work, tiles the destination and skips zero coefficients.
+    const auto add_scaled_batched =
         [](Polynomial& dst, const std::span<Polynomial>& sources, const std::span<FF>& scalars, const size_t skip_idx) {
-            const size_t num_slots = bb::get_num_cpus();
-            std::vector<Polynomial> batched_polys(num_slots);
-            for (auto& poly : batched_polys) {
-                poly = Polynomial(dst.size(), dst.virtual_size(), dst.start_index());
-            }
-
-            // Chunks are consumed dynamically via an atomic counter: faster threads naturally pick up
-            // more chunks while the slot they write to stays fixed for the life of their outer task.
-            std::atomic<size_t> next_poly(0);
-
-            // Accumulate polynomials: each thread picks up the next available polynomial
-            parallel_for(num_slots, [&](size_t slot_id) {
-                while (true) {
-                    const size_t poly_id = next_poly.fetch_add(1, std::memory_order_relaxed);
-                    if (poly_id >= sources.size()) {
-                        break;
-                    }
-                    if (poly_id == skip_idx) {
-                        continue;
-                    }
-
-                    const size_t start_idx = sources[poly_id].start_index();
-                    const size_t end_idx = sources[poly_id].end_index();
-                    for (size_t idx = start_idx; idx < end_idx; idx++) {
-                        batched_polys[slot_id].at(idx) += scalars[poly_id] * sources[poly_id][idx];
-                    }
+            BB_ASSERT_EQ(sources.size(), scalars.size());
+            std::vector<PolynomialSpan<const FF>> source_spans;
+            std::vector<FF> source_scalars;
+            source_spans.reserve(sources.size());
+            source_scalars.reserve(sources.size());
+            for (size_t poly_id = 0; poly_id < sources.size(); ++poly_id) {
+                const auto& source = sources[poly_id];
+                // The selected polynomial was moved into dst. Empty sources contribute nothing and may
+                // start outside dst's backing range, so omit them before the helper's range checks.
+                if (poly_id == skip_idx || source.is_empty()) {
+                    continue;
                 }
-            });
-
-            for (const auto& poly : batched_polys) {
-                dst += poly;
+                source_spans.emplace_back(static_cast<PolynomialSpan<const FF>>(source));
+                source_scalars.push_back(scalars[poly_id]);
             }
+            bb::add_scaled_batch(
+                dst, std::span<const PolynomialSpan<const FF>>(source_spans), std::span<const FF>(source_scalars));
         };
 
     // Batch to be shifted polys in their to_be_shifted form
@@ -274,7 +356,7 @@ void AvmProver::execute_pcs_rounds()
     // Assign the batched unshifted polynomial according to whether the largest poly was among the to be shifted polys
     // or not
     Polynomial batched_unshifted;
-    if (unshifted_polys[max_idx_unshifted].end_index() > batched_shifted.end_index()) {
+    if (unshifted_polys[max_idx_unshifted].end_index() >= batched_shifted.end_index()) {
         batched_unshifted = std::move(unshifted_polys[max_idx_unshifted]);
         batched_unshifted *= unshifted_challenges[max_idx_unshifted];
         batched_unshifted += batched_shifted;

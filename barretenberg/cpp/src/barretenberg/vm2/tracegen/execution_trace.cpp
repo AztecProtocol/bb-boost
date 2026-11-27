@@ -9,6 +9,7 @@
 
 #include "barretenberg/aztec/aztec_constants.hpp"
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/thread.hpp"
 #include "barretenberg/vm2/common/addressing.hpp"
 #include "barretenberg/vm2/common/field.hpp"
 #include "barretenberg/vm2/common/instruction_spec.hpp"
@@ -212,8 +213,7 @@ struct FailingContexts {
  * @param ex_events The execution events.
  * @return The failing contexts.
  */
-FailingContexts preprocess_for_discard(
-    const simulation::EventEmitterInterface<simulation::ExecutionEvent>::Container& ex_events)
+template <typename Events> FailingContexts preprocess_for_discard(const Events& ex_events)
 {
     FailingContexts dying_info;
 
@@ -223,7 +223,7 @@ FailingContexts preprocess_for_discard(
     // would lead to the same results.
 
     // Preprocessing pass 1: find the events that exit the app logic and teardown phases
-    for (const auto& ex_event : ex_events) {
+    for (const simulation::ExecutionEvent& ex_event : ex_events) {
         bool is_exit = ex_event.is_exit();
         bool is_top_level = ex_event.after_context_event.parent_id == 0;
 
@@ -240,7 +240,7 @@ FailingContexts preprocess_for_discard(
     }
 
     // Preprocessing pass 2: find all contexts that fail and mark them
-    for (const auto& ex_event : ex_events) {
+    for (const simulation::ExecutionEvent& ex_event : ex_events) {
         if (ex_event.is_failure()) {
             dying_info.does_context_fail.insert(ex_event.after_context_event.id);
         }
@@ -324,28 +324,64 @@ uint32_t dying_context_for_phase(TransactionPhase phase, const FailingContexts& 
 void ExecutionTraceBuilder::process(
     const simulation::EventEmitterInterface<simulation::ExecutionEvent>::Container& ex_events, TraceContainer& trace)
 {
-    uint32_t row = 1; // We start from row 1 because this trace contains shifted columns.
+    process_events(ex_events, trace);
+}
 
-    // Preprocess events to determine which contexts will fail
+template <std::same_as<std::vector<simulation::ExecutionEvent>> Events>
+void ExecutionTraceBuilder::process(const Events& ex_events, TraceContainer& trace)
+{
+    process_events(ex_events, trace);
+}
+
+template void ExecutionTraceBuilder::process(const std::vector<simulation::ExecutionEvent>& ex_events,
+                                             TraceContainer& trace);
+
+template <typename Events> void ExecutionTraceBuilder::process_events(const Events& ex_events, TraceContainer& trace)
+{
+    // Resolve the small chronological state machine before filling independent rows.
     const FailingContexts failures = preprocess_for_discard(ex_events);
-
-    // Some variables updated per loop iteration to track
-    // whether or not the upcoming row should "discard" [side effects].
-    uint32_t dying_context_id = 0;
-    // dying_context_id captures whether we discard or not. Namely, discard == 1 <=> dying_context_id != 0
-    // is a circuit invariant. For this reason, we use a lambda to preserve the invariant.
-    auto is_discarding = [&dying_context_id]() { return dying_context_id != 0; };
-    bool is_first_event_in_enqueued_call = true;
-    bool prev_row_was_enter_call = false;
-
-    for (const auto& ex_event : ex_events) {
-        // Check if this is the first event in an enqueued call and whether
-        // the phase should be discarded
-        if (!is_discarding() && is_first_event_in_enqueued_call &&
-            is_phase_discarded(ex_event.after_context_event.phase, failures)) {
-            dying_context_id = dying_context_for_phase(ex_event.after_context_event.phase, failures);
+    struct RowState {
+        uint32_t dying_context_id;
+        bool enqueued_call_start;
+        bool previous_row_entered_call;
+    };
+    std::vector<RowState> row_states;
+    row_states.reserve(ex_events.size());
+    uint32_t discarding_context_id = 0;
+    bool next_enqueued_call_start = true;
+    bool previous_entered_call = false;
+    for (const simulation::ExecutionEvent& event : ex_events) {
+        if (discarding_context_id == 0 && next_enqueued_call_start &&
+            is_phase_discarded(event.after_context_event.phase, failures)) {
+            discarding_context_id = dying_context_for_phase(event.after_context_event.phase, failures);
         }
+        row_states.push_back({ discarding_context_id, next_enqueued_call_start, previous_entered_call });
+        // Only NONE and OPCODE_EXECUTION reach the opcode-execution temporality group.
+        const bool reaches_opcode =
+            event.error == ExecutionError::NONE || event.error == ExecutionError::OPCODE_EXECUTION;
+        bool enters_call = false;
+        if (reaches_opcode) {
+            const auto opcode = event.wire_instruction.get_exec_opcode();
+            enters_call = opcode == ExecutionOpCode::CALL || opcode == ExecutionOpCode::STATICCALL;
+        }
+        if (event.is_failure() && event.after_context_event.id == discarding_context_id) {
+            discarding_context_id = 0;
+        } else if (enters_call && discarding_context_id == 0 &&
+                   failures.does_context_fail.contains(event.next_context_id)) {
+            discarding_context_id = event.next_context_id;
+        }
+        next_enqueued_call_start = event.after_context_event.parent_id == 0 && event.is_exit();
+        previous_entered_call = enters_call;
+    }
 
+    const auto process_event = [&](size_t index) {
+        const simulation::ExecutionEvent& ex_event = ex_events[index];
+        const uint32_t row = static_cast<uint32_t>(index + 1); // Row zero is reserved for shifted columns.
+        const auto& state = row_states[index];
+        const uint32_t dying_context_id = state.dying_context_id;
+        const bool is_first_event_in_enqueued_call = state.enqueued_call_start;
+        const bool prev_row_was_enter_call = state.previous_row_entered_call;
+        const auto is_discarding = [dying_context_id]() { return dying_context_id != 0; };
         const bool has_parent = ex_event.after_context_event.parent_id != 0;
 
         /**************************************************************************************************
@@ -576,7 +612,6 @@ void ExecutionTraceBuilder::process(
 
         // These booleans are used after of the "opcode code execution" block but need
         // to be set as part of the "opcode code execution" block.
-        bool sel_enter_call = false;
         bool sel_exit_call = false;
         bool execute_revert = false;
 
@@ -599,7 +634,6 @@ void ExecutionTraceBuilder::process(
             // Execution trace opcodes specific logic.
             // Note that the opcode selectors were set above. (e.g., sel_execute_call, sel_execute_static_call, ..).
             if (*exec_opcode == ExecutionOpCode::CALL || *exec_opcode == ExecutionOpCode::STATICCALL) {
-                sel_enter_call = true;
 
                 const Gas gas_left = ex_event.after_context_event.gas_limit - ex_event.after_context_event.gas_used;
 
@@ -772,37 +806,23 @@ void ExecutionTraceBuilder::process(
                       { C::execution_dying_context_diff_inv, dying_context_diff }, // Will be inverted in batch.
                       { C::execution_enqueued_call_end, enqueued_call_end ? 1 : 0 },
                   } });
+    };
 
-        // Trace-generation is done for this event.
-        // Now, use this event to determine whether we should set/reset the discard flag for the NEXT event.
-        // Note: is_failure implies discard is true.
-        const bool event_kills_dying_context = is_failure && is_dying_context;
-
-        if (event_kills_dying_context) {
-            // Set/unset discard flag if the current event is the one that kills the dying context
-            dying_context_id = 0;
-        } else if (sel_enter_call && !is_discarding() &&
-                   failures.does_context_fail.contains(ex_event.next_context_id)) {
-            // If making a nested call, and discard isn't already high...
-            // if the nested context being entered eventually dies, we set which context is dying (implicitly raise
-            // discard flag). NOTE: If a [STATIC]CALL instruction _itself_ errors, we don't set the discard flag
-            // because we aren't actually entering a new context. This is already captured by `sel_enter_call`
-            // boolean which is set to true only during opcode execution temporality group which cannot
-            // fail for CALL/STATICALL.
-            dying_context_id = ex_event.next_context_id;
+    // Align chunks to trace shards: writers never share a cell, and normally share no shard.
+    constexpr size_t chunk_size = TraceContainer::INTERVAL_SIZE;
+    const size_t num_chunks = (ex_events.size() + chunk_size) / chunk_size;
+    if (num_chunks < 4) {
+        for (size_t index = 0; index < ex_events.size(); ++index) {
+            process_event(index);
         }
-        // Otherwise, we aren't entering or exiting a dying context,
-        // so just propagate discard and dying context.
-        // Implicit: dying_context_id = dying_context_id; discard = discard;
-
-        // If an enqueued call just exited, next event (if any) is the first in an enqueued call.
-        // Update flag for next iteration.
-        is_first_event_in_enqueued_call = !has_parent && sel_exit_call;
-
-        // Track this bool for use determining whether the next row is the first in a context
-        prev_row_was_enter_call = sel_enter_call;
-
-        row++;
+    } else {
+        parallel_for(num_chunks, [&](size_t chunk) {
+            const size_t first_row = std::max<size_t>(1, chunk * chunk_size);
+            const size_t end_row = std::min(ex_events.size() + 1, (chunk + 1) * chunk_size);
+            for (size_t row = first_row; row < end_row; ++row) {
+                process_event(row - 1);
+            }
+        });
     }
 
     // Batch invert the columns.

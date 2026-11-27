@@ -128,6 +128,14 @@ void parallel_for(size_t num_iterations, const std::function<void(size_t)>& func
 #endif
 }
 
+#ifdef NO_MULTITHREADING
+size_t parallel_for_num_workers()
+{
+    return 0;
+}
+void parallel_for_stop_workers() {}
+#endif
+
 /**
  * @brief Split a loop into several loops running in parallel
  *

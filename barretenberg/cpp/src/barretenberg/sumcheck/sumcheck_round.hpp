@@ -21,7 +21,10 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <memory>
 #include <optional>
+#include <variant>
+#include <vector>
 
 namespace bb {
 
@@ -45,6 +48,37 @@ concept IsVectorField = requires { T::SIZE; };
 // `accumulate_edge_chunks`'s `EDGE_STRIDE = 2 * lane_count`.
 template <typename T> inline constexpr size_t lane_count = 1;
 template <IsVectorField T> inline constexpr size_t lane_count<T> = T::SIZE;
+
+/**
+ * @brief Prover-only subrelation batching hook.
+ * @details A relation whose subrelations share most of their per-row work (e.g. a common selector factor and a
+ * constant linear map applied to shared S-box outputs) may expose
+ *  - `SubrelationBatchingConstants`,
+ *  - `compute_subrelation_batching_constants(weights)`, where `weights[k] = separator_k / separator_0` are its
+ *    subrelation separators relative to that of its first subrelation, and
+ *  - `accumulate_with_subrelation_batching(accumulators, in, params, scaling_factor, constants)`, which adds
+ *    \f$ \sum_k w_k T_k \f$ (with \f$ w_k \f$ the weights) into the first subrelation accumulator and leaves the others
+ *    untouched.
+ * After `scale_univariates` multiplies the first accumulator by separator_0, the batched round univariate equals the
+ * per-subrelation one, so this is only valid for relations whose subrelations are all linearly independent and of
+ * equal length (they are then extended and batched identically). Verifiers never take this path.
+ */
+template <typename Relation>
+concept HasProverSubrelationBatching = requires { typename Relation::SubrelationBatchingConstants; };
+
+template <typename Relation> struct SubrelationBatchingSlot {
+    using type = std::monostate;
+};
+template <HasProverSubrelationBatching Relation> struct SubrelationBatchingSlot<Relation> {
+    // Empty when the relation's first separator is zero, in which case its subrelations are accumulated separately.
+    using type = std::optional<typename Relation::SubrelationBatchingConstants>;
+};
+template <typename Relations> struct SubrelationBatchingTuple;
+// Preserve the flavor's tuple family: AVM uses flat_tuple to avoid recursive std::tuple storage.
+template <template <typename...> class Tuple, typename... Relation>
+struct SubrelationBatchingTuple<Tuple<Relation...>> {
+    using type = Tuple<typename SubrelationBatchingSlot<Relation>::type...>;
+};
 
 /*! \brief Imlementation of the Sumcheck prover round.
     \class SumcheckProverRound
@@ -92,6 +126,10 @@ template <typename Flavor> class SumcheckProverRound {
                                              : (SupportsSimdSumcheck<Flavor> && simd_available_v<typename FF::Params>)
                                                  ? 50
                                                  : 64;
+    // Rows at the start of each round that are scheduled as one-edge chunks ahead of the `ROWS_PER_CHUNK` chunks. AVM
+    // columns are prefixes of the trace, so the leading edges carry the most live columns, and a single chunk holding
+    // them would set the round's wall time. A constant: chunk boundaries never depend on the thread count.
+    static constexpr size_t DENSE_HEAD_ROWS = isAvmFlavor<Flavor> ? 512 : 0;
     using ZKData = ZKSumcheckData<Flavor>;
 
     // Number of rows excluded from the main sumcheck loop and handled by compute_offset_area_contribution.
@@ -117,6 +155,8 @@ template <typename Flavor> class SumcheckProverRound {
      */
     static constexpr size_t BATCHED_RELATION_PARTIAL_LENGTH = Flavor::BATCHED_RELATION_PARTIAL_LENGTH;
     using SumcheckRoundUnivariate = bb::Univariate<FF, BATCHED_RELATION_PARTIAL_LENGTH>;
+    // Per-relation constants of the prover-only subrelation batching (see HasProverSubrelationBatching).
+    using SubrelationBatching = typename SubrelationBatchingTuple<Relations>::type;
     // Note: since this is not initialized with {}, the univariates contain garbage.
     SumcheckTupleOfTuplesOfUnivariates univariate_accumulators;
 
@@ -416,8 +456,42 @@ template <typename Flavor> class SumcheckProverRound {
                       "SIMD element requested for a flavor that does not support the row-parallel path");
 
         auto chunks = make_edge_chunks(polynomials);
-        accumulate_edge_chunks<ResolvedElement>(chunks, polynomials, relation_parameters, gate_separators);
+        const SubrelationBatching subrelation_batching = compute_subrelation_batching(alphas);
+        accumulate_edge_chunks<ResolvedElement>(
+            chunks, polynomials, relation_parameters, gate_separators, &subrelation_batching);
         return batch_over_relations<SumcheckRoundUnivariate>(univariate_accumulators, alphas, gate_separators);
+    }
+
+    /**
+     * @brief Constants of the prover-only subrelation batching for every relation that supports it.
+     * @details `scale_univariates` multiplies the accumulator of the g-th subrelation (in flavor order) by
+     * `alphas[g - 1]` (the very first one by 1). A batching relation receives its subrelations' separators divided by
+     * that of its first subrelation; if the latter is zero the relation keeps its per-subrelation accumulation.
+     */
+    static SubrelationBatching compute_subrelation_batching(const SubrelationSeparators& alphas)
+    {
+        SubrelationBatching result;
+        size_t first_subrelation_idx = 0;
+        constexpr_for<0, NUM_RELATIONS, 1>([&]<size_t relation_idx>() {
+            using Relation = std::tuple_element_t<relation_idx, Relations>;
+            constexpr size_t NUM_SUBRELATIONS_IN_RELATION = Relation::SUBRELATION_PARTIAL_LENGTHS.size();
+            if constexpr (HasProverSubrelationBatching<Relation>) {
+                auto separator = [&](const size_t subrelation_idx) {
+                    return subrelation_idx == 0 ? FF(1) : alphas[subrelation_idx - 1];
+                };
+                const FF first_separator = separator(first_subrelation_idx);
+                if (!first_separator.is_zero()) {
+                    const FF first_separator_inverse = first_separator.invert();
+                    std::array<FF, NUM_SUBRELATIONS_IN_RELATION> weights;
+                    for (size_t k = 0; k < NUM_SUBRELATIONS_IN_RELATION; ++k) {
+                        weights[k] = separator(first_subrelation_idx + k) * first_separator_inverse;
+                    }
+                    std::get<relation_idx>(result) = Relation::compute_subrelation_batching_constants(weights);
+                }
+            }
+            first_subrelation_idx += NUM_SUBRELATIONS_IN_RELATION;
+        });
+        return result;
     }
 
     struct EdgeRange {
@@ -432,24 +506,33 @@ template <typename Flavor> class SumcheckProverRound {
     }
 
     // Work-stealing scheduler over a single contiguous edge range (the dense-flavor case, see
-    // `compute_univariate`). `pop()` computes chunk bounds arithmetically, so it allocates nothing.
+    // `compute_univariate`). The first `head_rows` rows go out as one-edge chunks, then the rest in `rows_per_chunk`
+    // chunks. `pop()` computes chunk bounds arithmetically, so it allocates nothing.
     struct ContiguousEdgeChunks {
         const size_t begin;
         const size_t end;
         const size_t rows_per_chunk;
+        const size_t head_end;
+        const size_t head_chunks;
         const size_t total_chunks;
         std::atomic<size_t> next_chunk{ 0 };
 
-        ContiguousEdgeChunks(const size_t begin, const size_t end, const size_t rows_per_chunk)
+        ContiguousEdgeChunks(const size_t begin,
+                             const size_t end,
+                             const size_t rows_per_chunk,
+                             const size_t head_rows = 0)
             : begin(begin)
             , end(end)
             , rows_per_chunk(rows_per_chunk)
-            , total_chunks(chunk_count(end - begin, rows_per_chunk))
+            , head_end(std::min(begin + head_rows, end))
+            , head_chunks((head_end - begin) / 2)
+            , total_chunks(head_chunks + chunk_count(end - head_end, rows_per_chunk))
         {
             BB_ASSERT(begin % 2 == 0, "edge range begin must be even");
             BB_ASSERT(end % 2 == 0, "edge range end must be even");
             BB_ASSERT(begin <= end, "edge range begin must not exceed end");
             BB_ASSERT(rows_per_chunk >= 2 && rows_per_chunk % 2 == 0, "rows_per_chunk must be at least 2 and even");
+            BB_ASSERT(head_rows % 2 == 0 && head_rows <= DENSE_HEAD_ROWS, "head_rows must be even and enabled");
         }
 
         size_t num_slots() const { return std::min(bb::get_num_cpus(), std::max<size_t>(total_chunks, 1)); }
@@ -460,8 +543,16 @@ template <typename Flavor> class SumcheckProverRound {
             if (id >= total_chunks) {
                 return std::nullopt;
             }
-            const size_t chunk_begin = begin + id * rows_per_chunk;
-            return EdgeRange{ .begin = chunk_begin, .end = std::min(chunk_begin + rows_per_chunk, end) };
+            if constexpr (DENSE_HEAD_ROWS > 0) {
+                if (id < head_chunks) {
+                    return EdgeRange{ .begin = begin + 2 * id, .end = begin + 2 * id + 2 };
+                }
+                const size_t chunk_begin = head_end + (id - head_chunks) * rows_per_chunk;
+                return EdgeRange{ .begin = chunk_begin, .end = std::min(chunk_begin + rows_per_chunk, end) };
+            } else {
+                const size_t chunk_begin = begin + id * rows_per_chunk;
+                return EdgeRange{ .begin = chunk_begin, .end = std::min(chunk_begin + rows_per_chunk, end) };
+            }
         }
     };
 
@@ -521,7 +612,7 @@ template <typename Flavor> class SumcheckProverRound {
         } else {
             // Short traces don't need to iterate over the zero tail of the polynomial.
             const size_t effective_round_size = compute_effective_round_size(polynomials);
-            return ContiguousEdgeChunks{ excluded_head_size, effective_round_size, ROWS_PER_CHUNK };
+            return ContiguousEdgeChunks{ excluded_head_size, effective_round_size, ROWS_PER_CHUNK, DENSE_HEAD_ROWS };
         }
     }
 
@@ -555,11 +646,15 @@ template <typename Flavor> class SumcheckProverRound {
                          const Multivariates& polynomials,
                          const bb::RelationParameters<Element>& params,
                          const bb::GateSeparatorPolynomial<FF>& gate_separators,
-                         const size_t edge_idx)
+                         const size_t edge_idx,
+                         const SubrelationBatching* subrelation_batching)
     {
         SumcheckProverRound::load_edge(edge_container, polynomials, edge_idx);
-        accumulate_relation_univariates<RelationTupleFor<Element>>(
-            accumulator, edge_container, params, element_scaling<Element>(gate_separators, edge_idx));
+        accumulate_relation_univariates<RelationTupleFor<Element>>(accumulator,
+                                                                   edge_container,
+                                                                   params,
+                                                                   element_scaling<Element>(gate_separators, edge_idx),
+                                                                   subrelation_batching);
     }
 
     // Accumulate the round univariate over `chunks` in element type `Element`. Each work-stealing slot owns a
@@ -571,20 +666,19 @@ template <typename Flavor> class SumcheckProverRound {
     void accumulate_edge_chunks(EdgeChunks& chunks,
                                 ProverPolynomialsOrPartiallyEvaluatedMultivariates& polynomials,
                                 const bb::RelationParameters<FF>& relation_parameters,
-                                const bb::GateSeparatorPolynomial<FF>& gate_separators)
+                                const bb::GateSeparatorPolynomial<FF>& gate_separators,
+                                const SubrelationBatching* subrelation_batching = nullptr)
     {
         constexpr size_t EDGE_STRIDE = 2 * lane_count<Element>;
         const size_t num_slots = chunks.num_slots();
         const auto element_parameters = relation_parameters.template convert_to<Element>();
 
-        std::vector<AccumulatorsFor<Element>> slot_wide_accumulators(num_slots);
-        std::vector<SumcheckTupleOfTuplesOfUnivariates> slot_results(num_slots);
-
-        parallel_for(num_slots, [&](size_t slot_id) {
+        // Accumulates the chunks a slot pops into `wide_accumulator` (full groups) and `result` (leftover pairs), then
+        // folds the former into the latter.
+        auto accumulate_slot = [&](AccumulatorsFor<Element>& wide_accumulator,
+                                   SumcheckTupleOfTuplesOfUnivariates& result) {
             auto edges = make_extended_edges<Element>(polynomials);
             auto tail_edges = make_extended_edges(polynomials);
-            auto& wide_accumulator = slot_wide_accumulators[slot_id];
-            auto& result = slot_results[slot_id];
             while (auto chunk = chunks.pop()) {
                 // Both passes call the same `accumulate_edge`, differing only in the element folded in: the
                 // full-group pass a wide `Element` batch (`edges`) into `wide_accumulator`, the leftover pass
@@ -594,20 +688,72 @@ template <typename Flavor> class SumcheckProverRound {
                     chunk->end,
                     EDGE_STRIDE,
                     [&](const size_t edge_idx) {
-                        accumulate_edge(
-                            wide_accumulator, edges, polynomials, element_parameters, gate_separators, edge_idx);
+                        accumulate_edge(wide_accumulator,
+                                        edges,
+                                        polynomials,
+                                        element_parameters,
+                                        gate_separators,
+                                        edge_idx,
+                                        subrelation_batching);
                     },
                     [&](const size_t edge_idx) {
-                        accumulate_edge(
-                            result, tail_edges, polynomials, relation_parameters, gate_separators, edge_idx);
+                        accumulate_edge(result,
+                                        tail_edges,
+                                        polynomials,
+                                        relation_parameters,
+                                        gate_separators,
+                                        edge_idx,
+                                        subrelation_batching);
                     });
             }
             reduce_accumulator<Element>(result, wide_accumulator);
-        });
+        };
 
-        for (auto& result : slot_results) {
-            Utils::add_nested_tuples(univariate_accumulators, result);
+        if constexpr (LARGE_ACCUMULATORS) {
+            // Each slot allocates and value-initializes its own accumulators on its own thread, instead of the calling
+            // thread building all of them (about 40 MB per round for AVM at 64 slots).
+            std::vector<std::unique_ptr<SumcheckTupleOfTuplesOfUnivariates>> slot_results(num_slots);
+            parallel_for(num_slots, [&](size_t slot_id) {
+                const auto wide_accumulator = std::make_unique<AccumulatorsFor<Element>>();
+                slot_results[slot_id] = std::make_unique<SumcheckTupleOfTuplesOfUnivariates>();
+                accumulate_slot(*wide_accumulator, *slot_results[slot_id]);
+            });
+            add_slot_results(slot_results);
+        } else {
+            std::vector<AccumulatorsFor<Element>> slot_wide_accumulators(num_slots);
+            std::vector<SumcheckTupleOfTuplesOfUnivariates> slot_results(num_slots);
+            parallel_for(num_slots, [&](size_t slot_id) {
+                accumulate_slot(slot_wide_accumulators[slot_id], slot_results[slot_id]);
+            });
+            for (auto& result : slot_results) {
+                Utils::add_nested_tuples(univariate_accumulators, result);
+            }
         }
+    }
+
+    // Accumulator tuples this large make building and summing the per-slot copies on the calling thread a serial cost
+    // per round (AVM: ~10k coefficients, 304 KiB, one copy per thread). Smaller flavors keep the plain serial form.
+    static constexpr bool LARGE_ACCUMULATORS = sizeof(SumcheckTupleOfTuplesOfUnivariates) >= (size_t{ 1 } << 16);
+
+    // Adds the slot results into `univariate_accumulators` slot by slot. With several slots the work is split by
+    // relation, and each relation still adds the slots in slot order, so every coefficient goes through the same
+    // additions in the same order as in the serial loop: the same field elements, raw limbs included.
+    void add_slot_results(const std::vector<std::unique_ptr<SumcheckTupleOfTuplesOfUnivariates>>& slot_results)
+    {
+        if (slot_results.size() == 1) {
+            Utils::add_nested_tuples(univariate_accumulators, *slot_results.front());
+            return;
+        }
+        parallel_for(NUM_RELATIONS, [&](size_t relation) {
+            constexpr_for<0, NUM_RELATIONS, 1>([&]<size_t relation_idx>() {
+                if (relation_idx == relation) {
+                    for (const auto& slot_result : slot_results) {
+                        Utils::add_tuples(std::get<relation_idx>(univariate_accumulators),
+                                          std::get<relation_idx>(*slot_result));
+                    }
+                }
+            });
+        });
     }
 
     // True when the flavor exposes a static row-skip manifest: a contiguous prefix [head, active_prefix_end) holding
@@ -818,11 +964,15 @@ template <typename Flavor> class SumcheckProverRound {
     {
         SumcheckTupleOfTuplesOfUnivariates univariate_accumulator{};
         auto extended_edges = make_extended_edges(polynomials);
+        const SubrelationBatching subrelation_batching = compute_subrelation_batching(alphas);
 
         for (size_t edge_idx = 0; edge_idx < excluded_head_size; edge_idx += 2) {
             load_edge(extended_edges, polynomials, edge_idx);
-            accumulate_relation_univariates(
-                univariate_accumulator, extended_edges, relation_parameters, gate_separators[edge_idx]);
+            accumulate_relation_univariates(univariate_accumulator,
+                                            extended_edges,
+                                            relation_parameters,
+                                            gate_separators[edge_idx],
+                                            &subrelation_batching);
         }
 
         return batch_over_relations<SumcheckRoundUnivariate>(
@@ -860,8 +1010,9 @@ template <typename Flavor> class SumcheckProverRound {
 
         // The tail of G(X) = \prod_{k} (1 + X_k(\beta_k - 1) ) evaluated at the edge (0, ..., 0).
         const FF gate_separator_tail{ 1 };
+        const SubrelationBatching subrelation_batching = compute_subrelation_batching(alphas);
         accumulate_relation_univariates(
-            univariate_accumulator, extended_edges, relation_parameters, gate_separator_tail);
+            univariate_accumulator, extended_edges, relation_parameters, gate_separator_tail, &subrelation_batching);
 
         return batch_over_relations<SumcheckRoundUnivariate>(
             univariate_accumulator, alphas, gate_separator, row_disabling_polynomial);
@@ -889,15 +1040,27 @@ template <typename Flavor> class SumcheckProverRound {
                                                    const bb::GateSeparatorPolynomial<FF>& gate_separators,
                                                    const RowDisablingPolynomial<FF>* row_disabling_polynomial = nullptr)
     {
-        Utils::scale_univariates(univariate_accumulators, challenge);
-
         auto result = ExtendedUnivariate(0);
-        extend_and_batch_univariates<ExtendedUnivariate>(
-            univariate_accumulators, result, gate_separators, row_disabling_polynomial);
-
-        // Reset all univariate accumulators to 0 before beginning accumulation in the next round
-        Utils::zero_univariates(univariate_accumulators);
+        if constexpr (ParallelizesRelationBatching<Flavor>) {
+            // Each relation's task scales its accumulators before batching them and zeroes them after.
+            extend_and_batch_univariates<ExtendedUnivariate>(
+                univariate_accumulators, result, gate_separators, row_disabling_polynomial, &challenge);
+        } else {
+            Utils::scale_univariates(univariate_accumulators, challenge);
+            extend_and_batch_univariates<ExtendedUnivariate>(
+                univariate_accumulators, result, gate_separators, row_disabling_polynomial);
+            // Reset all univariate accumulators to 0 before beginning accumulation in the next round
+            Utils::zero_univariates(univariate_accumulators);
+        }
         return result;
+    }
+
+    // Position, in flavor order, of relation `relation_idx`'s first subrelation within a tuple of tuples.
+    template <typename TupleOfTuples, size_t relation_idx> static constexpr size_t first_subrelation_index()
+    {
+        return []<size_t... I>(std::index_sequence<I...>) {
+            return (size_t{ 0 } + ... + std::tuple_size_v<std::tuple_element_t<I, TupleOfTuples>>);
+        }(std::make_index_sequence<relation_idx>{});
     }
 
     /**
@@ -919,12 +1082,16 @@ template <typename Flavor> class SumcheckProverRound {
      * @param gate_separators Round \f$pow_{\beta}\f$-factor \f$ ( (1−X_i) + X_i\cdot \beta_i )\f$.
      * @param row_disabling_polynomial Optional; when non-null, its `eval_at_0/1` supply `L^{(i)}`
      *        for per-relation `L` / `(1 - L)` scaling.
+     * @param scale_then_zero Optional, for a mutable `tuple`: each relation first scales its subrelation accumulators
+     *        as `scale_univariates` does with these separators, and zeroes them once batched, so every coefficient
+     *        goes through the same operations in the same order as with those two passes around the call.
      */
     template <typename ExtendedUnivariate, typename TupleOfTuplesOfUnivariates>
-    static void extend_and_batch_univariates(const TupleOfTuplesOfUnivariates& tuple,
+    static void extend_and_batch_univariates(TupleOfTuplesOfUnivariates& tuple,
                                              ExtendedUnivariate& result,
                                              const bb::GateSeparatorPolynomial<FF>& gate_separators,
-                                             const RowDisablingPolynomial<FF>* row_disabling_polynomial = nullptr)
+                                             const RowDisablingPolynomial<FF>* row_disabling_polynomial = nullptr,
+                                             const SubrelationSeparators* scale_then_zero = nullptr)
     {
         // Pow-Factor  \f$ (1-X) + X\beta_i \f$
         auto random_polynomial = bb::Univariate<FF, 2>({ 1, gate_separators.current_element() });
@@ -951,7 +1118,20 @@ template <typename Flavor> class SumcheckProverRound {
         // row-disabling factor. Independent across relations, so it can run serially or in parallel.
         auto batch_one_relation = [&]<size_t relation_idx>() -> ExtendedUnivariate {
             using Relation = typename std::tuple_element_t<relation_idx, Relations>;
-            const auto& outer_element = std::get<relation_idx>(tuple);
+            auto& outer_element = std::get<relation_idx>(tuple);
+            constexpr size_t num_subrelations = std::tuple_size_v<std::decay_t<decltype(outer_element)>>;
+            constexpr bool can_scale_and_zero = !std::is_const_v<TupleOfTuplesOfUnivariates>;
+            if constexpr (can_scale_and_zero) {
+                if (scale_then_zero != nullptr) {
+                    constexpr size_t first =
+                        first_subrelation_index<std::remove_const_t<TupleOfTuplesOfUnivariates>, relation_idx>();
+                    constexpr_for<0, num_subrelations, 1>([&]<size_t subrelation_idx>() {
+                        if constexpr (first + subrelation_idx != 0) {
+                            std::get<subrelation_idx>(outer_element) *= (*scale_then_zero)[first + subrelation_idx - 1];
+                        }
+                    });
+                }
+            }
 
             ExtendedUnivariate per_relation(0);
             constexpr_for<0, std::tuple_size_v<std::decay_t<decltype(outer_element)>>, 1>(
@@ -974,6 +1154,15 @@ template <typename Flavor> class SumcheckProverRound {
                             extended * extended_random_polynomial * gate_separators.partial_evaluation_result;
                     }
                 });
+
+            if constexpr (can_scale_and_zero) {
+                if (scale_then_zero != nullptr) {
+                    constexpr_for<0, num_subrelations, 1>([&]<size_t subrelation_idx>() {
+                        auto& evaluations = std::get<subrelation_idx>(outer_element).evaluations;
+                        std::fill(evaluations.begin(), evaluations.end(), FF(0));
+                    });
+                }
+            }
 
             if constexpr (IsOffsetOnlyRelation<Relation>) {
                 return per_relation * offset_factor;
@@ -1042,9 +1231,11 @@ template <typename Flavor> class SumcheckProverRound {
     void accumulate_relation_univariates_public(SumcheckTupleOfTuplesOfUnivariates& univariate_accumulators,
                                                 const auto& extended_edges,
                                                 const bb::RelationParameters<FF>& relation_parameters,
-                                                const FF& scaling_factor)
+                                                const FF& scaling_factor,
+                                                const SubrelationBatching* subrelation_batching = nullptr)
     {
-        accumulate_relation_univariates(univariate_accumulators, extended_edges, relation_parameters, scaling_factor);
+        accumulate_relation_univariates(
+            univariate_accumulators, extended_edges, relation_parameters, scaling_factor, subrelation_batching);
     }
 
   private:
@@ -1079,27 +1270,43 @@ template <typename Flavor> class SumcheckProverRound {
     void accumulate_relation_univariates(Accumulators& univariate_accumulators,
                                          const Edges& extended_edges,
                                          const bb::RelationParameters<Element>& relation_parameters,
-                                         const Element& scaling_factor)
+                                         const Element& scaling_factor,
+                                         const SubrelationBatching* subrelation_batching = nullptr)
     {
         // `RelationTuple` is `Relations` or `Flavor::Relations_<Element>` -- the same relation set over
         // different fields, so its size is always NUM_RELATIONS.
         static_assert(std::tuple_size_v<RelationTuple> == NUM_RELATIONS);
         constexpr_for<0, NUM_RELATIONS, 1>([&]<size_t relation_idx>() {
             using Relation = std::tuple_element_t<relation_idx, RelationTuple>;
-            // Check if the relation is skippable to speed up accumulation
-            if constexpr (!isSkippable<Relation, decltype(extended_edges)>) {
-                // If not, accumulate normally
+            auto accumulate_relation = [&]() {
+                // Subrelation batching is wired for the scalar element only; `RelationTuple` is then `Relations`.
+                if constexpr (HasProverSubrelationBatching<Relation> && std::same_as<Element, FF>) {
+                    if (subrelation_batching != nullptr) {
+                        const auto& constants = std::get<relation_idx>(*subrelation_batching);
+                        if (constants.has_value()) {
+                            Relation::accumulate_with_subrelation_batching(
+                                std::get<relation_idx>(univariate_accumulators),
+                                extended_edges,
+                                relation_parameters,
+                                scaling_factor,
+                                *constants);
+                            return;
+                        }
+                    }
+                }
                 Relation::accumulate(std::get<relation_idx>(univariate_accumulators),
                                      extended_edges,
                                      relation_parameters,
                                      scaling_factor);
+            };
+            // Check if the relation is skippable to speed up accumulation
+            if constexpr (!isSkippable<Relation, decltype(extended_edges)>) {
+                // If not, accumulate normally
+                accumulate_relation();
             } else {
                 // If so, only compute the contribution if the relation is active
                 if (!Relation::skip(extended_edges)) {
-                    Relation::accumulate(std::get<relation_idx>(univariate_accumulators),
-                                         extended_edges,
-                                         relation_parameters,
-                                         scaling_factor);
+                    accumulate_relation();
                 }
             }
         });
