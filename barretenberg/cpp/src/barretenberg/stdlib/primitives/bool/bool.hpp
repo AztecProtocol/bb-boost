@@ -180,6 +180,7 @@ template <typename Builder> class bool_t {
 
     template <typename, typename> friend class bigfield;
     template <typename> friend class field_t;
+    template <typename> friend struct BuilderBindingWalk;
 };
 
 template <typename T> inline std::ostream& operator<<(std::ostream& os, bool_t<T> const& v)

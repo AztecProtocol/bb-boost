@@ -254,6 +254,25 @@ template <class base_uint> std::pair<uintx<base_uint>, uintx<base_uint>> uintx<b
 
     if (b == uintx(BN254FQMODULUS256)) {
         if constexpr (base_uint::length() == 512) {
+#ifndef __wasm__
+            // For x < 2^508, floor(2^508 / p) fits in 256 bits. Two 256-bit
+            // products suffice for the quotient estimate; its error is at most one.
+            if (hi == base_uint(0) && (lo.hi >> 252) == uint256_t(0)) {
+                static const uint256_t reciprocal =
+                    (uintx(1) << 508).divmod_base(uintx(BN254FQMODULUS256)).first.lo.lo;
+                const auto lower = lo.lo.mul_extended(reciprocal);
+                const auto upper = lo.hi.mul_extended(reciprocal);
+                const base_uint middle = base_uint(upper.first, upper.second) + base_uint(lower.second);
+                uint256_t quotient = (middle >> 252).lo;
+                const auto product = quotient.mul_extended(BN254FQMODULUS256);
+                base_uint remainder = lo - base_uint(product.first, product.second);
+                if (remainder >= base_uint(BN254FQMODULUS256)) {
+                    quotient += 1;
+                    remainder -= base_uint(BN254FQMODULUS256);
+                }
+                return { uintx(base_uint(quotient)), uintx(remainder) };
+            }
+#endif
             // For x < S = 2^576, mu = floor(S / p) gives an underestimate
             // q = floor(x * mu / S) of x / p by at most one. Keep the full-width
             // Barrett path below for larger operands; no caller bounds are assumed.

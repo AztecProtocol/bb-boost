@@ -59,6 +59,20 @@ template <typename Builder, typename T> class bigfield {
             os << "{ " << a.element << " <= " << a.maximum_value << " }";
             return os;
         }
+        /**
+         * @brief Construct a constant limb from its integer value, which must be below both the native modulus and
+         * DEFAULT_MAXIMUM_LIMB.
+         * @details Equal to Limb(field_t<Builder>(ctx, bb::fr(value))), whose maximum value is the element converted
+         * back out of Montgomery form, i.e. `value` itself.
+         */
+        static Limb from_constant(Builder* ctx, const uint256_t& value)
+        {
+            BB_ASSERT_DEBUG(value <= DEFAULT_MAXIMUM_LIMB);
+            Limb limb;
+            limb.element = field_t<Builder>(ctx, bb::fr(value));
+            limb.maximum_value = value;
+            return limb;
+        }
         Limb(const Limb& other) = default;
         Limb(Limb&& other) noexcept = default;
         Limb& operator=(const Limb& other) = default;
@@ -570,11 +584,24 @@ template <typename Builder, typename T> class bigfield {
                              bool enable_divisor_nz_check = true);
 
     static bigfield sum(const std::vector<bigfield>& terms);
+    // Caller-owned native witness-evaluation cache. It stores no circuit values
+    // and accepts a hit only for the same reduced denominator.
+    class NativeDivisionCache {
+        friend class bigfield;
+        uint256_t denominator_{ 0 };
+        native inverse_;
+        bool valid_ = false;
+    };
+
     static bigfield internal_div(const std::vector<bigfield>& numerators,
                                  const bigfield& denominator,
-                                 bool check_for_zero);
+                                 bool check_for_zero,
+                                 NativeDivisionCache* cache = nullptr);
 
     static bigfield div_without_denominator_check(const std::vector<bigfield>& numerators, const bigfield& denominator);
+    static bigfield div_without_denominator_check(const std::vector<bigfield>& numerators,
+                                                  const bigfield& denominator,
+                                                  NativeDivisionCache& cache);
     bigfield div_without_denominator_check(const bigfield& denominator);
     static bigfield div_check_denominator_nonzero(const std::vector<bigfield>& numerators, const bigfield& denominator);
 
@@ -672,19 +699,22 @@ template <typename Builder, typename T> class bigfield {
      */
     static bigfield unreduced_zero()
     {
-        // The multiple of the modulus is a fixed value, so it is computed once
-        static const uint512_t multiple_of_modulus =
-            ((get_maximum_unreduced_value() / modulus_u512) + 1) * modulus_u512;
-        static const uint256_t prime_basis_value = (multiple_of_modulus % uint512_t(field_t<Builder>::modulus)).lo;
-        const auto msb = multiple_of_modulus.get_msb();
+        // A context-free constant fixed by the moduli, so it is built once and copied
+        static const bigfield unreduced_zero_constant = [] {
+            const uint512_t multiple_of_modulus = ((get_maximum_unreduced_value() / modulus_u512) + 1) * modulus_u512;
+            const uint256_t prime_basis_value = (multiple_of_modulus % uint512_t(field_t<Builder>::modulus)).lo;
+            const auto msb = multiple_of_modulus.get_msb();
 
-        bigfield result(nullptr, uint256_t(0));
-        result.binary_basis_limbs[0] = Limb(bb::fr(multiple_of_modulus.slice(0, NUM_LIMB_BITS).lo));
-        result.binary_basis_limbs[1] = Limb(bb::fr(multiple_of_modulus.slice(NUM_LIMB_BITS, 2 * NUM_LIMB_BITS).lo));
-        result.binary_basis_limbs[2] = Limb(bb::fr(multiple_of_modulus.slice(2 * NUM_LIMB_BITS, 3 * NUM_LIMB_BITS).lo));
-        result.binary_basis_limbs[3] = Limb(bb::fr(multiple_of_modulus.slice(3 * NUM_LIMB_BITS, msb + 1).lo));
-        result.prime_basis_limb = field_t<Builder>(prime_basis_value);
-        return result;
+            bigfield result(nullptr, uint256_t(0));
+            result.binary_basis_limbs[0] = Limb(bb::fr(multiple_of_modulus.slice(0, NUM_LIMB_BITS).lo));
+            result.binary_basis_limbs[1] = Limb(bb::fr(multiple_of_modulus.slice(NUM_LIMB_BITS, 2 * NUM_LIMB_BITS).lo));
+            result.binary_basis_limbs[2] =
+                Limb(bb::fr(multiple_of_modulus.slice(2 * NUM_LIMB_BITS, 3 * NUM_LIMB_BITS).lo));
+            result.binary_basis_limbs[3] = Limb(bb::fr(multiple_of_modulus.slice(3 * NUM_LIMB_BITS, msb + 1).lo));
+            result.prime_basis_limb = field_t<Builder>(prime_basis_value);
+            return result;
+        }();
+        return unreduced_zero_constant;
     }
 
     /**
@@ -1035,6 +1065,7 @@ template <typename Builder, typename T> class bigfield {
 
     // For testing purposes only
     friend class bigfield_test_access;
+    template <typename> friend struct BuilderBindingWalk;
 
   private:
     /**

@@ -6,14 +6,18 @@
 
 #pragma once
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/deferred_value.hpp"
 #include "barretenberg/honk/execution_trace/generated/ultra_execution_trace_generated.hpp"
 #include "barretenberg/stdlib_circuit_builders/plookup_tables/plookup_tables.hpp"
 #include "barretenberg/stdlib_circuit_builders/plookup_tables/types.hpp"
 
 #include "circuit_builder_base.hpp"
+#include "circuit_splice.hpp"
 #include "rom_ram_logic.hpp"
+#include <atomic>
 #include <deque>
 #include <optional>
+#include <span>
 #include <unordered_set>
 
 #include "barretenberg/serialize/msgpack.hpp"
@@ -201,8 +205,50 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         UltraCircuitBuilderData::cached_partial_non_native_field_multiplication;
 
   private:
+    // One registration body for arbitrary witnesses and exact native sub-limbs. The empty source tag
+    // lets the public entry point delegate without preparing field temporaries or native-value arguments.
+    struct RangeWitnessValue {};
+    template <typename ValueSource>
+    void register_small_range_constraint(uint32_t variable_index,
+                                         uint64_t target_range,
+                                         ValueSource value_source,
+                                         std::string_view msg);
+
+    // The range list of `target_range`, created if it does not exist yet.
+    RangeList& get_or_create_range_list(uint64_t target_range);
+
+    // register_small_range_constraint for a variable the caller has just created and not yet tagged or
+    // copy-constrained, with its value: such a variable is its own real variable and carries DEFAULT_TAG, so it joins
+    // the list without the tag checks. `list` caches the list of the caller's previous registration.
+    void register_new_variable_range_constraint(
+        uint32_t variable_index, uint64_t target_range, uint64_t value, RangeList*& list, std::string_view msg);
+
+    // create_lookup_gate with its q_3 selector, FF(table.table_index), supplied by the caller.
+    void append_lookup_gate(uint32_t key_idx,
+                            uint32_t val1_idx,
+                            uint32_t val2_idx,
+                            plookup::BasicTable& table,
+                            const plookup::BasicTable::LookupEntry& entry,
+                            const FF& table_index_selector,
+                            const FF& column_1_step_size,
+                            const FF& column_2_step_size,
+                            const FF& column_3_step_size)
+        requires(ExecutionTrace::has_gate_kind(GateKind::Lookup));
+
     // The set of lookup tables used by the circuit, plus the gate data for the lookups from each table
     std::deque<plookup::BasicTable> lookup_tables;
+
+    // Set only on a builder constructed with SpliceRecording.
+    std::optional<SpliceLog> splice_log_;
+
+    // The log of a recording builder, once its cancellation, if any, has let the recording go on.
+    SpliceLog& recording_log()
+    {
+        if (splice_log_->cancellation != nullptr) {
+            splice_log_->cancellation->check();
+        }
+        return *splice_log_;
+    }
 
   public:
     // Storage for wires and selectors for all gate types
@@ -226,6 +272,22 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     std::vector<cached_partial_non_native_field_multiplication> cached_partial_non_native_field_multiplications;
 
     std::vector<fr> ipa_proof;
+    // An IPA proof still being computed, held instead of ipa_proof until resolve_ipa_proof().
+    DeferredValue<std::vector<fr>> pending_ipa_proof;
+
+    /**
+     * @brief Hand over an IPA proof that is still being computed; it replaces any proof set before.
+     */
+    void set_pending_ipa_proof(DeferredValue<std::vector<fr>> proof)
+    {
+        ipa_proof.clear();
+        pending_ipa_proof = std::move(proof);
+    }
+
+    /**
+     * @brief The IPA proof, after waiting for a pending one. Rethrows what computing a pending proof threw.
+     */
+    const std::vector<fr>& resolve_ipa_proof() { return resolve_into(ipa_proof, pending_ipa_proof); }
 
     void populate_public_inputs_block();
 
@@ -274,10 +336,17 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         // decompositions, gadget internals — typically 4-40x); reserve generously so the
         // per-variable bookkeeping vectors do not repeatedly reallocate during construction.
         // 4x keeps the transient over-allocation for large-witness circuits within a few MB.
+        // This witness-count hint is the capacity wherever address space is not reserved.
         constexpr size_t VARIABLES_PER_ACIR_WITNESS_HINT = 4;
         constexpr size_t MIN_VARIABLES_RESERVE = 1 << 16;
-        this->reserve_variables(
-            std::max(witness_values.size() * VARIABLES_PER_ACIR_WITNESS_HINT, MIN_VARIABLES_RESERVE));
+        const size_t hint = std::max(witness_values.size() * VARIABLES_PER_ACIR_WITNESS_HINT, MIN_VARIABLES_RESERVE);
+        // Mega circuits are built many in turn by one process. Hint-sized buffers may reuse warm heap blocks, where a
+        // reservation is a fresh mapping each time and its capacity qualifies all five arrays for the page release.
+        if constexpr (ExecutionTrace::IS_MEGA_ARITHMETIZATION) {
+            this->reserve_variables(hint);
+        } else {
+            this->reserve_variables_address_space(hint);
+        }
         for (const auto value : witness_values) {
             this->add_variable(value);
         }
@@ -292,13 +361,62 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
                                DEFAULT_TAG); // tau fixes the `DEFAULT_TAG`, as we assume that `DEFAULT_TAG` is not
                                              // involved in any non-trivial multiset-equality checks.
     };
+
+    /**
+     * @brief A builder that records what splice must replay of the circuit then built on it.
+     * @details Its variables start with one per value of `seed_values`, in order, followed by the zero constant; the
+     * circuit is built on these seeds and later appended to another builder by that builder's splice. Each recording
+     * first calls `recording.cancellation->check()` when it is set.
+     */
+    UltraCircuitBuilder_(SpliceRecording recording, std::span<const FF> seed_values)
+        requires(!ExecutionTrace::IS_MEGA_ARITHMETIZATION)
+        : CircuitBuilderBase<FF>(false)
+    {
+        this->reserve_variables_address_space(seed_values.size() + 1);
+        for (const FF& value : seed_values) {
+            this->add_variable(value);
+        }
+        this->set_zero_idx(put_constant_variable(FF::zero()));
+        this->set_tau_at_index(DEFAULT_TAG, DEFAULT_TAG);
+        // splice treats every row after the zero constant's fixing row as recorded.
+        BB_ASSERT_EQ(blocks.get_total_content_size(), blocks.arithmetic.size());
+        SpliceLog log;
+        log.num_seeds = static_cast<uint32_t>(seed_values.size());
+        log.num_prefix_variables = static_cast<uint32_t>(this->get_num_variables());
+        log.num_prefix_arithmetic_rows = blocks.arithmetic.size();
+        log.num_prefix_gates = this->num_gates();
+        log.num_prefix_used_witnesses = used_witnesses.size();
+        log.cancellation = recording.cancellation;
+        splice_log_.emplace(std::move(log));
+    }
+
     UltraCircuitBuilder_(const UltraCircuitBuilder_& other) = default;
     UltraCircuitBuilder_(UltraCircuitBuilder_&& other) = default;
     UltraCircuitBuilder_& operator=(const UltraCircuitBuilder_& other) = default;
     UltraCircuitBuilder_& operator=(UltraCircuitBuilder_&& other) = default;
-    ~UltraCircuitBuilder_() override = default;
+    ~UltraCircuitBuilder_() override { release_storage_pages(); }
 
     void finalize_circuit();
+
+    bool is_recording() const { return splice_log_.has_value(); }
+
+    /**
+     * @brief Append the circuit built on `source` after its seeds, leaving this builder exactly as building that
+     * circuit here, on the variables `seed_indices`, would have left it.
+     * @details `source` was constructed with SpliceRecording on the values of the variables `seed_indices` of this
+     * builder, in that order, and the circuit was then built on it. Every precondition is checked before anything
+     * changes: neither builder has failed, is finalized or is in write-VK mode, and this one is not recording; each
+     * seed still has its source value; no two inputs share a copy cycle and none carries a tag, the inputs being the
+     * seeds and the zero and cached constants that a source tag reaches; the source added no public input, elliptic
+     * row, IPA proof or variable name, registered no lookup table with register_basic_lookup_table, did not finalize
+     * its public inputs, and its tag permutation holds only DEFAULT_TAG's entry and its range lists'. When one fails
+     * this builder is unchanged. Each source table becomes the table get_table gives for its id here, and its read
+     * records follow that table's.
+     * @return The refusal, or, when spliced, the index here of every source variable and the shift of the source's
+     * pairing-point tags, with which values built on `source` are rebound to this builder.
+     */
+    SpliceResult splice(const UltraCircuitBuilder_& source, std::span<const uint32_t> seed_indices)
+        requires(!ExecutionTrace::IS_MEGA_ARITHMETIZATION);
 
     void create_add_gate(const add_triple_<FF>& in);
     void create_big_mul_add_gate(const mul_quad_<FF>& in, const bool use_next_gate_w_4 = false);
@@ -422,6 +540,14 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         return std::max(get_tables_size(), num_filled_gates);
     }
 
+    void assert_equal(const uint32_t a_idx, const uint32_t b_idx, std::string const& msg = "assert_equal") override
+    {
+        if (splice_log_.has_value()) [[unlikely]] {
+            recording_log().events.push_back({ SpliceLog::Event::Kind::AssertEqual, a_idx, b_idx });
+        }
+        CircuitBuilderBase<FF>::assert_equal(a_idx, b_idx, msg);
+    }
+
     void assert_equal_constant(const uint32_t a_idx, const FF& b, std::string const& msg = "assert equal constant")
     {
         if (this->get_variable(a_idx) != b && !this->failed()) {
@@ -539,6 +665,9 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
         }
 
         BB_ASSERT_EQ(this->real_variable_tags[this->real_variable_index[variable_index]], DEFAULT_TAG);
+        if (splice_log_.has_value()) [[unlikely]] {
+            recording_log().events.push_back({ SpliceLog::Event::Kind::Tag, variable_index, tag });
+        }
         this->real_variable_tags[this->real_variable_index[variable_index]] = tag;
     }
     /**
@@ -581,6 +710,31 @@ class UltraCircuitBuilder_ : public CircuitBuilderBase<typename ExecutionTrace_:
     void process_range_list(RangeList& list);
     void process_range_lists();
 
+    /**
+     * @brief Hand the pages of the builder's storage back to the OS from one team of threads; the destructor calls it.
+     * @details The builder's contents are lost: call it only right before destroying the builder. A builder that does
+     * not record releases its gate tiles and variable arrays under the default floors of release_pages_in_parallel. A
+     * recording builder releases every block of at least RECORDING_RELEASE_MIN_BLOCK_BYTES that it owns with trivially
+     * destructible elements (gate tiles, variable arrays, range lists, ROM/RAM transcripts and records, cached
+     * multiplications, lookup tables, tooling lists and its log), whatever their total.
+     */
+    void release_storage_pages() noexcept;
+
+    // A recording builder is filled on another thread, so the allocator keeps even its smaller blocks in that thread's
+    // malloc arena, where free() leaves their pages resident and unusable by the thread that frees them.
+    static constexpr size_t RECORDING_RELEASE_MIN_BLOCK_BYTES = size_t{ 64 } << 10;
+
+  private:
+    void release_recording_storage_pages() noexcept;
+
+    // One bit per variable; every bit is clear between range lists.
+    using VariableBitmap = std::vector<std::atomic<uint64_t>>;
+    // process_range_list with a bitmap that is kept, all clear, for the next list.
+    void process_range_list(RangeList& list, VariableBitmap& real_variables);
+    // One delta-range row per `NUM_WIRES` consecutive entries of `variable_indices`.
+    void append_delta_range_rows(const std::vector<uint32_t>& variable_indices);
+
+  public:
     /**
      * Custom Gate Selectors
      **/

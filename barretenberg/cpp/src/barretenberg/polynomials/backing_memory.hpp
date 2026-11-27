@@ -6,12 +6,16 @@
 
 #pragma once
 
+#include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include "unistd.h"
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <vector>
 #if !defined(__wasm__) && !defined(_WIN32)
@@ -145,7 +149,87 @@ template <typename Fr> struct BackingMemory {
 
     ~BackingMemory() = default;
 
+    /**
+     * @brief Before the listed handles are destroyed together, release the pages of every in-memory block that no
+     * other handle owns, with one team of threads for all of them (see release_pages_in_parallel).
+     * @details A block qualifies when its owner count equals the number of distinct listed handles to it, so memory
+     * shared with an object outside the list is left alone, however often a handle is listed. File-backed memory and
+     * blocks not allocated by allocate() are never released. The caller guarantees that no other thread can acquire a
+     * new reference to a listed block during the call; in particular, no weak_ptr to one may exist. The released
+     * blocks' contents are lost, so this must run immediately before the handles are destroyed.
+     */
+    template <size_t N>
+    static void release_pages_of_sole_owned(const std::array<const BackingMemory*, N>& handles) noexcept
+    {
+        // A handle holds one reference however often it is listed.
+        std::array<const BackingMemory*, N> unique = handles;
+        std::sort(unique.begin(), unique.end(), std::less<>{});
+        const auto num_unique = static_cast<size_t>(std::unique(unique.begin(), unique.end()) - unique.begin());
+        // A deleter lives in its block's shared control block, so equal deleters mean the same block.
+        std::array<AlignedDeleter*, N> deleters{};
+        for (size_t i = 0; i < num_unique; ++i) {
+            deleters[i] = unique[i]->aligned_deleter();
+        }
+        bb::PageBlockList<N> blocks;
+        std::array<AlignedDeleter*, N> added{};
+        size_t num_added = 0;
+        for (size_t i = 0; i < num_unique; ++i) {
+            AlignedDeleter* deleter = deleters[i];
+            if (deleter == nullptr || deleter->pages_released.load(std::memory_order_relaxed) ||
+                std::find(deleters.data(), deleters.data() + i, deleter) != deleters.data() + i) {
+                continue;
+            }
+            const auto num_listed = std::count(deleters.data() + i, deleters.data() + num_unique, deleter);
+            if (num_listed == unique[i]->aligned_memory.use_count() &&
+                blocks.add(deleter->allocation, deleter->bytes)) {
+                added[num_added++] = deleter;
+                // Dropping a copy acquires the count, so earlier owners' accesses happen before the release.
+                [[maybe_unused]] const std::shared_ptr<Fr[]> copy = unique[i]->aligned_memory;
+            }
+        }
+        if (blocks.release()) {
+            for (size_t i = 0; i < num_added; ++i) {
+                added[i]->pages_released.store(true, std::memory_order_relaxed);
+            }
+        }
+    }
+
   private:
+    // Keeps the block's allocation and size, so that a batch can release the block's pages before its last handle is
+    // destroyed. An aliasing handle shares this deleter but may point inside the allocation.
+    struct AlignedDeleter {
+        Fr* allocation = nullptr;
+        size_t bytes = 0;
+        // Relaxed suffices: it only lets the deleter skip a release a batch already made, and orders nothing else.
+        std::atomic<bool> pages_released{ false };
+
+        AlignedDeleter(Fr* allocated, size_t allocated_bytes) noexcept
+            : allocation(allocated)
+            , bytes(allocated_bytes)
+        {}
+        // shared_ptr needs a copyable deleter, and std::atomic is not copyable.
+        AlignedDeleter(const AlignedDeleter& other) noexcept
+            : allocation(other.allocation)
+            , bytes(other.bytes)
+            , pages_released(other.pages_released.load(std::memory_order_relaxed))
+        {}
+
+        void operator()(Fr* p) const
+        {
+            if (!pages_released.load(std::memory_order_relaxed)) {
+                // Inside a PolynomialMemoryRelease scope (the AVM prover's), the scope releases the pages of every
+                // block freed in it with one team of threads, then frees them; otherwise this block's pages go now.
+                if (bb::PolynomialMemoryRelease::defer_free(p, bytes, [](void* q) { delete[] static_cast<Fr*>(q); })) {
+                    return;
+                }
+                bb::release_pages_in_parallel(p, bytes);
+            }
+            delete[] p;
+        }
+    };
+
+    AlignedDeleter* aligned_deleter() const { return std::get_deleter<AlignedDeleter>(aligned_memory); }
+
     // Use new Fr[] instead of std::make_shared<Fr[]>(n) to avoid serial
     // value-initialization (zeroing). Polynomial's constructor handles
     // zeroing in parallel where needed.
@@ -157,11 +241,7 @@ template <typename Fr> struct BackingMemory {
             return;
         }
         Fr* ptr = new Fr[size];
-        memory.aligned_memory = std::shared_ptr<Fr[]>(ptr, [bytes = size * sizeof(Fr)](Fr* p) {
-            if (!bb::PolynomialMemoryRelease::defer_free(p, bytes, [](void* q) { delete[] static_cast<Fr*>(q); })) {
-                delete[] p;
-            }
-        });
+        memory.aligned_memory = std::shared_ptr<Fr[]>(ptr, AlignedDeleter{ ptr, size * sizeof(Fr) });
         memory.raw_data = ptr;
     }
 

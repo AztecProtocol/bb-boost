@@ -238,6 +238,11 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
     //   - max n <= Σn / pool_width (n is the work proxy): with largest-first ordering (below) the
     //     makespan is max(largest, Σn / pool_width), so a dominant member can't strand one worker.
     //   - pool_width >= CONCURRENT_MIN_POOL_WIDTH: fewer threads make the win too small to justify.
+    // A batch of a few large members also qualifies when each member's share of the pool, pool_width / members, is at
+    // least 8/3 threads and its 2^16-point chunks fill the pool. Spreading one member over that many threads costs
+    // CPU and leaves threads idle in its reductions, which single-threaded chunks avoid; with fewer threads per
+    // member there is no such cost to remove, and the chunked path's tail makes it a loss.
+    static constexpr size_t CONCURRENT_CHUNK_POINTS = size_t{ 1 } << 16;
 #ifdef __wasm__
     // wasm keeps large members on the sequential shared-arena dispatch: with single-threaded MSMs the
     // concurrent path's per-worker live arenas buy nothing over one reused arena.
@@ -268,9 +273,15 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
         }
         return true;
     };
-    const bool large_members_concurrent = pool_width >= CONCURRENT_MIN_POOL_WIDTH &&
-                                          large_members.size() > CONCURRENT_MIN_MEMBERS &&
-                                          max_large_n <= total_large_n / pool_width && scalar_spans_disjoint();
+    size_t min_chunks = 0;
+    for (size_t m : large_members) {
+        min_chunks += (n_input[m] + CONCURRENT_CHUNK_POINTS - 1) / CONCURRENT_CHUNK_POINTS;
+    }
+    const bool many_balanced_members =
+        large_members.size() > CONCURRENT_MIN_MEMBERS && max_large_n <= total_large_n / pool_width;
+    const bool few_wide_members = (3 * pool_width) >= (8 * large_members.size()) && min_chunks >= pool_width;
+    const bool large_members_concurrent = pool_width >= CONCURRENT_MIN_POOL_WIDTH && !large_members.empty() &&
+                                          (many_balanced_members || few_wide_members) && scalar_spans_disjoint();
 #endif
 
     // A few independent large native MSMs can instead share the CPU budget,
@@ -513,9 +524,7 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
     if (large_members_concurrent) {
         // Workers pull work off an atomic cursor and run it single-threaded (max_threads=1). This skips the
         // member's cross-thread reduction. It also keeps the member off the pool, so there is no nested
-        // parallel_for. The gate above guarantees at least pool_width members, so every worker starts busy. Each
-        // call self-allocates its arena (empty span), because a shared num_workers × max-member arena would
-        // exceed BATCH_MEM_BUDGET and cap num_workers below pool_width.
+        // parallel_for. The gate above guarantees at least pool_width chunks, so every worker starts busy.
         //
         // A member's cost tracks its non-zero scalars, not its span, so the span-based gate admits batches in
         // which a few dense members each take longer on one thread than the rest of the batch takes on all of
@@ -523,19 +532,49 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
         // many points: an MSM is a sum over its terms, so a member's result is the sum of its chunks' results.
         // Chunks run longest-first to bound the tail.
         BB_BENCH_NAME("MSM_fast::pippenger_round_parallel_batched/large_members_concurrent");
-        constexpr size_t CONCURRENT_CHUNK_POINTS = size_t{ 1 } << 16;
         struct Chunk {
             size_t member;
             size_t offset;
             size_t length;
         };
+        // Each member needs at least ceil(n / CONCURRENT_CHUNK_POINTS) parts. The total is then raised to a whole
+        // number of rounds of the pool, because a count just past a multiple of the pool width runs its last round
+        // on a few workers while the rest idle. Each extra part goes to the member whose parts are currently the
+        // largest, so parts stay as equal as the member boundaries allow. When the arena budget below fits fewer
+        // workers than the pool, the last round may be partial.
+        std::vector<size_t> parts(large_members.size());
+        size_t total_parts = 0;
+        for (size_t i = 0; i < large_members.size(); ++i) {
+            parts[i] = (n_input[large_members[i]] + CONCURRENT_CHUNK_POINTS - 1) / CONCURRENT_CHUNK_POINTS;
+            total_parts += parts[i];
+        }
+        const size_t whole_rounds = ((total_parts + pool_width - 1) / pool_width) * pool_width;
+        // Orders members by part size n / parts, compared exactly by cross-multiplication; ties go to the lower index.
+        const auto smaller_parts = [&](size_t a, size_t b) {
+            const size_t lhs = n_input[large_members[a]] * parts[b];
+            const size_t rhs = n_input[large_members[b]] * parts[a];
+            return lhs != rhs ? lhs < rhs : a > b;
+        };
+        std::priority_queue<size_t, std::vector<size_t>, decltype(smaller_parts)> largest_parts(smaller_parts);
+        for (size_t i = 0; i < large_members.size(); ++i) {
+            largest_parts.push(i);
+        }
+        for (size_t added = total_parts; added < whole_rounds; ++added) {
+            const size_t i = largest_parts.top();
+            if (n_input[large_members[i]] <= parts[i]) {
+                break;
+            }
+            largest_parts.pop();
+            ++parts[i];
+            largest_parts.push(i);
+        }
         std::vector<Chunk> chunks;
-        for (size_t m : large_members) {
+        for (size_t i = 0; i < large_members.size(); ++i) {
+            const size_t m = large_members[i];
             const size_t n = n_input[m];
-            const size_t parts = (n + CONCURRENT_CHUNK_POINTS - 1) / CONCURRENT_CHUNK_POINTS;
-            for (size_t k = 0; k < parts; ++k) {
-                const size_t begin = (n * k) / parts;
-                chunks.push_back({ m, begin, ((n * (k + 1)) / parts) - begin });
+            for (size_t k = 0; k < parts[i]; ++k) {
+                const size_t begin = (n * k) / parts[i];
+                chunks.push_back({ m, begin, ((n * (k + 1)) / parts[i]) - begin });
             }
         }
         std::sort(chunks.begin(), chunks.end(), [](const Chunk& a, const Chunk& b) {
@@ -544,10 +583,37 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
             }
             return a.member != b.member ? a.member < b.member : a.offset < b.offset;
         });
+        // Each worker reuses one slice, sized for the largest chunk, of a single block allocated here, rather than
+        // allocating an arena per chunk, and releases the slice's pages when it runs out of chunks. CHUNK_ARENA_BUDGET
+        // bounds the block, so a pool needing more slices than fit runs fewer workers: a slice for a 2^16-point chunk
+        // is about 32 MiB, or 33 MiB with a dedup hint, so 61 to 64 workers fit.
+        constexpr size_t CHUNK_ARENA_BUDGET = size_t{ 2 } << 30;
+        size_t chunk_arena_bytes = 0;
+        for (const Chunk& chunk : chunks) {
+            const size_t n = n_input[chunk.member];
+            const size_t info =
+                info_for(chunk.member) >= 2 ? std::max<size_t>(2, (info_for(chunk.member) * chunk.length) / n)
+                                            : info_for(chunk.member);
+            const bool ext_glv = !external_glv_for(chunk.member, n).empty();
+            chunk_arena_bytes = std::max(
+                chunk_arena_bytes, compute_arena_bytes_for_msm<Curve>(chunk.length, ext_glv, info, /*max_threads=*/1));
+        }
+        const size_t workers_by_budget = chunk_arena_bytes > 0
+                                             ? std::max<size_t>(1, CHUNK_ARENA_BUDGET / chunk_arena_bytes)
+                                             : std::numeric_limits<size_t>::max();
         std::vector<typename Curve::Element> partials(chunks.size());
-        const size_t num_workers = std::min(pool_width, chunks.size());
+        const size_t num_workers = std::min({ pool_width, chunks.size(), workers_by_budget });
+        std::unique_ptr<std::byte[]> chunk_arena_owner; // NOLINT(cppcoreguidelines-avoid-c-arrays)
+        if (chunk_arena_bytes > 0) {
+            chunk_arena_owner = std::make_unique_for_overwrite<std::byte[]>(
+                num_workers * chunk_arena_bytes); // NOLINT(cppcoreguidelines-avoid-c-arrays)
+        }
         std::atomic<size_t> next_chunk{ 0 };
-        bb::parallel_for(num_workers, [&](size_t) {
+        bb::parallel_for(num_workers, [&](size_t tid) {
+            std::span<std::byte> worker_arena;
+            if (chunk_arena_bytes > 0) {
+                worker_arena = { chunk_arena_owner.get() + (tid * chunk_arena_bytes), chunk_arena_bytes };
+            }
             while (true) {
                 const size_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
                 if (c >= chunks.size()) {
@@ -564,8 +630,9 @@ void pippenger_round_parallel_batched(std::span<std::span<typename Curve::Scalar
                 PolynomialSpan<const ScalarField> sp(
                     0, std::span<const ScalarField>(scalar_arrays[m].data() + offset, length));
                 partials[c] = pippenger_round_parallel<Curve>(
-                    sp, point_arrays[m].subspan(offset), info, glv, {}, /*max_threads=*/1);
+                    sp, point_arrays[m].subspan(offset), info, glv, worker_arena, /*max_threads=*/1);
             }
+            round_parallel_detail::release_arena_slice(worker_arena);
         });
         // out_results starts at infinity; summing in chunk order keeps the result deterministic.
         for (size_t c = 0; c < chunks.size(); ++c) {

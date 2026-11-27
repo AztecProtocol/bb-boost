@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace bb {
 
@@ -143,6 +144,28 @@ template <typename Fr> std::pair<size_t, size_t> twice_folded_backed_range(const
     return { src.start_index() / 4, (src.end_index() / 4) + (src.end_index() % 4 != 0 ? 1 : 0) };
 }
 
+/** Outputs per work item of `fold_stride4_backed_all`: 2 MiB of bn254 source reads, about a millisecond of work. */
+inline constexpr size_t FOLD_STRIDE4_OUTPUTS_PER_CHUNK = size_t{ 1 } << 14;
+
+/**
+ * @brief The outputs k in [k_begin, k_end) of `fold_stride4_backed`, which must lie inside
+ * `twice_folded_backed_range(src)`; leaves `dst`'s end index alone, so disjoint ranges may run concurrently.
+ */
+template <typename Fr>
+void fold_stride4_backed_range(const Polynomial<Fr>& src,
+                               Polynomial<Fr>& dst,
+                               size_t k_begin,
+                               size_t k_end,
+                               const Fr& first_challenge,
+                               const Fr& second_challenge)
+{
+    for (size_t k = k_begin; k < k_end; ++k) {
+        const Fr even = fold_pair(src[4 * k], src[(4 * k) + 1], first_challenge);
+        const Fr odd = fold_pair(src[(4 * k) + 2], src[(4 * k) + 3], first_challenge);
+        dst[ScalarIndex{ k }] = fold_pair(even, odd, second_challenge);
+    }
+}
+
 /**
  * @brief Fold `src` at `first_challenge` and the result at `second_challenge` in one pass, without materializing the
  * intermediate fold: `dst[k] = fold(fold(src[4k], src[4k+1]), fold(src[4k+2], src[4k+3]))` for k in
@@ -160,12 +183,49 @@ void fold_stride4_backed(const Polynomial<Fr>& src,
     if (begin == end) {
         return;
     }
-    for (size_t k = begin; k < end; ++k) {
-        const Fr even = fold_pair(src[4 * k], src[(4 * k) + 1], first_challenge);
-        const Fr odd = fold_pair(src[(4 * k) + 2], src[(4 * k) + 3], first_challenge);
-        dst[ScalarIndex{ k }] = fold_pair(even, odd, second_challenge);
-    }
+    fold_stride4_backed_range(src, dst, begin, end, first_challenge, second_challenge);
     dst.shrink_end_index(end);
+}
+
+/**
+ * @brief `fold_stride4_backed(src[j], dst[j], ...)` for every j, scheduled as chunks of at most `outputs_per_chunk`
+ * outputs so that a few long polynomials do not leave most threads idle. Outputs and end indices are exactly those of
+ * the per-polynomial calls, whatever the thread count.
+ * @details `src` and `dst` are indexable ranges of polynomials of equal size (e.g. `get_all()` views); the `dst`
+ * polynomials must be distinct from each other and from every source.
+ */
+template <typename Fr, typename Sources, typename Dests>
+void fold_stride4_backed_all(const Sources& src,
+                             Dests&& dst,
+                             const Fr& first_challenge,
+                             const Fr& second_challenge,
+                             size_t outputs_per_chunk = FOLD_STRIDE4_OUTPUTS_PER_CHUNK)
+{
+    BB_ASSERT_EQ(src.size(), dst.size());
+    BB_ASSERT_GT(outputs_per_chunk, 0UL);
+    struct Chunk {
+        size_t poly;
+        size_t begin;
+        size_t end;
+    };
+    std::vector<Chunk> chunks;
+    for (size_t j = 0; j < src.size(); ++j) {
+        const auto [begin, end] = twice_folded_backed_range(src[j]);
+        for (size_t k = begin; k < end; k += outputs_per_chunk) {
+            chunks.push_back({ j, k, std::min(end, k + outputs_per_chunk) });
+        }
+    }
+    parallel_for(chunks.size(), [&](size_t c) {
+        const Chunk& chunk = chunks[c];
+        fold_stride4_backed_range(
+            src[chunk.poly], dst[chunk.poly], chunk.begin, chunk.end, first_challenge, second_challenge);
+    });
+    for (size_t j = 0; j < src.size(); ++j) {
+        const auto [begin, end] = twice_folded_backed_range(src[j]);
+        if (begin != end) {
+            dst[j].shrink_end_index(end);
+        }
+    }
 }
 
 /**

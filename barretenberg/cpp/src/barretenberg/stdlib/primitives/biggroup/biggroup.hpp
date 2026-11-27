@@ -468,6 +468,7 @@ template <class Builder_, class Fq, class Fr, class NativeGroup> class element {
 
     // For testing purposes only
     friend class element_test_accessor;
+    template <typename> friend struct ::bb::stdlib::BuilderBindingWalk;
 
   private:
     // Private constructor with explicit infinity flag control.

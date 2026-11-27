@@ -1,4 +1,5 @@
 #include "barretenberg/bbapi/bbapi_ultra_honk.hpp"
+#include "barretenberg/bbapi/bbapi_prove_instance.hpp"
 #include "barretenberg/bbapi/bbapi_shared.hpp"
 #include "barretenberg/common/serialize.hpp"
 #include "barretenberg/dsl/acir_format/acir_to_constraint_buf.hpp"
@@ -35,25 +36,28 @@ Circuit _compute_circuit(std::vector<uint8_t>&& bytecode, std::vector<uint8_t>&&
 
 template <typename Flavor, typename IO>
 std::shared_ptr<ProverInstance_<Flavor>> _compute_prover_instance(std::vector<uint8_t>&& bytecode,
-                                                                  std::vector<uint8_t>&& witness)
+                                                                  std::vector<uint8_t>&& witness,
+                                                                  const bool for_proof = false)
 {
     // Measure function time and debug print
     auto initial_time = std::chrono::high_resolution_clock::now();
     typename Flavor::CircuitBuilder builder = _compute_circuit<Flavor, IO>(std::move(bytecode), std::move(witness));
-    auto prover_instance = std::make_shared<ProverInstance_<Flavor>>(builder);
+    // The VK path keeps the circuit as it was; a proof's instance frees it while copying it.
+    auto prover_instance =
+        for_proof ? circuit_prove_instance<Flavor>(builder) : std::make_shared<ProverInstance_<Flavor>>(builder);
     auto final_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(final_time - initial_time);
     info("CircuitProve: Proving key computed in ", duration.count(), " ms");
 
     // Validate consistency between IO type and IPA proof presence
     // IO::HasIPA indicates the circuit type requires IPA accumulation (rollup circuits)
-    // prover_instance->ipa_proof contains the actual IPA proof data from the circuit
+    // has_ipa_proof() also counts a proof still being computed, without waiting for it
     if constexpr (IO::HasIPA) {
-        BB_ASSERT(!prover_instance->ipa_proof.empty(),
+        BB_ASSERT(prover_instance->has_ipa_proof(),
                   "RollupIO circuit expected IPA proof but none was provided. "
                   "Ensure the circuit includes IPA accumulation data.");
     } else {
-        BB_ASSERT(prover_instance->ipa_proof.empty(),
+        BB_ASSERT(!prover_instance->has_ipa_proof(),
                   "Non-rollup circuit should not have IPA proof. "
                   "Use ipa_accumulation=true in settings for rollup circuits.");
     }
@@ -110,7 +114,8 @@ CircuitProve::Response _prove(std::vector<uint8_t>&& bytecode,
     using Proof = typename Flavor::Transcript::Proof;
     using VerificationKey = typename Flavor::VerificationKey;
 
-    auto prover_instance = _compute_prover_instance<Flavor, IO>(std::move(bytecode), std::move(witness));
+    auto prover_instance =
+        _compute_prover_instance<Flavor, IO>(std::move(bytecode), std::move(witness), /*for_proof=*/true);
 
     // Create or deserialize VK
     std::shared_ptr<VerificationKey> vk;
@@ -169,6 +174,8 @@ CircuitComputeVk::Response CircuitComputeVk::execute(BB_UNUSED const BBApiReques
     return dispatch_by_settings(settings, [&]<typename Flavor, typename IO>() {
         auto prover_instance = _compute_prover_instance<Flavor, IO>(std::move(circuit.bytecode), {});
         auto vk = std::make_shared<typename Flavor::VerificationKey>(prover_instance->get_precomputed());
+        // No proof is exported here, so wait for a pending IPA proof now: its failure must fail the request.
+        prover_instance->resolve_ipa_proof();
         return CircuitComputeVk::Response{ .bytes = to_buffer(*vk),
                                            .fields = vk_to_uint256_fields(*vk),
                                            .hash = to_buffer(vk->hash()) };
@@ -190,6 +197,8 @@ CircuitStats::Response _stats(std::vector<uint8_t>&& bytecode, bool include_gate
     acir_format::AcirProgram program{ std::move(constraint_system), {} };
     auto builder = acir_format::create_circuit<Circuit>(program, metadata);
     builder.finalize_circuit();
+    // No proof is exported here, so wait for a pending IPA proof now: its failure must fail the request.
+    builder.resolve_ipa_proof();
 
     response.num_gates = static_cast<uint32_t>(builder.get_finalized_total_circuit_size());
     response.num_gates_dyadic = static_cast<uint32_t>(builder.get_circuit_subgroup_size(response.num_gates));

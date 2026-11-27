@@ -42,6 +42,10 @@ template <typename T, typename Container> T* validate_context(const Container& e
     return result;
 }
 
+// Visits the builder pointers and witness indices of stdlib values in place (builder_binding.hpp); befriended by every
+// value type that holds one.
+template <typename Builder> struct BuilderBindingWalk;
+
 template <typename Builder> class bool_t;
 template <typename Builder_> class field_t {
   public:
@@ -58,6 +62,7 @@ template <typename Builder_> class field_t {
     template <typename B> friend class bool_t;
     template <typename B, typename T> friend class bigfield;
     template <typename B> friend void mark_witness_as_used(const field_t<B>& field);
+    template <typename B> friend struct BuilderBindingWalk;
 
     mutable Builder* context = nullptr;
 

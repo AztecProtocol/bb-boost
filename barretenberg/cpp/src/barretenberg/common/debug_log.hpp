@@ -67,8 +67,8 @@ std::string _summarize(const T* x)
  */
 template <typename... FuncArgs> void _debug_log(const char* func_name, const char* arg_string, const FuncArgs&... args)
 {
-    // shut off recursive DEBUG_LOG
-    static size_t debug_log_calls = 0;
+    // shut off recursive DEBUG_LOG; per thread, since threads log concurrently
+    static thread_local size_t debug_log_calls = 0;
     if (debug_log_calls > 0) {
         return;
     }

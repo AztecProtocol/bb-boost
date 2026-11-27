@@ -5,6 +5,7 @@
 #include <fstream>
 #include <ios>
 #include <memory>
+#include <vector>
 
 namespace bb {
 std::vector<g1::affine_element> get_bn254_g1_data(const std::filesystem::path& path,
@@ -31,6 +32,12 @@ struct Bn254G1Points {
  * file, threads deserialize straight into freshly allocated memory.
  */
 Bn254G1Points load_bn254_g1_points(const std::filesystem::path& path, size_t num_points, bool allow_download = true);
+
+/**
+ * @brief Moves `points` into shared storage without copying them; the storage hands the pages holding the points back
+ * from several threads before it is freed (see release_pages_in_parallel).
+ */
+std::shared_ptr<g1::affine_element[]> share_bn254_g1_points(std::vector<g1::affine_element>&& points);
 
 g2::affine_element get_bn254_g2_data(const std::filesystem::path& path);
 } // namespace bb

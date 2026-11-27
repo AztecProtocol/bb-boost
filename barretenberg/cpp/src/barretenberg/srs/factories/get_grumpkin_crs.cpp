@@ -9,7 +9,9 @@
 #include "grumpkin_crs_data.hpp"
 #include "grumpkin_srs_gen.hpp"
 #include "pread.hpp"
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <span>
 
 namespace bb {
@@ -67,12 +69,32 @@ std::vector<curve::Grumpkin::AffineElement> get_grumpkin_g1_data(const std::file
         // Not hashed here: the CRS constructor checks every point against the pinned chunk hashes, and accepts only
         // whole chunks.
         std::vector<curve::Grumpkin::AffineElement> points(verify_points);
+        // The bytes are not authenticated yet, so a parse may fail: the first error is rethrown once every worker is
+        // done, as a serial parse would throw it.
+        std::exception_ptr parse_error;
+        std::mutex parse_error_mutex;
         parallel_for([&](ThreadChunk chunk) {
-            for (auto i : chunk.range(verify_points)) {
-                points[i] =
-                    from_buffer<curve::Grumpkin::AffineElement>(data, i * sizeof(curve::Grumpkin::AffineElement));
+#ifndef BB_NO_EXCEPTIONS
+            try {
+#endif
+                for (auto i : chunk.range(verify_points)) {
+                    points[i] =
+                        from_buffer<curve::Grumpkin::AffineElement>(data, i * sizeof(curve::Grumpkin::AffineElement));
+                }
+#ifndef BB_NO_EXCEPTIONS
+            } catch (...) {
+                const std::lock_guard<std::mutex> lock(parse_error_mutex);
+                if (!parse_error) {
+                    parse_error = std::current_exception();
+                }
             }
+#endif
         });
+#ifndef BB_NO_EXCEPTIONS
+        if (parse_error) {
+            std::rethrow_exception(parse_error);
+        }
+#endif
         return points;
     }
 

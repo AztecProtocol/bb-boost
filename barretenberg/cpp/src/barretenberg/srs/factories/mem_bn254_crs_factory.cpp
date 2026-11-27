@@ -6,6 +6,7 @@
 #include "barretenberg/ecc/scalar_multiplication/scalar_multiplication.hpp"
 #include "bn254_crs_data.hpp"
 #include "crs_integrity.hpp"
+#include "get_bn254_crs.hpp"
 #include <atomic>
 #include <memory>
 #include <span>
@@ -64,21 +65,16 @@ class MemBn254Crs : public Crs<curve::BN254> {
     std::atomic<bool> points_verified_{ false };
 };
 
-/** A vector of points as a shared array that keeps the vector as its owner (aliasing constructor): no copy. */
-std::shared_ptr<g1::affine_element[]> share_points(std::vector<g1::affine_element>&& points)
-{
-    const auto owner = std::make_shared<std::vector<g1::affine_element>>(std::move(points));
-    return { owner, owner->data() };
-}
-
 } // namespace
 
 namespace bb::srs::factories {
 
 MemBn254CrsFactory::MemBn254CrsFactory(std::vector<g1::affine_element> points, g2::affine_element const& g2_point)
+    : crs_([&points, &g2_point] {
+        const size_t num_points = points.size();
+        return std::make_shared<MemBn254Crs>(share_bn254_g1_points(std::move(points)), num_points, g2_point);
+    }())
 {
-    const size_t num_points = points.size();
-    crs_ = std::make_shared<MemBn254Crs>(share_points(std::move(points)), num_points, g2_point);
     vinfo("Initialized ", curve::BN254::name, " CRS from memory with num points = ", crs_->get_monomial_size());
 }
 

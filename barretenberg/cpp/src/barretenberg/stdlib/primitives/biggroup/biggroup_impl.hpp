@@ -374,10 +374,27 @@ std::array<element<C, Fq, Fr, G>, 2> element<C, Fq, Fr, G>::checked_unconditiona
     const Fq denominator = other._x - _x;
     const Fq x2x1 = -(other._x + _x);
 
-    const Fq lambda1 = Fq::div_without_denominator_check({ other._y, -_y }, denominator);
+    auto division_cache = [] {
+        if constexpr (requires { typename Fq::NativeDivisionCache; }) {
+            return typename Fq::NativeDivisionCache{};
+        } else {
+            return false;
+        }
+    }();
+    const auto divide = [&](const std::vector<Fq>& numerators) {
+        if constexpr (requires {
+                          typename Fq::NativeDivisionCache;
+                          Fq::div_without_denominator_check(numerators, denominator, division_cache);
+                      }) {
+            return Fq::div_without_denominator_check(numerators, denominator, division_cache);
+        } else {
+            return Fq::div_without_denominator_check(numerators, denominator);
+        }
+    };
+    const Fq lambda1 = divide({ other._y, -_y });
     const Fq x_3 = lambda1.sqradd({ x2x1 });
     const Fq y_3 = lambda1.madd(_x - x_3, { -_y });
-    const Fq lambda2 = Fq::div_without_denominator_check({ -other._y, -_y }, denominator);
+    const Fq lambda2 = divide({ -other._y, -_y });
     const Fq x_4 = lambda2.sqradd({ x2x1 });
     const Fq y_4 = lambda2.madd(_x - x_4, { -_y });
 

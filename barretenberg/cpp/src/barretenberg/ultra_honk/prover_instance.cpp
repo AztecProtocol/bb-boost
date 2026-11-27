@@ -118,8 +118,9 @@ ProverInstance_<Flavor>::ProverInstance_(Circuit& circuit, CopiedCircuitData cop
         public_inputs.emplace_back(polynomials.w_r()[idx]);
     }
 
-    // Copy IPA proof if present
+    // Copy IPA proof if present; one still being computed stays pending until the proof is exported
     ipa_proof = circuit.ipa_proof;
+    pending_ipa_proof = circuit.pending_ipa_proof;
 
     if (std::getenv("BB_POLY_STATS")) {
         analyze_prover_polynomials(polynomials);

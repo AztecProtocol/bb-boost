@@ -85,16 +85,21 @@ template <typename Params> struct VectorFieldPushSpan {
     }
 
     // The g-th completed VectorField, for SIMD arithmetic over all W of its elements at once.
+    // Unchecked in release like Polynomial::get: walkers call require_backing() once per walk, and every
+    // change of count is checked (push, adopt_cursor), so num_full_vectors() never exceeds the backing.
     [[gnu::always_inline]] Vec& operator[](size_t g) noexcept
     {
-        BB_ASSERT(g < vector_fields.size());
+        BB_ASSERT_DEBUG(g < vector_fields.size());
         return vector_fields[g];
     }
     [[gnu::always_inline]] const Vec& operator[](size_t g) const noexcept
     {
-        BB_ASSERT(g < vector_fields.size());
+        BB_ASSERT_DEBUG(g < vector_fields.size());
         return vector_fields[g];
     }
+
+    // Release bounds check for a walk that indexes this span at every g < num_full.
+    void require_backing(size_t num_full) const noexcept { BB_ASSERT_LTE(num_full, vector_fields.size()); }
 
     size_t num_full_vectors() const noexcept { return count / W; } // completed VectorFields
     size_t tail() const noexcept { return count % W; }             // trailing elements, in partial[0..tail())
@@ -137,6 +142,7 @@ template <typename Params> struct VectorFieldPushSpan {
     // this so the result reports the same size() / tail() as its input.
     void adopt_cursor(const VectorFieldPushSpan& src) noexcept
     {
+        require_backing(src.num_full_vectors());
         count = src.count;
         lane = src.lane;
     }
@@ -203,6 +209,7 @@ template <typename Params> struct VectorAffineElementPushSpan {
     template <typename Kernel> void for_each_point(Kernel kernel) const
     {
         size_t k = 0;
+        y.require_backing(x.num_full_vectors());
         for (size_t g = 0; g < x.num_full_vectors(); ++g) {
             const auto xs = x[g].to_array();
             const auto ys = y[g].to_array();
@@ -260,6 +267,7 @@ template <typename Tuple, typename Kernel, size_t... I>
     const auto& first = std::get<0>(spans);
     const size_t num_full = first.num_full_vectors();
     const size_t ntail = first.tail();
+    (std::get<I>(spans).require_backing(num_full), ...);
     for (size_t g = 0; g < num_full; ++g) {
         kernel(std::get<I>(spans)[g]...);
     }
@@ -311,6 +319,7 @@ template <Direction Dir, typename Params, typename Step>
 {
     const size_t num_full = in.num_full_vectors();
     const size_t ntail = in.tail();
+    out.require_backing(num_full);
     if constexpr (Dir == Direction::Backward) {
         for (size_t g = num_full; g-- > 0;) {
             step(bulk_acc, in[g], out[g]);

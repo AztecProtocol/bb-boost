@@ -5,7 +5,9 @@
 // =====================
 
 #pragma once
+#include "barretenberg/common/address_space_reserve.hpp"
 #include "barretenberg/common/assert.hpp"
+#include "barretenberg/common/release_pages.hpp"
 #include "barretenberg/ecc/curves/bn254/bn254.hpp"
 #include "barretenberg/ecc/curves/bn254/fr.hpp"
 #include "barretenberg/ecc/curves/grumpkin/grumpkin.hpp"
@@ -13,11 +15,15 @@
 #include "barretenberg/public_input_component/public_component_key.hpp"
 #include "barretenberg/serialize/msgpack.hpp"
 #include "pairing_points_tagging.hpp"
+#include <tuple>
 #include <utility>
 
 #include <algorithm>
+#include <cstddef>
+#include <numeric>
 #include <span>
 #include <unordered_map>
+#include <vector>
 
 namespace bb {
 static constexpr uint32_t DEFAULT_TAG = 0;
@@ -69,6 +75,56 @@ template <typename FF_> class CircuitBuilderBase {
      * @return The index of the first variable in the same class as the submitted index
      */
     uint32_t get_first_variable_in_class(uint32_t index) const;
+
+    /**
+     * @brief Append `count` variables, each its own real variable carrying `tag`.
+     * @details Leaves the state of `count` calls of CircuitBuilderBase::add_variable, each followed by setting the tag
+     * of the new variable to `tag`, where the i-th call adds the value `write_values` assigns to `values[i]`. The
+     * per-variable vectors also end with the capacities those calls would give them. `write_values(values)` is called
+     * once with the value slots of the new variables, zero-initialized, and must assign each of them. The virtual
+     * add_variable is not called.
+     * @return The index of the first new variable; the others follow it consecutively.
+     */
+    template <typename WriteValues>
+    uint32_t add_tagged_variables(const size_t count, const uint32_t tag, const WriteValues& write_values)
+    {
+        const size_t first = variables.size();
+        const size_t new_size = first + count;
+        reserve_as_appends(variables, new_size);
+        reserve_as_appends(real_variable_index, new_size);
+        reserve_as_appends(next_var_index, new_size);
+        reserve_as_appends(prev_var_index, new_size);
+        reserve_as_appends(real_variable_tags, new_size);
+        variables.resize(new_size);
+        write_values(std::span<FF>(variables).subspan(first));
+        real_variable_index.resize(new_size);
+        std::iota(real_variable_index.begin() + static_cast<std::ptrdiff_t>(first),
+                  real_variable_index.end(),
+                  static_cast<uint32_t>(first));
+        next_var_index.resize(new_size, REAL_VARIABLE);
+        prev_var_index.resize(new_size, FIRST_VARIABLE_IN_CLASS);
+        real_variable_tags.resize(new_size, tag);
+        return static_cast<uint32_t>(first);
+    }
+
+    /**
+     * @brief Give `vec` the capacity that appending one element at a time up to `size` elements would give it.
+     * @details Appends double a full vector's capacity (one element for an empty one), saturating at max_size(), under
+     * libc++ and libstdc++, and `reserve` allocates exactly the requested capacity. A `size` above max_size() makes
+     * `reserve` throw std::length_error, as the append reaching it would.
+     */
+    template <typename T> static void reserve_as_appends(std::vector<T>& vec, const size_t size)
+    {
+        size_t capacity = vec.capacity();
+        if (capacity >= size) {
+            return;
+        }
+        const size_t max_size = vec.max_size();
+        while (capacity < size && capacity < max_size) {
+            capacity = capacity == 0 ? 1 : (capacity > max_size / 2 ? max_size : 2 * capacity);
+        }
+        vec.reserve(std::max(capacity, size));
+    }
 
     /**
      * @brief Check whether each variable index points to a witness value in the variables array
@@ -138,6 +194,33 @@ template <typename FF_> class CircuitBuilderBase {
     virtual ~CircuitBuilderBase() = default;
 
     bool operator==(const CircuitBuilderBase& other) const = default;
+
+    /**
+     * @brief Whether this builder equals `other` in every member but the variable values, of which only the number
+     * is compared.
+     */
+    bool equal_except_values(const CircuitBuilderBase& other) const
+    {
+        const auto members = [](const CircuitBuilderBase& builder) {
+            return std::tie(builder._public_inputs,
+                            builder._public_inputs_finalized,
+                            builder.next_var_index,
+                            builder.prev_var_index,
+                            builder._zero_idx,
+                            builder._num_gates,
+                            builder._tau,
+                            builder._current_tag,
+                            builder.real_variable_index,
+                            builder.real_variable_tags,
+                            builder.circuit_finalized,
+                            builder._failed,
+                            builder._err,
+                            builder._is_write_vk_mode,
+                            builder.variable_names,
+                            builder.pairing_points_tagging);
+        };
+        return variables.size() == other.variables.size() && members(*this) == members(other);
+    }
 
     virtual size_t get_num_finalized_gates() const;
     virtual size_t get_num_variables() const;
@@ -211,6 +294,8 @@ template <typename FF_> class CircuitBuilderBase {
 
     const std::vector<uint32_t>& public_inputs() const { return _public_inputs; };
 
+    bool public_inputs_finalized() const { return _public_inputs_finalized; }
+
     /**
      * @brief Set the _public_inputs_finalized to true to prevent any new public inputs from being added
      * @details This is used, for example, for special internal public inputs (like pairing inputs) which we want to
@@ -244,6 +329,43 @@ template <typename FF_> class CircuitBuilderBase {
         prev_var_index.reserve(capacity);
         real_variable_tags.reserve(capacity);
     }
+
+    // Entries reserved per per-variable vector where address space may be reserved: 2^25 x 48 bytes = 1.5 GiB for the
+    // five with a 32-byte FF. Chosen for address space, not derived from any circuit or input; beyond it the vectors
+    // grow as std::vector does.
+    static constexpr size_t VARIABLES_ADDRESS_SPACE_ENTRIES = size_t{ 1 } << 25;
+
+    /**
+     * @brief Reserve the per-variable vectors for VARIABLES_ADDRESS_SPACE_ENTRIES variables when
+     * address_space_reservation_allowed() and all five reservations succeed, else for `fallback` as reserve_variables.
+     */
+    void reserve_variables_address_space(size_t fallback)
+    {
+        _variables_reservation.value = VariablesReservation::NotAttempted;
+        if (fallback < VARIABLES_ADDRESS_SPACE_ENTRIES && address_space_reservation_allowed()) {
+            if (try_reserve_address_space(VARIABLES_ADDRESS_SPACE_ENTRIES,
+                                          variables,
+                                          real_variable_index,
+                                          next_var_index,
+                                          prev_var_index,
+                                          real_variable_tags)) {
+                _variables_reservation.value = VariablesReservation::Reserved;
+                return;
+            }
+            _variables_reservation.value = VariablesReservation::Refused;
+        }
+        reserve_variables(fallback);
+    }
+
+    /**
+     * @brief What the last reserve_variables_address_space call did, which the Ultra ACIR and seed constructors make
+     * first; not the vectors' current capacity, which free_variables, for one, releases without changing this.
+     * @details NotAttempted: reservation is not allowed, or the fallback already reaches the reservation (also for a
+     * builder that never made the call). Refused: try_reserve_address_space returned false, because the allocator
+     * refused or a vector already had capacity, and the call went on to reserve the fallback. Reserved: otherwise.
+     */
+    enum class VariablesReservation : uint8_t { NotAttempted, Refused, Reserved };
+    VariablesReservation variables_reservation() const { return _variables_reservation.value; }
 
     // Disallow add_variable for non-FF types to prevent implicit conversions (specifically, using indices rather
     // than values)
@@ -285,8 +407,32 @@ template <typename FF_> class CircuitBuilderBase {
     // True if we are writing a vk; used to disable certain warnings
     bool _is_write_vk_mode = false;
 
+    // Not part of a builder's identity: builders holding the same circuit are equal whatever their reservation did.
+    struct VariablesReservationRecord {
+        VariablesReservation value = VariablesReservation::NotAttempted;
+        bool operator==(const VariablesReservationRecord& /*other*/) const { return true; }
+    };
+    VariablesReservationRecord _variables_reservation;
+
   protected:
     std::unordered_map<uint32_t, std::string> variable_names;
+
+    /**
+     * @brief Adds the storage of the witness values and the copy-constraint bookkeeping to `blocks`, so their pages can
+     * be released just before they are freed. Each vector qualifies by its capacity, but only its elements are
+     * released.
+     */
+    template <typename Blocks> void add_variable_storage_to(Blocks& blocks) noexcept
+    {
+        const auto add = [&blocks]<typename T>(std::vector<T>& vec) noexcept {
+            blocks.add(vec.data(), vec.capacity() * sizeof(T), vec.size() * sizeof(T));
+        };
+        add(variables);
+        add(next_var_index);
+        add(prev_var_index);
+        add(real_variable_index);
+        add(real_variable_tags);
+    }
 
   public:
     /**
